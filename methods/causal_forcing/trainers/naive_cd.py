@@ -5,12 +5,13 @@ from core.data.dataset import LatentLMDBDataset
 from core.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
 from core.misc import (
     set_seed,
-    merge_dict_list
+    merge_dict_list,
+    TensorBoardLogger
 )
 import torch.distributed as dist
 from omegaconf import OmegaConf
 import torch
-import wandb
+
 import time
 import os
 from methods.causal_forcing import NaiveConsistency
@@ -34,7 +35,7 @@ class Trainer:
         self.device = torch.cuda.current_device()
         self.is_main_process = global_rank == 0
         self.causal = config.causal
-        self.disable_wandb = config.disable_wandb
+        self.disable_logging = getattr(config, 'disable_logging', False) or getattr(config, 'disable_wandb', False)
 
         # use a random seed for the training
         if config.seed == 0:
@@ -44,18 +45,16 @@ class Trainer:
 
         set_seed(config.seed + global_rank)
 
-        if self.is_main_process and not self.disable_wandb:
-            wandb.login(host=config.wandb_host, key=config.wandb_key)
-            wandb.init(
-                config=OmegaConf.to_container(config, resolve=True),
-                name=config.config_name,
-                mode="online",
-                entity=config.wandb_entity,
-                project=config.wandb_project,
-                dir=config.wandb_save_dir
-            )
-
         self.output_path = config.logdir
+
+        if self.is_main_process and not self.disable_logging:
+            tensorboard_dir = os.path.join(self.output_path, "tensorboard")
+            os.makedirs(tensorboard_dir, exist_ok=True)
+            self.writer = TensorBoardLogger(
+                log_dir=tensorboard_dir,
+                config=config,
+                name=getattr(config, 'config_name', None)
+            )
 
         # Step 2: Initialize the model and optimizer
         self.model = NaiveConsistency(config, device=self.device)
@@ -287,8 +286,8 @@ class Trainer:
 
               
 
-                if not self.disable_wandb:
-                    wandb.log(wandb_loss_dict, step=self.step)
+                if not self.disable_logging:
+                    self.writer.log(wandb_loss_dict, step=self.step)
 
             if self.step % self.config.gc_interval == 0:
                 if dist.get_rank() == 0:
@@ -301,6 +300,6 @@ class Trainer:
                 if self.previous_time is None:
                     self.previous_time = current_time
                 else:
-                    if not self.disable_wandb:
-                        wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
+                    if not self.disable_logging:
+                        self.writer.log({"per iteration time": current_time - self.previous_time}, step=self.step)
                     self.previous_time = current_time

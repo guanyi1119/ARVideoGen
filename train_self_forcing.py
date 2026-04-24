@@ -1,7 +1,6 @@
 import argparse
 import os
 from omegaconf import OmegaConf
-import wandb
 
 from core.config import load_config
 from methods.self_forcing.trainers import DiffusionTrainer, GANTrainer, ODETrainer, ScoreDistillationTrainer
@@ -26,7 +25,7 @@ def main():
     config.config_name = config_name
     config.logdir = args.logdir
     config.wandb_save_dir = args.wandb_save_dir
-    config.disable_wandb = args.disable_wandb
+    config.disable_logging = args.disable_wandb
 
     if config.trainer == "diffusion":
         trainer = DiffusionTrainer(config)
@@ -37,8 +36,6 @@ def main():
     elif config.trainer == "score_distillation":
         trainer = ScoreDistillationTrainer(config)
     trainer.train()
-
-    wandb.finish()
 
 
 if __name__ == "__main__":

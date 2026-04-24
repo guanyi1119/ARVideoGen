@@ -16,7 +16,6 @@ from functools import partial
 import numpy as np
 import random
 import torch
-import wandb
 import os
 
 
@@ -56,6 +55,9 @@ def set_seed(seed: int, deterministic: bool = False):
 
 
 def init_logging_folder(args):
+    """Initialize TensorBoard logging and create output directory."""
+    from core.misc.tensorboard_utils import TensorBoardLogger
+
     date = str(datetime.now()).replace(" ", "-").replace(":", "-")
     output_path = os.path.join(
         args.output_path,
@@ -64,16 +66,16 @@ def init_logging_folder(args):
     os.makedirs(output_path, exist_ok=False)
 
     os.makedirs(args.output_path, exist_ok=True)
-    wandb.login(host=args.wandb_host, key=args.wandb_key)
-    run = wandb.init(config=OmegaConf.to_container(args, resolve=True), dir=args.output_path, **
-                     {"mode": "online", "entity": args.wandb_entity, "project": args.wandb_project})
-    wandb.run.log_code(".")
-    wandb.run.name = args.wandb_name
-    print(f"run dir: {run.dir}")
-    wandb_folder = run.dir
-    os.makedirs(wandb_folder, exist_ok=True)
 
-    return output_path, wandb_folder
+    tensorboard_dir = os.path.join(output_path, "tensorboard")
+    os.makedirs(tensorboard_dir, exist_ok=True)
+    writer = TensorBoardLogger(
+        log_dir=tensorboard_dir,
+        config=args,
+        name=getattr(args, 'wandb_name', None)
+    )
+
+    return output_path, writer
 
 
 def fsdp_wrap(module, sharding_strategy="full", mixed_precision=False, wrap_strategy="size", min_num_params=int(5e7), transformer_module=None):
@@ -145,15 +147,19 @@ def barrier():
 
 
 def prepare_for_saving(tensor, fps=16, caption=None):
-    # Convert range [-1, 1] to [0, 1]
+    """Convert range [-1, 1] to [0, 1] and format for logging.
+
+    Returns:
+        3D tensor [C, H, W] for images (grid), or
+        5D tensor [N, T, C, H, W] for videos.
+    """
     tensor = (tensor * 0.5 + 0.5).clamp(0, 1).detach()
 
     if tensor.ndim == 4:
-        # Assuming it's an image and has shape [batch_size, 3, height, width]
-        tensor = make_grid(tensor, 4, padding=0, normalize=False)
-        return wandb.Image((tensor * 255).cpu().numpy().astype(np.uint8), caption=caption)
+        # [B, C, H, W] → grid image [C, H', W']
+        return make_grid(tensor, 4, padding=0, normalize=False)
     elif tensor.ndim == 5:
-        # Assuming it's a video and has shape [batch_size, num_frames, 3, height, width]
-        return wandb.Video((tensor * 255).cpu().numpy().astype(np.uint8), fps=fps, format="webm", caption=caption)
+        # [B, T, C, H, W] → keep as-is for add_video
+        return tensor
     else:
         raise ValueError("Unsupported tensor shape for saving. Expected 4D (image) or 5D (video) tensor.")

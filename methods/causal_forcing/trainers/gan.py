@@ -5,13 +5,14 @@ from core.data.dataset import ShardingLMDBDataset, cycle
 from core.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
 from core.misc import (
     set_seed,
-    merge_dict_list
+    merge_dict_list,
+    TensorBoardLogger
 )
 import torch.distributed as dist
 from omegaconf import OmegaConf
 from methods.causal_forcing import GAN
 import torch
-import wandb
+
 import time
 import os
 
@@ -33,7 +34,7 @@ class Trainer:
         self.device = torch.cuda.current_device()
         self.is_main_process = global_rank == 0
         self.causal = config.causal
-        self.disable_wandb = config.disable_wandb
+        self.disable_logging = getattr(config, 'disable_logging', False) or getattr(config, 'disable_wandb', False)
 
         # Configuration for discriminator warmup
         self.discriminator_warmup_steps = getattr(config, "discriminator_warmup_steps", 0)
@@ -50,18 +51,16 @@ class Trainer:
 
         set_seed(config.seed + global_rank)
 
-        if self.is_main_process and not self.disable_wandb:
-            wandb.login(host=config.wandb_host, key=config.wandb_key)
-            wandb.init(
-                config=OmegaConf.to_container(config, resolve=True),
-                name=config.config_name,
-                mode="online",
-                entity=config.wandb_entity,
-                project=config.wandb_project,
-                dir=config.wandb_save_dir
-            )
-
         self.output_path = config.logdir
+
+        if self.is_main_process and not self.disable_logging:
+            tensorboard_dir = os.path.join(self.output_path, "tensorboard")
+            os.makedirs(tensorboard_dir, exist_ok=True)
+            self.writer = TensorBoardLogger(
+                log_dir=tensorboard_dir,
+                config=config,
+                name=getattr(config, 'config_name', None)
+            )
 
         # Step 2: Initialize the model and optimizer
         self.model = GAN(config, device=self.device)
@@ -433,11 +432,11 @@ class Trainer:
                 if self.in_discriminator_warmup:
                     warmup_status = f"[WARMUP {self.step}/{self.discriminator_warmup_steps}] Training only discriminator params"
                     print(warmup_status)
-                    if not self.disable_wandb:
+                    if not self.disable_logging:
                         wandb_loss_dict.update({"warmup_status": 1.0})
 
-                if not self.disable_wandb:
-                    wandb.log(wandb_loss_dict, step=self.step)
+                if not self.disable_logging:
+                    self.writer.log(wandb_loss_dict, step=self.step)
 
             if self.step % self.config.gc_interval == 0:
                 if dist.get_rank() == 0:
@@ -450,8 +449,8 @@ class Trainer:
                 if self.previous_time is None:
                     self.previous_time = current_time
                 else:
-                    if not self.disable_wandb:
-                        wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
+                    if not self.disable_logging:
+                        self.writer.log({"per iteration time": current_time - self.previous_time}, step=self.step)
                     self.previous_time = current_time
 
     def all_gather_dict(self, target_dict):

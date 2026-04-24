@@ -1,7 +1,6 @@
 import argparse
 import os
 from omegaconf import OmegaConf
-import wandb
 
 from core.config import load_config
 from methods.causvid.trainers import DistillationTrainer, ODETrainer
@@ -26,8 +25,6 @@ def main():
     else:
         raise ValueError(f"Unknown trainer: {config.trainer}")
     trainer.train()
-
-    wandb.finish()
 
 
 if __name__ == "__main__":

@@ -1,7 +1,6 @@
 import argparse
 import os
 from omegaconf import OmegaConf
-import wandb
 
 from core.config import load_config
 from methods.longlive.trainers import ScoreDistillationTrainer
@@ -28,7 +27,7 @@ def main():
     config.config_name = config_name
     config.logdir = args.logdir
     config.wandb_save_dir = args.wandb_save_dir
-    config.disable_wandb = args.disable_wandb
+    config.disable_logging = args.disable_wandb
     config.auto_resume = not args.no_auto_resume
     config.use_one_logger = not args.no_one_logger
 
@@ -37,8 +36,6 @@ def main():
     else:
         raise ValueError(f"Unknown trainer: {config.trainer}")
     trainer.train()
-
-    wandb.finish()
 
 
 if __name__ == "__main__":

@@ -10,14 +10,14 @@ from core.data.dataset import TextDataset, TwoTextDataset, cycle
 from core.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
 from core.misc import (
     set_seed,
-    merge_dict_list
+    merge_dict_list,
+    TensorBoardLogger
 )
 import torch.distributed as dist
 from omegaconf import OmegaConf
 from methods.longlive import DMD, DMDSwitch
 from methods.longlive.streaming_training import StreamingTrainingModel
 import torch
-import wandb
 import time
 import os
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
@@ -56,7 +56,7 @@ class Trainer:
         self.device = torch.cuda.current_device()
         self.is_main_process = global_rank == 0
         self.causal = config.causal
-        self.disable_wandb = config.disable_wandb
+        self.disable_logging = getattr(config, 'disable_logging', False) or getattr(config, 'disable_wandb', False)
 
         # use a random seed for the training
         if config.seed == 0:
@@ -67,24 +67,20 @@ class Trainer:
         set_seed(config.seed + global_rank)
 
         self.use_one_logger = getattr(config, "use_one_logger", True)
-        if self.is_main_process and not self.disable_wandb:
-            wandb.login(
-                # host=config.wandb_host,
-                key=config.wandb_key)
-            wandb.init(
-                config=OmegaConf.to_container(config, resolve=True),
-                name=config.config_name,
-                mode="online",
-                entity=config.wandb_entity,
-                project=config.wandb_project,
-                dir=config.wandb_save_dir
+        self.output_path = config.logdir
+        if self.is_main_process and not self.disable_logging:
+            tensorboard_dir = os.path.join(self.output_path, "tensorboard")
+            os.makedirs(tensorboard_dir, exist_ok=True)
+            self.writer = TensorBoardLogger(
+                log_dir=tensorboard_dir,
+                config=config,
+                name=getattr(config, 'config_name', None)
             )
 
-        self.output_path = config.logdir
-        app_start_time = time.time_ns() / 1_000_000 
+        app_start_time = time.time_ns() / 1_000_000
         
         # ------------------------------------- One Logger Setup ----------------------------------------------
-        if self.use_one_logger and dist.get_rank() == 0 and not self.disable_wandb:
+        if self.use_one_logger and dist.get_rank() == 0 and not self.disable_logging:
             app_tag_run_name = f"dmd_{config.real_name[:6]}_local_attn_size_{config.model_kwargs.local_attn_size}_lr_{config.lr}"
             app_tag_run_version = "0.0.0"
             app_tag = f"{app_tag_run_name}_{app_tag_run_version}_{config.batch_size}_{dist.get_world_size()}"
@@ -1334,8 +1330,8 @@ class Trainer:
                             "critic_grad_norm": critic_log_dict["critic_grad_norm"].mean().item()
                         }
                     )
-                    if not self.disable_wandb:
-                        wandb.log(wandb_loss_dict, step=self.step)
+                    if not self.disable_logging:
+                        self.writer.log(wandb_loss_dict, step=self.step)
 
                 if self.step % self.config.gc_interval == 0:
                     if dist.get_rank() == 0:
@@ -1346,8 +1342,8 @@ class Trainer:
                 if self.is_main_process:
                     current_time = time.time()
                     iteration_time = 0 if self.previous_time is None else current_time - self.previous_time
-                    if not self.disable_wandb:
-                        wandb.log({"per iteration time": iteration_time}, step=self.step)
+                    if not self.disable_logging:
+                        self.writer.log({"per iteration time": iteration_time}, step=self.step)
                     self.previous_time = current_time
                     # Log training progress
                     if TRAIN_GENERATOR and generator_log_dict:

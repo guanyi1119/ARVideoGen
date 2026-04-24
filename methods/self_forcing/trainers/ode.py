@@ -4,12 +4,12 @@ from core.data.dataset import ODERegressionLMDBDataset, cycle
 from methods.self_forcing import ODERegression
 from collections import defaultdict
 from core.misc import (
-    set_seed
+    set_seed,
+    TensorBoardLogger
 )
 import torch.distributed as dist
 from omegaconf import OmegaConf
 import torch
-import wandb
 import time
 import os
 
@@ -32,7 +32,7 @@ class Trainer:
         self.dtype = torch.bfloat16 if config.mixed_precision else torch.float32
         self.device = torch.cuda.current_device()
         self.is_main_process = global_rank == 0
-        self.disable_wandb = config.disable_wandb
+        self.disable_logging = getattr(config, 'disable_logging', False) or getattr(config, 'disable_wandb', False)
 
         # use a random seed for the training
         if config.seed == 0:
@@ -42,18 +42,16 @@ class Trainer:
 
         set_seed(config.seed + global_rank)
 
-        if self.is_main_process and not self.disable_wandb:
-            wandb.login(host=config.wandb_host, key=config.wandb_key)
-            wandb.init(
-                config=OmegaConf.to_container(config, resolve=True),
-                name=config.config_name,
-                mode="online",
-                entity=config.wandb_entity,
-                project=config.wandb_project,
-                dir=config.wandb_save_dir
-            )
-
         self.output_path = config.logdir
+
+        if self.is_main_process and not self.disable_logging:
+            tensorboard_dir = os.path.join(self.output_path, "tensorboard")
+            os.makedirs(tensorboard_dir, exist_ok=True)
+            self.writer = TensorBoardLogger(
+                log_dir=tensorboard_dir,
+                config=config,
+                name=getattr(config, 'config_name', None)
+            )
 
         # Step 2: Initialize the model and optimizer
 
@@ -188,7 +186,7 @@ class Trainer:
         self.generator_optimizer.step()
 
         # Step 4: Visualization
-        if VISUALIZE and not self.config.no_visualize and not self.config.disable_wandb and self.is_main_process:
+        if VISUALIZE and not self.config.no_visualize and not self.disable_logging and self.is_main_process:
             # Visualize the input, output, and ground truth
             input = log_dict["input"]
             output = log_dict["output"]
@@ -197,25 +195,23 @@ class Trainer:
             input_video = self.model.vae.decode_to_pixel(input)
             output_video = self.model.vae.decode_to_pixel(output)
             ground_truth_video = self.model.vae.decode_to_pixel(ground_truth)
-            input_video = 255.0 * (input_video.cpu().numpy() * 0.5 + 0.5)
-            output_video = 255.0 * (output_video.cpu().numpy() * 0.5 + 0.5)
-            ground_truth_video = 255.0 * (ground_truth_video.cpu().numpy() * 0.5 + 0.5)
 
-            # Visualize the input, output, and ground truth
-            wandb.log({
-                "input": wandb.Video(input_video, caption="Input", fps=16, format="mp4"),
-                "output": wandb.Video(output_video, caption="Output", fps=16, format="mp4"),
-                "ground_truth": wandb.Video(ground_truth_video, caption="Ground Truth", fps=16, format="mp4"),
-            }, step=self.step)
+            # TensorBoard add_video needs [N, T, C, H, W] float in [0, 1]
+            input_tb = (input_video * 0.5 + 0.5).clamp(0, 1).cpu()
+            output_tb = (output_video * 0.5 + 0.5).clamp(0, 1).cpu()
+            gt_tb = (ground_truth_video * 0.5 + 0.5).clamp(0, 1).cpu()
+            self.writer.log_video("input", input_tb, step=self.step, fps=16)
+            self.writer.log_video("output", output_tb, step=self.step, fps=16)
+            self.writer.log_video("ground_truth", gt_tb, step=self.step, fps=16)
 
         # Step 5: Logging
-        if self.is_main_process and not self.disable_wandb:
+        if self.is_main_process and not self.disable_logging:
             wandb_loss_dict = {
                 "generator_loss": generator_loss.item(),
                 "generator_grad_norm": generator_grad_norm.item(),
                 **stats
             }
-            wandb.log(wandb_loss_dict, step=self.step)
+            self.writer.log(wandb_loss_dict, step=self.step)
 
         if self.step % self.config.gc_interval == 0:
             if dist.get_rank() == 0:
@@ -235,8 +231,8 @@ class Trainer:
                 if self.previous_time is None:
                     self.previous_time = current_time
                 else:
-                    if not self.disable_wandb:
-                        wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
+                    if not self.disable_logging:
+                        self.writer.log({"per iteration time": current_time - self.previous_time}, step=self.step)
                     self.previous_time = current_time
 
             self.step += 1

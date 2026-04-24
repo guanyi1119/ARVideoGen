@@ -13,7 +13,6 @@ import torch.distributed as dist
 from omegaconf import OmegaConf
 import argparse
 import torch
-import wandb
 import time
 import os
 
@@ -43,7 +42,7 @@ class Trainer:
         set_seed(config.seed + global_rank)
 
         if self.is_main_process:
-            self.output_path, self.wandb_folder = init_logging_folder(config)
+            self.output_path, self.writer = init_logging_folder(config)
 
         # Step 2: Initialize the model and optimizer
 
@@ -163,12 +162,12 @@ class Trainer:
 
         # Step 4: Logging
         if self.is_main_process:
-            wandb_loss_dict = {
+            log_dict = {
                 "generator_loss": generator_loss.item(),
                 "generator_grad_norm": generator_grad_norm.item(),
                 **stats
             }
-            wandb.log(wandb_loss_dict, step=self.step)
+            self.writer.log(log_dict, step=self.step)
 
     def train(self):
         while True:
@@ -183,7 +182,7 @@ class Trainer:
                 if self.previous_time is None:
                     self.previous_time = current_time
                 else:
-                    wandb.log({"per iteration time": current_time -
+                    self.writer.log({"per iteration time": current_time -
                               self.previous_time}, step=self.step)
                     self.previous_time = current_time
 
@@ -203,8 +202,6 @@ def main():
 
     trainer = Trainer(config)
     trainer.train()
-
-    wandb.finish()
 
 
 if __name__ == "__main__":

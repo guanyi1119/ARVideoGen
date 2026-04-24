@@ -14,7 +14,6 @@ from omegaconf import OmegaConf
 from methods.causvid.dmd import DMD
 import argparse
 import torch
-import wandb
 import time
 import os
 
@@ -43,7 +42,7 @@ class Trainer:
         set_seed(config.seed + global_rank)
 
         if self.is_main_process:
-            self.output_path, self.wandb_folder = init_logging_folder(config)
+            self.output_path, self.writer = init_logging_folder(config)
 
         # Step 2: Initialize the model and optimizer
         if config.distillation_loss == "dmd":
@@ -213,13 +212,13 @@ class Trainer:
 
         # Step 5: Logging
         if self.is_main_process:
-            wandb_loss_dict = {
+            log_dict = {
                 "critic_loss": critic_loss.item(),
                 "critic_grad_norm": critic_grad_norm.item()
             }
 
             if TRAIN_GENERATOR:
-                wandb_loss_dict.update(
+                log_dict.update(
                     {
                         "generator_loss": generator_loss.item(),
                         "generator_grad_norm": generator_grad_norm.item(),
@@ -228,11 +227,11 @@ class Trainer:
                 )
 
             if VISUALIZE:
-                self.add_visualization(generator_log_dict, critic_log_dict, wandb_loss_dict)
+                self.add_visualization(generator_log_dict, critic_log_dict, log_dict)
 
-            wandb.log(wandb_loss_dict, step=self.step)
+            self.writer.log(log_dict, step=self.step)
 
-    def add_visualization(self, generator_log_dict, critic_log_dict, wandb_loss_dict):
+    def add_visualization(self, generator_log_dict, critic_log_dict, log_dict):
         critictrain_latent, critictrain_noisy_latent, critictrain_pred_image = map(
             lambda x: self.distillation_model.vae.decode_to_pixel(
                 x).squeeze(1),
@@ -240,11 +239,9 @@ class Trainer:
                 critic_log_dict['critictrain_pred_image']]
         )
 
-        wandb_loss_dict.update({
-            "critictrain_latent": prepare_for_saving(critictrain_latent),
-            "critictrain_noisy_latent": prepare_for_saving(critictrain_noisy_latent),
-            "critictrain_pred_image": prepare_for_saving(critictrain_pred_image)
-        })
+        self.writer.log_image("critictrain_latent", prepare_for_saving(critictrain_latent), step=self.step)
+        self.writer.log_image("critictrain_noisy_latent", prepare_for_saving(critictrain_noisy_latent), step=self.step)
+        self.writer.log_image("critictrain_pred_image", prepare_for_saving(critictrain_pred_image), step=self.step)
 
         if "dmdtrain_clean_latent" in generator_log_dict:
             (dmdtrain_clean_latent, dmdtrain_noisy_latent, dmdtrain_pred_real_image, dmdtrain_pred_fake_image) = map(
@@ -254,14 +251,10 @@ class Trainer:
                     generator_log_dict['dmdtrain_pred_real_image'], generator_log_dict['dmdtrain_pred_fake_image']]
             )
 
-            wandb_loss_dict.update(
-                {
-                    "dmdtrain_clean_latent": prepare_for_saving(dmdtrain_clean_latent),
-                    "dmdtrain_noisy_latent": prepare_for_saving(dmdtrain_noisy_latent),
-                    "dmdtrain_pred_real_image": prepare_for_saving(dmdtrain_pred_real_image),
-                    "dmdtrain_pred_fake_image": prepare_for_saving(dmdtrain_pred_fake_image)
-                }
-            )
+            self.writer.log_image("dmdtrain_clean_latent", prepare_for_saving(dmdtrain_clean_latent), step=self.step)
+            self.writer.log_image("dmdtrain_noisy_latent", prepare_for_saving(dmdtrain_noisy_latent), step=self.step)
+            self.writer.log_image("dmdtrain_pred_real_image", prepare_for_saving(dmdtrain_pred_real_image), step=self.step)
+            self.writer.log_image("dmdtrain_pred_fake_image", prepare_for_saving(dmdtrain_pred_fake_image), step=self.step)
 
     def train(self):
         while True:
@@ -276,7 +269,7 @@ class Trainer:
                 if self.previous_time is None:
                     self.previous_time = current_time
                 else:
-                    wandb.log({"per iteration time": current_time -
+                    self.writer.log({"per iteration time": current_time -
                               self.previous_time}, step=self.step)
                     self.previous_time = current_time
 
@@ -298,8 +291,6 @@ def main():
 
     trainer = Trainer(config)
     trainer.train()
-
-    wandb.finish()
 
 
 if __name__ == "__main__":

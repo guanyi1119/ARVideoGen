@@ -3,12 +3,11 @@ import logging
 from core.data.dataset import cycle
 from core.data.dataset import TextDataset
 from core.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
-from core.misc import set_seed
+from core.misc import set_seed, TensorBoardLogger
 import torch.distributed as dist
 from omegaconf import OmegaConf
 from methods.causal_forcing import DMD
 import torch
-import wandb
 import time
 import os
 
@@ -30,7 +29,9 @@ class Trainer:
         self.device = torch.cuda.current_device()
         self.is_main_process = global_rank == 0
         self.causal = config.causal
-        self.disable_wandb = config.disable_wandb
+        self.disable_logging = getattr(config, 'disable_logging', False) or getattr(config, 'disable_wandb', False)
+
+        self.output_path = config.logdir
 
         # use a random seed for the training
         if config.seed == 0:
@@ -40,18 +41,14 @@ class Trainer:
 
         set_seed(config.seed + global_rank)
 
-        if self.is_main_process and not self.disable_wandb:
-            wandb.login(host=config.wandb_host, key=config.wandb_key)
-            wandb.init(
-                config=OmegaConf.to_container(config, resolve=True),
-                name=config.config_name,
-                mode="online",
-                entity=config.wandb_entity,
-                project=config.wandb_project,
-                dir=config.wandb_save_dir
+        if self.is_main_process and not self.disable_logging:
+            tensorboard_dir = os.path.join(self.output_path, "tensorboard")
+            os.makedirs(tensorboard_dir, exist_ok=True)
+            self.writer = TensorBoardLogger(
+                log_dir=tensorboard_dir,
+                config=config,
+                name=getattr(config, 'config_name', None)
             )
-
-        self.output_path = config.logdir
 
         # Step 2: Initialize the model and optimizer
         if config.distribution_loss == "dmd":
@@ -343,9 +340,9 @@ class Trainer:
 
             # Logging
             if self.is_main_process:
-                wandb_loss_dict = {}
+                log_dict = {}
                 if TRAIN_GENERATOR:
-                    wandb_loss_dict.update(
+                    log_dict.update(
                         {
                             "generator_loss": generator_log_dict["generator_loss"].mean().item(),
                             "generator_grad_norm": generator_log_dict["generator_grad_norm"].mean().item(),
@@ -353,15 +350,15 @@ class Trainer:
                         }
                     )
 
-                wandb_loss_dict.update(
+                log_dict.update(
                     {
                         "critic_loss": critic_log_dict["critic_loss"].mean().item(),
                         "critic_grad_norm": critic_log_dict["critic_grad_norm"].mean().item()
                     }
                 )
 
-                if not self.disable_wandb:
-                    wandb.log(wandb_loss_dict, step=self.step)
+                if not self.disable_logging:
+                    self.writer.log(log_dict, step=self.step)
 
             if self.step % self.config.gc_interval == 0:
                 if dist.get_rank() == 0:
@@ -374,6 +371,6 @@ class Trainer:
                 if self.previous_time is None:
                     self.previous_time = current_time
                 else:
-                    if not self.disable_wandb:
-                        wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
+                    if not self.disable_logging:
+                        self.writer.log({"per iteration time": current_time - self.previous_time}, step=self.step)
                     self.previous_time = current_time
