@@ -66,5 +66,5 @@ def retrieve_row_from_lmdb(lmdb_env, array_name, dtype, row_index, shape=None):
         array = np.frombuffer(row_bytes, dtype=dtype)
 
     if shape is not None and len(shape) > 0:
-        array_reshaped = array.reshape(shape)
-    return array_reshaped
+        array = array.reshape(shape)
+    return array

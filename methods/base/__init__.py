@@ -1,16 +1,11 @@
-from .base_causal_forcing import BaseModel, SelfForcingModel, TeacherForcingModel, BidirectionalModel
-from .base_self_forcing import BaseModel as SFBaseModel, SelfForcingModel as SFSelfForcingModel
-from .base_longlive import BaseModel as LLBaseModel, SelfForcingModel as LLSelfForcingModel
-
-
 def get_base_classes(method='default'):
-    """Return (BaseModel, SelfForcingModel) for the given method.
+    """Return base model classes for the given method.
 
     Args:
         method: One of 'default' (Causal-Forcing/Self-Forcing base), 'self_forcing', 'longlive'
 
     Returns:
-        Tuple of (BaseModel, SelfForcingModel) classes, plus method-specific classes
+        Tuple of base model classes for the specified method.
     """
     if method == 'default':
         from .base_causal_forcing import BaseModel, SelfForcingModel, TeacherForcingModel, BidirectionalModel
