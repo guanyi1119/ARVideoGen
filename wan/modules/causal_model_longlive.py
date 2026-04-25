@@ -17,10 +17,11 @@ from wan.modules.model import (
     MLPProj,
     sinusoidal_embedding_1d
 )
-from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention as _flex_attention
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from torch.nn.attention.flex_attention import BlockMask
 from diffusers.models.modeling_utils import ModelMixin
+import os
 import torch.nn as nn
 import torch
 import math
@@ -31,11 +32,14 @@ from utils.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, log
 # [TODO] Update import after core/ is created: from core.misc.debug_option import ...
 from utils.debug_option import DEBUG
 
-# wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
-# see https://github.com/pytorch/pytorch/issues/133254
-# change to default for other models
-flex_attention = torch.compile(
-    flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
+# torch.compile relies on Triton/CUDA backends which are not supported on NPU
+if os.environ.get('DEVICE_TYPE', 'cuda') == 'npu':
+    flex_attention = _flex_attention
+else:
+    # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
+    # see https://github.com/pytorch/pytorch/issues/133254
+    flex_attention = torch.compile(
+        _flex_attention, dynamic=False, mode="max-autotune-no-cudagraphs")
 
 
 def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
