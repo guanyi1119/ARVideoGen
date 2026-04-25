@@ -2,12 +2,13 @@ import argparse
 import os
 from omegaconf import OmegaConf
 
-from core.config import load_config
-from methods.longlive.trainers import ScoreDistillationTrainer
-
+import torch
 DEVICE_TYPE = os.environ.get('DEVICE_TYPE', 'cuda')
 if DEVICE_TYPE == "npu":
     from torch_npu.contrib import transfer_to_npu
+
+from core.config import load_config
+from methods.longlive.trainers import ScoreDistillationTrainer
 
 
 def main():
