@@ -59,7 +59,7 @@ def block_relativistic_rope(x, grid_sizes, freqs, start_frame=0, relative_frame_
         seq_len = f * h * w
 
         # precompute multipliers
-        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float64).reshape(
+        x_i = torch.view_as_complex(x[i, :seq_len].to(torch.float32).reshape(
             seq_len, n, -1, 2))
         
         # Use relative_frame_indices if provided (Block-Relativistic RoPE),
