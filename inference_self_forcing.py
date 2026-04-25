@@ -1,5 +1,9 @@
 import argparse
 import torch
+DEVICE_TYPE = os.environ.get('DEVICE_TYPE', 'cuda')
+if DEVICE_TYPE == "npu":
+    from torch_npu.contrib import transfer_to_npu
+
 import os
 from omegaconf import OmegaConf
 from core.config import load_config
@@ -18,6 +22,7 @@ from methods.self_forcing.pipelines import (
 from core.data.dataset import TextDataset, TextImagePairDataset
 from core.misc import set_seed
 from core.misc.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_path", type=str, required=True)

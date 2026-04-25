@@ -2,6 +2,10 @@
 # Based on archive/CausVid/minimal_inference/ scripts
 import argparse
 import torch
+DEVICE_TYPE = os.environ.get('DEVICE_TYPE', 'cuda')
+if DEVICE_TYPE == "npu":
+    from torch_npu.contrib import transfer_to_npu
+
 import os
 from omegaconf import OmegaConf
 from tqdm import tqdm
@@ -11,6 +15,7 @@ import torch.distributed as dist
 from methods.causvid.pipelines.causal_inference import CausalInferencePipeline
 from methods.causvid.data import TextDataset
 from core.misc import set_seed
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--config_path", type=str, required=True)
