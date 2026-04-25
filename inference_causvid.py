@@ -21,6 +21,10 @@ parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--num_output_frames", type=int, default=21)
 args = parser.parse_args()
 
+if args.output_folder:
+    output_root = os.environ.get('OUTPUT_URL', '.')
+    args.output_folder = os.path.join(output_root, args.output_folder)
+
 set_seed(args.seed)
 torch.set_grad_enabled(False)
 

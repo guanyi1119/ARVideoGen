@@ -18,6 +18,9 @@ def main():
     config.no_save = args.no_save
     config.no_visualize = args.no_visualize
 
+    output_root = os.environ.get('OUTPUT_URL', '.')
+    config.output_path = os.path.join(output_root, config.output_path)
+
     if config.trainer == "distillation":
         trainer = DistillationTrainer(config)
     elif config.trainer == "ode":

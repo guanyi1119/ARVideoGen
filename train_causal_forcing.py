@@ -25,8 +25,9 @@ def main():
     config.tf = args.tf
     config_name = os.path.basename(args.config_path).split(".")[0]
     config.config_name = config_name
-    config.logdir = args.logdir
-    config.wandb_save_dir = args.wandb_save_dir
+    output_root = os.environ.get('OUTPUT_URL', '.')
+    config.logdir = os.path.join(output_root, args.logdir)
+    config.wandb_save_dir = os.path.join(output_root, args.wandb_save_dir)
     config.disable_logging = args.disable_wandb
 
     if config.trainer == "diffusion":

@@ -6,6 +6,7 @@
 #   - WanTextEncoder: moves text encoder to GPU immediately in __init__
 #   - [DIFF-Base] Base (CF/SF) lacks sink_recache_after_switch, uses fixed seq_len=32760, no chunked decode
 #   - [DIFF-CausVid] CausVid uses DiffusionModelInterface, current_end, returns pred_x0 only, no clean_x/classify_mode
+import os
 import types
 from typing import List, Optional
 import torch
@@ -31,7 +32,7 @@ class WanTextEncoder(torch.nn.Module):
             device=torch.device('cpu')
         ).eval().requires_grad_(False)
         self.text_encoder.load_state_dict(
-            torch.load("wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
+            torch.load(f"{os.environ.get('MODELS_DIR', 'wan_models')}/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
                        map_location='cpu', weights_only=False)
         )
 
@@ -39,7 +40,7 @@ class WanTextEncoder(torch.nn.Module):
             self.text_encoder = self.text_encoder.cuda()
 
         self.tokenizer = HuggingfaceTokenizer(
-            name="wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
+            name=f"{os.environ.get('MODELS_DIR', 'wan_models')}/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
 
     @property
     def device(self):
@@ -76,7 +77,7 @@ class WanVAEWrapper(torch.nn.Module):
         self.std = torch.tensor(std, dtype=torch.float32)
 
         self.model = _video_vae(
-            pretrained_path="wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
+            pretrained_path=f"{os.environ.get('MODELS_DIR', 'wan_models')}/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
             z_dim=16,
         ).eval().requires_grad_(False)
 
@@ -176,12 +177,12 @@ class WanDiffusionWrapper(torch.nn.Module):
         if is_causal:
             if use_infinite_attention:
                 self.model = CausalWanModelInfinity.from_pretrained(
-                    f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
+                    f"{os.environ.get('MODELS_DIR', 'wan_models')}/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
             else:
                 self.model = CausalWanModel.from_pretrained(
-                    f"wan_models/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
+                    f"{os.environ.get('MODELS_DIR', 'wan_models')}/{model_name}/", local_attn_size=local_attn_size, sink_size=sink_size)
         else:
-            self.model = WanModel.from_pretrained(f"wan_models/{model_name}/")
+            self.model = WanModel.from_pretrained(f"{os.environ.get('MODELS_DIR', 'wan_models')}/{model_name}/")
         self.model.eval()
 
         self.uniform_timestep = not is_causal

@@ -7,6 +7,7 @@
 #   - WanTextEncoder: uses next(self.parameters()).device instead of torch.cuda.current_device()
 #   - [DIFF-Base] Base (CF/SF) uses cache_start, clean_x/aug_t, classify_mode, returns (flow_pred, pred_x0)
 #   - [DIFF-LongLive] LongLive adds sink_recache_after_switch, dynamic seq_len, decode_to_pixel_chunk
+import os
 from typing import List, Optional
 import torch
 
@@ -34,12 +35,12 @@ class WanTextEncoder(TextEncoderInterface):
             device=torch.device('cpu')
         ).eval().requires_grad_(False)
         self.text_encoder.load_state_dict(
-            torch.load("wan_models/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
+            torch.load(f"{os.environ.get('MODELS_DIR', 'wan_models')}/Wan2.1-T2V-1.3B/models_t5_umt5-xxl-enc-bf16.pth",
                        map_location='cpu', weights_only=False)
         )
 
         self.tokenizer = HuggingfaceTokenizer(
-            name="wan_models/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
+            name=f"{os.environ.get('MODELS_DIR', 'wan_models')}/Wan2.1-T2V-1.3B/google/umt5-xxl/", seq_len=512, clean='whitespace')
 
     @property
     def device(self):
@@ -76,7 +77,7 @@ class WanVAEWrapper(VAEInterface):
         self.std = torch.tensor(std, dtype=torch.float32)
 
         self.model = _video_vae(
-            pretrained_path="wan_models/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
+            pretrained_path=f"{os.environ.get('MODELS_DIR', 'wan_models')}/Wan2.1-T2V-1.3B/Wan2.1_VAE.pth",
             z_dim=16,
         ).eval().requires_grad_(False)
 
@@ -101,7 +102,7 @@ class WanDiffusionWrapper(DiffusionModelInterface):
     def __init__(self):
         super().__init__()
 
-        self.model = WanModel.from_pretrained("wan_models/Wan2.1-T2V-1.3B/")
+        self.model = WanModel.from_pretrained(f"{os.environ.get('MODELS_DIR', 'wan_models')}/Wan2.1-T2V-1.3B/")
         self.model.eval()
 
         self.uniform_timestep = True
@@ -190,7 +191,7 @@ class CausalWanDiffusionWrapper(WanDiffusionWrapper):
         super().__init__()
 
         self.model = CausalWanModel.from_pretrained(
-            "wan_models/Wan2.1-T2V-1.3B/")
+            f"{os.environ.get('MODELS_DIR', 'wan_models')}/Wan2.1-T2V-1.3B/")
         self.model.eval()
 
         self.uniform_timestep = False

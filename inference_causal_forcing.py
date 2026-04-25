@@ -30,6 +30,10 @@ parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--i2v", action="store_true")
 args = parser.parse_args()
 
+if args.output_folder:
+    output_root = os.environ.get('OUTPUT_URL', '.')
+    args.output_folder = os.path.join(output_root, args.output_folder)
+
 # Initialize distributed inference
 if "LOCAL_RANK" in os.environ:
     dist.init_process_group(backend='nccl')

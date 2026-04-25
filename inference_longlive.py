@@ -24,6 +24,10 @@ args = parser.parse_args()
 default_config_path = os.path.join(os.path.dirname(args.config_path), "default_config.yaml")
 config = load_config(args.config_path, default_config_path=default_config_path)
 
+if config.output_folder:
+    output_root = os.environ.get('OUTPUT_URL', '.')
+    config.output_folder = os.path.join(output_root, config.output_folder)
+
 # Initialize distributed inference
 if "LOCAL_RANK" in os.environ:
     os.environ["NCCL_CROSS_NIC"] = "1"

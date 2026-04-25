@@ -33,6 +33,10 @@ parser.add_argument("--num_samples", type=int, default=1)
 parser.add_argument("--save_with_index", action="store_true")
 args = parser.parse_args()
 
+if args.output_folder:
+    output_root = os.environ.get('OUTPUT_URL', '.')
+    args.output_folder = os.path.join(output_root, args.output_folder)
+
 # Initialize distributed inference
 if "LOCAL_RANK" in os.environ:
     dist.init_process_group(backend='nccl')
