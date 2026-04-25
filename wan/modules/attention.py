@@ -1,4 +1,6 @@
 # Copyright 2024-2025 The Alibaba Wan Team Authors. All rights reserved.
+import os
+
 import torch
 
 try:
@@ -155,7 +157,10 @@ def attention(
     dtype=torch.bfloat16,
     fa_version=None,
 ):
-    if FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE:
+    device_type = os.environ.get('DEVICE_TYPE', 'cuda')
+    use_flash = (device_type != 'npu') and (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE)
+
+    if use_flash:
         return flash_attention(
             q=q,
             k=k,
@@ -176,14 +181,23 @@ def attention(
             warnings.warn(
                 'Padding mask is disabled when using scaled_dot_product_attention. It can have a significant impact on performance.'
             )
-        attn_mask = None
+        if window_size != (-1, -1):
+            warnings.warn(
+                'Sliding window attention is not fully supported with scaled_dot_product_attention. Using global attention instead.'
+            )
 
         q_t = q.transpose(1, 2).to(dtype)
         k_t = k.transpose(1, 2).to(dtype)
         v_t = v.transpose(1, 2).to(dtype)
 
+        if q_scale is not None:
+            q_t = q_t * q_scale
+
+        scale = softmax_scale
+
         out = torch.nn.functional.scaled_dot_product_attention(
-            q_t, k_t, v_t, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
+            q_t, k_t, v_t, attn_mask=None, is_causal=causal,
+            dropout_p=dropout_p, scale=scale)
 
         out_t = out.transpose(1, 2).contiguous()
         return out_t
