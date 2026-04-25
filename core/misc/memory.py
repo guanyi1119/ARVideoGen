@@ -3,11 +3,16 @@
 # Apache-2.0 License
 # By lllyasviel
 # [DIFF-Causal-Forcing/Self-Forcing] CF/SF do not use these utilities
+import os
 import torch
 
 
 cpu = torch.device('cpu')
-gpu = torch.device(f'cuda:{torch.cuda.current_device()}')
+_device_type = os.environ.get('DEVICE_TYPE', 'cuda')
+if _device_type == 'npu':
+    gpu = torch.device(f'npu:{torch.npu.current_device()}')
+else:
+    gpu = torch.device(f'cuda:{torch.cuda.current_device()}')
 gpu_complete_modules = []
 
 
