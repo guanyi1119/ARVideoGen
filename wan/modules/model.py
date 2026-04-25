@@ -151,8 +151,8 @@ class WanSelfAttention(nn.Module):
             window_size=self.window_size)
 
         # output
-        x = x.flatten(2)
-        x = self.o(x)
+        x_flat = x.flatten(2)
+        x = self.o(x_flat)
         return x
 
 
@@ -189,8 +189,8 @@ class WanT2VCrossAttention(WanSelfAttention):
         x = flash_attention(q, k, v, k_lens=context_lens)
 
         # output
-        x = x.flatten(2)
-        x = self.o(x)
+        x_flat = x.flatten(2)
+        x = self.o(x_flat)
         return x
 
 
@@ -217,8 +217,8 @@ class WanGanCrossAttention(WanSelfAttention):
         x = flash_attention(qq, kk, vv)
 
         # output
-        x = x.flatten(2)
-        x = self.o(x)
+        x_flat = x.flatten(2)
+        x = self.o(x_flat)
         return x
 
 
@@ -260,9 +260,9 @@ class WanI2VCrossAttention(WanSelfAttention):
         x = flash_attention(q, k, v, k_lens=context_lens)
 
         # output
-        x = x.flatten(2)
-        img_x = img_x.flatten(2)
-        x = x + img_x
+        x_flat = x.flatten(2)
+        img_x_flat = img_x.flatten(2)
+        x = x_flat + img_x_flat
         x = self.o(x)
         return x
 
@@ -904,8 +904,8 @@ class WanModel(ModelMixin, ConfigMixin):
         for u, v in zip(x, grid_sizes.tolist()):
             u = u[:math.prod(v)].view(*v, *self.patch_size, c)
             u = torch.einsum('fhwpqrc->cfphqwr', u)
-            u = u.reshape(c, *[i * j for i, j in zip(v, self.patch_size)])
-            out.append(u)
+            u_reshaped = u.reshape(c, *[i * j for i, j in zip(v, self.patch_size)])
+            out.append(u_reshaped)
         return out
 
     def init_weights(self):

@@ -112,7 +112,8 @@ class FlowMatchScheduler():
 
     def step(self, model_output, timestep, sample, to_final=False):
         if timestep.ndim == 2:
-            timestep = timestep.flatten(0, 1)
+            timestep_flat = timestep.flatten(0, 1)
+            timestep = timestep_flat
         self.sigmas = self.sigmas.to(model_output.device)
         self.timesteps = self.timesteps.to(model_output.device)
         timestep_id = torch.argmin(
@@ -128,7 +129,8 @@ class FlowMatchScheduler():
 
     def add_noise(self, original_samples, noise, timestep):
         if timestep.ndim == 2:
-            timestep = timestep.flatten(0, 1)
+            timestep_flat = timestep.flatten(0, 1)
+            timestep = timestep_flat
         self.sigmas = self.sigmas.to(noise.device)
         self.timesteps = self.timesteps.to(noise.device)
         timestep_id = torch.argmin(
@@ -143,7 +145,8 @@ class FlowMatchScheduler():
 
     def training_weight(self, timestep):
         if timestep.ndim == 2:
-            timestep = timestep.flatten(0, 1)
+            timestep_flat = timestep.flatten(0, 1)
+            timestep = timestep_flat
         self.linear_timesteps_weights = self.linear_timesteps_weights.to(timestep.device)
         timestep_id = torch.argmin(
             (self.timesteps.unsqueeze(1) - timestep.unsqueeze(0)).abs(), dim=0)

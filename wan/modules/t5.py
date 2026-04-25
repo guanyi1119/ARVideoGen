@@ -104,9 +104,9 @@ class T5Attention(nn.Module):
             attn_bias += pos_bias
         if mask is not None:
             assert mask.ndim in [2, 3]
-            mask = mask.view(b, 1, 1,
+            mask_view = mask.view(b, 1, 1,
                              -1) if mask.ndim == 2 else mask.unsqueeze(1)
-            attn_bias.masked_fill_(mask == 0, torch.finfo(x.dtype).min)
+            attn_bias.masked_fill_(mask_view == 0, torch.finfo(x.dtype).min)
 
         # compute attention (T5 does not use scaling)
         attn = torch.einsum('binc,bjnc->bnij', q, k) + attn_bias
@@ -114,8 +114,8 @@ class T5Attention(nn.Module):
         x = torch.einsum('bnij,bjnc->binc', attn, v)
 
         # output
-        x = x.reshape(b, -1, n * c)
-        x = self.o(x)
+        x_reshaped = x.reshape(b, -1, n * c)
+        x = self.o(x_reshaped)
         x = self.dropout(x)
         return x
 
@@ -238,9 +238,9 @@ class T5RelativeEmbedding(nn.Module):
             torch.arange(lq, device=device).unsqueeze(1)
         rel_pos = self._relative_position_bucket(rel_pos)
         rel_pos_embeds = self.embedding(rel_pos)
-        rel_pos_embeds = rel_pos_embeds.permute(2, 0, 1).unsqueeze(
+        rel_pos_embeds_unsq = rel_pos_embeds.permute(2, 0, 1).unsqueeze(
             0)  # [1, N, Lq, Lk]
-        return rel_pos_embeds.contiguous()
+        return rel_pos_embeds_unsq.contiguous()
 
     def _relative_position_bucket(self, rel_pos):
         # preprocess

@@ -72,7 +72,8 @@ def apply_model_with_memblocks(model, x, parallel, show_progress_bar):
     assert x.ndim == 5, f"TAEHV operates on NTCHW tensors, but got {x.ndim}-dim tensor"
     N, T, C, H, W = x.shape
     if parallel:
-        x = x.reshape(N * T, C, H, W)
+        x_reshaped = x.reshape(N * T, C, H, W)
+        x = x_reshaped
         # parallel over input timesteps, iterate over blocks
         for b in tqdm(model, disable=not show_progress_bar):
             if isinstance(b, MemBlock):
@@ -85,7 +86,8 @@ def apply_model_with_memblocks(model, x, parallel, show_progress_bar):
                 x = b(x)
         NT, C, H, W = x.shape
         T = NT // N
-        x = x.view(N, T, C, H, W)
+        x_view = x.view(N, T, C, H, W)
+        x = x_view
     else:
         # TODO(oboerbohan): at least on macos this still gradually uses more memory during decode...
         # need to fix :(

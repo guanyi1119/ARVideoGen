@@ -178,12 +178,12 @@ def attention(
             )
         attn_mask = None
 
-        q = q.transpose(1, 2).to(dtype)
-        k = k.transpose(1, 2).to(dtype)
-        v = v.transpose(1, 2).to(dtype)
+        q_t = q.transpose(1, 2).to(dtype)
+        k_t = k.transpose(1, 2).to(dtype)
+        v_t = v.transpose(1, 2).to(dtype)
 
         out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
+            q_t, k_t, v_t, attn_mask=attn_mask, is_causal=causal, dropout_p=dropout_p)
 
-        out = out.transpose(1, 2).contiguous()
-        return out
+        out_t = out.transpose(1, 2).contiguous()
+        return out_t

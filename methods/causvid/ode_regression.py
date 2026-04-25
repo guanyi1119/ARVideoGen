@@ -83,10 +83,12 @@ class ODERegression(nn.Module):
             return timestep
         elif self.args.generator_task == "causal_video":
             # make the noise level the same within every motion block
-            timestep = timestep.reshape(
+            ts_reshaped = timestep.reshape(
                 timestep.shape[0], -1, self.num_frame_per_block)
+            timestep = ts_reshaped
             timestep[:, :, 1:] = timestep[:, :, 0:1]
-            timestep = timestep.reshape(timestep.shape[0], -1)
+            ts_reshaped2 = timestep.reshape(timestep.shape[0], -1)
+            timestep = ts_reshaped2
             return timestep
         else:
             raise NotImplementedError()

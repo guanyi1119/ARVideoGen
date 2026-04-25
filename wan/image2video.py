@@ -210,8 +210,8 @@ class WanI2V:
             torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]
         ],
             dim=1)
-        msk = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
-        msk = msk.transpose(1, 2)[0]
+        msk_view = msk.view(1, msk.shape[1] // 4, 4, lat_h, lat_w)
+        msk_t = msk_view.transpose(1, 2)[0]
 
         if n_prompt == "":
             n_prompt = self.sample_neg_prompt
@@ -243,7 +243,7 @@ class WanI2V:
             ],
                 dim=1).to(self.device)
         ])[0]
-        y = torch.concat([msk, y])
+        y = torch.concat([msk_t, y])
 
         @contextmanager
         def noop_no_sync():

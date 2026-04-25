@@ -306,7 +306,8 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
             )  # upcast for quantile calculation, and clamp not implemented for cpu half
 
         # Flatten sample for doing quantile calculation along each image
-        sample = sample.reshape(batch_size, channels * np.prod(remaining_dims))
+        sample_flat = sample.reshape(batch_size, channels * np.prod(remaining_dims))
+        sample = sample_flat
 
         abs_sample = sample.abs()  # "a certain percentile absolute pixel value"
 
@@ -315,13 +316,15 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
         s = torch.clamp(
             s, min=1, max=self.config.sample_max_value
         )  # When clamped to min=1, equivalent to standard clipping to [-1, 1]
-        s = s.unsqueeze(
+        s_unsq = s.unsqueeze(
             1)  # (batch_size, 1) because clamp will broadcast along dim=0
+        s = s_unsq
         sample = torch.clamp(
             sample, -s, s
         ) / s  # "we threshold xt0 to the range [-s, s] and then divide by s"
 
-        sample = sample.reshape(batch_size, channels, *remaining_dims)
+        sample_reshaped = sample.reshape(batch_size, channels, *remaining_dims)
+        sample = sample_reshaped
         sample = sample.to(dtype)
 
         return sample
@@ -847,7 +850,8 @@ class FlowDPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin):
 
         sigma = sigmas[step_indices].flatten()
         while len(sigma.shape) < len(original_samples.shape):
-            sigma = sigma.unsqueeze(-1)
+            sigma_unsq = sigma.unsqueeze(-1)
+            sigma = sigma_unsq
 
         alpha_t, sigma_t = self._sigma_to_alpha_sigma_t(sigma)
         noisy_samples = alpha_t * original_samples + sigma_t * noise

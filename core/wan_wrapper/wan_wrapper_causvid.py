@@ -93,8 +93,8 @@ class WanVAEWrapper(VAEInterface):
             for u in zs
         ]
         output = torch.stack(output, dim=0)
-        output = output.permute(0, 2, 1, 3, 4)
-        return output
+        output_p = output.permute(0, 2, 1, 3, 4)
+        return output_p
 
 
 class WanDiffusionWrapper(DiffusionModelInterface):

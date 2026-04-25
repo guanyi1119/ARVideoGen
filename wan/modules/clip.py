@@ -83,12 +83,12 @@ class SelfAttention(nn.Module):
         # compute attention
         p = self.attn_dropout if self.training else 0.0
         x = flash_attention(q, k, v, dropout_p=p, causal=self.causal, version=2)
-        x = x.reshape(b, s, c)
+        x_reshaped = x.reshape(b, s, c)
 
         # output
-        x = self.proj(x)
-        x = F.dropout(x, self.proj_dropout, self.training)
-        return x
+        x_out = self.proj(x_reshaped)
+        x_out = F.dropout(x_out, self.proj_dropout, self.training)
+        return x_out
 
 
 class SwiGLU(nn.Module):
@@ -195,15 +195,15 @@ class AttentionPool(nn.Module):
 
         # compute attention
         x = flash_attention(q, k, v, version=2)
-        x = x.reshape(b, 1, c)
+        x_reshaped = x.reshape(b, 1, c)
 
         # output
-        x = self.proj(x)
-        x = F.dropout(x, self.proj_dropout, self.training)
+        x_out = self.proj(x_reshaped)
+        x_out = F.dropout(x_out, self.proj_dropout, self.training)
 
         # mlp
-        x = x + self.mlp(self.norm(x))
-        return x[:, 0]
+        x_out = x_out + self.mlp(self.norm(x_out))
+        return x_out[:, 0]
 
 
 class VisionTransformer(nn.Module):

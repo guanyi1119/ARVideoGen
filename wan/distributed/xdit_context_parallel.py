@@ -187,6 +187,6 @@ def usp_attn_forward(self,
     # x = torch.cat([x, x.new_zeros(b, s - x.size(1), n, d)], dim=1)
 
     # output
-    x = x.flatten(2)
-    x = self.o(x)
+    x_flat = x.flatten(2)
+    x = self.o(x_flat)
     return x

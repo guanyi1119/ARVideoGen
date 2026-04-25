@@ -44,15 +44,15 @@ def get_bytes(txn, key):
 def latents_bytes_to_out(row_bytes, in_row_shape, out_row_shape):
     a = np.frombuffer(row_bytes, dtype=np.float16)
     if len(in_row_shape) == 4:
-        a = a.reshape(in_row_shape)[None, ...]
+        a_reshaped = a.reshape(in_row_shape)[None, ...]
     elif len(in_row_shape) == 5:
-        a = a.reshape(in_row_shape)
-        if a.shape[0] != 1: a = a[-1:]
+        a_reshaped = a.reshape(in_row_shape)
+        if a_reshaped.shape[0] != 1: a_reshaped = a_reshaped[-1:]
     else:
         raise RuntimeError(f"unsupported latents row shape: {in_row_shape}")
-    if tuple(a.shape) != out_row_shape:
-        raise RuntimeError(f"latents row shape mismatch: got {a.shape} vs expect {out_row_shape}")
-    return np.ascontiguousarray(a).tobytes()
+    if tuple(a_reshaped.shape) != out_row_shape:
+        raise RuntimeError(f"latents row shape mismatch: got {a_reshaped.shape} vs expect {out_row_shape}")
+    return np.ascontiguousarray(a_reshaped).tobytes()
 
 def merge_many(src_dirs_all, dst_dir):
     src_dirs = [d for d in tqdm(src_dirs_all, desc=f"scan -> {dst_dir}", unit="dir") if os.path.isdir(d)]

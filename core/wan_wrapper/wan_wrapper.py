@@ -86,8 +86,8 @@ class WanVAEWrapper(torch.nn.Module):
             for u in pixel
         ]
         output = torch.stack(output, dim=0)
-        output = output.permute(0, 2, 1, 3, 4)
-        return output
+        output_p = output.permute(0, 2, 1, 3, 4)
+        return output_p
 
     def decode_to_pixel(self, latent: torch.Tensor, use_cache: bool = False) -> torch.Tensor:
         zs = latent.permute(0, 2, 1, 3, 4)
@@ -107,8 +107,8 @@ class WanVAEWrapper(torch.nn.Module):
         for u in zs:
             output.append(decode_function(u.unsqueeze(0), scale).float().clamp_(-1, 1).squeeze(0))
         output = torch.stack(output, dim=0)
-        output = output.permute(0, 2, 1, 3, 4)
-        return output
+        output_p = output.permute(0, 2, 1, 3, 4)
+        return output_p
 
 
 class WanDiffusionWrapper(torch.nn.Module):
@@ -240,7 +240,8 @@ class WanDiffusionWrapper(torch.nn.Module):
                         gan_ca_blocks=self._gan_ca_blocks,
                         concat_time_embeddings=concat_time_embeddings
                     )
-                    flow_pred = flow_pred.permute(0, 2, 1, 3, 4)
+                    flow_pred_p = flow_pred.permute(0, 2, 1, 3, 4)
+                    flow_pred = flow_pred_p
                 else:
                     flow_pred = self.model(
                         noisy_image_or_video.permute(0, 2, 1, 3, 4),

@@ -75,10 +75,10 @@ class Resample(nn.Module):
                     feat_cache[idx] = cache_x
                     feat_idx[0] += 1
 
-                    x = x.reshape(b, 2, c, t, h, w)
-                    x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]),
+                    x_reshaped = x.reshape(b, 2, c, t, h, w)
+                    x_reshaped = torch.stack((x_reshaped[:, 0, :, :, :, :], x_reshaped[:, 1, :, :, :, :]),
                                     3)
-                    x = x.reshape(b, c, t * 2, h, w)
+                    x = x_reshaped.reshape(b, c, t * 2, h, w)
         t = x.shape[2]
         x = rearrange(x, 'b c t h w -> (b t) c h w')
         x = self.resample(x)
@@ -151,21 +151,21 @@ class VAEDecoderWrapper(nn.Module):
     ):
         # from [batch_size, num_frames, num_channels, height, width]
         # to [batch_size, num_channels, num_frames, height, width]
-        z = z.permute(0, 2, 1, 3, 4)
+        z_p = z.permute(0, 2, 1, 3, 4)
         feat_cache = list(feat_cache)
         print("Length of feat_cache: ", len(feat_cache))
 
-        device, dtype = z.device, z.dtype
+        device, dtype = z_p.device, z_p.dtype
         scale = [self.mean.to(device=device, dtype=dtype),
                  1.0 / self.std.to(device=device, dtype=dtype)]
 
         if isinstance(scale[0], torch.Tensor):
-            z = z / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
+            z_p = z_p / scale[1].view(1, self.z_dim, 1, 1, 1) + scale[0].view(
                 1, self.z_dim, 1, 1, 1)
         else:
-            z = z / scale[1] + scale[0]
-        iter_ = z.shape[2]
-        x = self.conv2(z)
+            z_p = z_p / scale[1] + scale[0]
+        iter_ = z_p.shape[2]
+        x = self.conv2(z_p)
         for i in range(iter_):
             if i == 0:
                 out, feat_cache = self.decoder(
@@ -180,8 +180,8 @@ class VAEDecoderWrapper(nn.Module):
         out = out.float().clamp_(-1, 1)
         # from [batch_size, num_channels, num_frames, height, width]
         # to [batch_size, num_frames, num_channels, height, width]
-        out = out.permute(0, 2, 1, 3, 4)
-        return out, feat_cache
+        out_p = out.permute(0, 2, 1, 3, 4)
+        return out_p, feat_cache
 
 
 class VAEDecoder3d(nn.Module):

@@ -409,9 +409,9 @@ class CausalWanSelfAttention(nn.Module):
                 )
 
         # output
-        x = x.flatten(2)
-        x = self.o(x)
-        
+        x_flat = x.flatten(2)
+        x = self.o(x_flat)
+
         # Return both output and cache update info
         if kv_cache is not None:
             return x, (current_end, local_end_index, cache_update_info)
@@ -1306,8 +1306,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         for u, v in zip(x, grid_sizes.tolist()):
             u = u[:math.prod(v)].view(*v, *self.patch_size, c)
             u = torch.einsum('fhwpqrc->cfphqwr', u)
-            u = u.reshape(c, *[i * j for i, j in zip(v, self.patch_size)])
-            out.append(u)
+            u_reshaped = u.reshape(c, *[i * j for i, j in zip(v, self.patch_size)])
+            out.append(u_reshaped)
         return out
 
     def init_weights(self):

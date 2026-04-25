@@ -187,8 +187,8 @@ def batch_mixture(a, b=None, probability_a=0.5, mask_a=None):
         mask_a = torch.rand(batch_size) < probability_a
 
     mask_a = mask_a.to(a.device)
-    mask_a = mask_a.reshape((batch_size,) + (1,) * (a.dim() - 1))
-    result = torch.where(mask_a, a, b)
+    mask_a_reshaped = mask_a.reshape((batch_size,) + (1,) * (a.dim() - 1))
+    result = torch.where(mask_a_reshaped, a, b)
     return result
 
 
@@ -421,8 +421,8 @@ def pytorch2numpy(imgs):
 @torch.inference_mode()
 def numpy2pytorch(imgs):
     h = torch.from_numpy(np.stack(imgs, axis=0)).float() / 127.5 - 1.0
-    h = h.movedim(-1, 1)
-    return h
+    h_md = h.movedim(-1, 1)
+    return h_md
 
 
 @torch.no_grad()

@@ -31,19 +31,19 @@ class SelfAttention(nn.Module):
         b, s, c, n, d = *x.size(), self.num_heads, self.head_dim
 
         # compute query, key, value
-        q = self.q(x).reshape(b, s, n, d).permute(0, 2, 1, 3)
-        k = self.k(x).reshape(b, s, n, d).permute(0, 2, 1, 3)
-        v = self.v(x).reshape(b, s, n, d).permute(0, 2, 1, 3)
+        q_p = self.q(x).reshape(b, s, n, d).permute(0, 2, 1, 3)
+        k_p = self.k(x).reshape(b, s, n, d).permute(0, 2, 1, 3)
+        v_p = self.v(x).reshape(b, s, n, d).permute(0, 2, 1, 3)
 
         # compute attention
         p = self.dropout.p if self.training else 0.0
-        x = F.scaled_dot_product_attention(q, k, v, mask, p)
-        x = x.permute(0, 2, 1, 3).reshape(b, s, c)
+        x_attn = F.scaled_dot_product_attention(q_p, k_p, v_p, mask, p)
+        x_reshaped = x_attn.permute(0, 2, 1, 3).reshape(b, s, c)
 
         # output
-        x = self.o(x)
-        x = self.dropout(x)
-        return x
+        x_out = self.o(x_reshaped)
+        x_out = self.dropout(x_out)
+        return x_out
 
 
 class AttentionBlock(nn.Module):

@@ -90,17 +90,21 @@ class BaseModel(nn.Module):
             )
             if self.independent_first_frame:
                 timestep_from_second = timestep[:, 1:]
-                timestep_from_second = timestep_from_second.reshape(
+                tfs_reshaped = timestep_from_second.reshape(
                     timestep_from_second.shape[0], -1, num_frame_per_block)
+                timestep_from_second = tfs_reshaped
                 timestep_from_second[:, :, 1:] = timestep_from_second[:, :, 0:1]
-                timestep_from_second = timestep_from_second.reshape(
+                tfs_reshaped2 = timestep_from_second.reshape(
                     timestep_from_second.shape[0], -1)
+                timestep_from_second = tfs_reshaped2
                 timestep = torch.cat([timestep[:, 0:1], timestep_from_second], dim=1)
             else:
-                timestep = timestep.reshape(
+                ts_reshaped = timestep.reshape(
                     timestep.shape[0], -1, num_frame_per_block)
+                timestep = ts_reshaped
                 timestep[:, :, 1:] = timestep[:, :, 0:1]
-                timestep = timestep.reshape(timestep.shape[0], -1)
+                ts_reshaped2 = timestep.reshape(timestep.shape[0], -1)
+                timestep = ts_reshaped2
             return timestep
 
 

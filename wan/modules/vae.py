@@ -133,10 +133,10 @@ class Resample(nn.Module):
                     feat_cache[idx] = cache_x
                     feat_idx[0] += 1
 
-                    x = x.reshape(b, 2, c, t, h, w)
-                    x = torch.stack((x[:, 0, :, :, :, :], x[:, 1, :, :, :, :]),
+                    x_reshaped = x.reshape(b, 2, c, t, h, w)
+                    x_reshaped = torch.stack((x_reshaped[:, 0, :, :, :, :], x_reshaped[:, 1, :, :, :, :]),
                                     3)
-                    x = x.reshape(b, c, t * 2, h, w)
+                    x = x_reshaped.reshape(b, c, t * 2, h, w)
         t = x.shape[2]
         x = rearrange(x, 'b c t h w -> (b t) c h w')
         x = self.resample(x)
@@ -256,10 +256,10 @@ class AttentionBlock(nn.Module):
             k,
             v,
         )
-        x = x.squeeze(1).permute(0, 2, 1).reshape(b * t, c, h, w)
+        x_reshaped = x.squeeze(1).permute(0, 2, 1).reshape(b * t, c, h, w)
 
         # output
-        x = self.proj(x)
+        x = self.proj(x_reshaped)
         x = rearrange(x, '(b t) c h w-> b c t h w', t=t)
         return x + identity
 
