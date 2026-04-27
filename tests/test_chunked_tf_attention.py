@@ -97,6 +97,10 @@ def chunked_tf_attention(q, k, v, grid_sizes, freqs, num_frame_per_block):
     Mathematically equivalent to flex_attention with BlockMask,
     but processes one query chunk at a time to reduce peak memory.
 
+    Key design: RoPE is applied to the full clean/noisy halves first (matching
+    the original code which applies rope to each half separately), then we slice
+    the already-roped tensors into chunks for per-chunk sdpa.
+
     Args:
         q, k, v: [B, total_len, num_heads, head_dim] where total_len = 2 * N
         grid_sizes: [B, 3] tensor with (F, H, W) per sample
@@ -105,7 +109,7 @@ def chunked_tf_attention(q, k, v, grid_sizes, freqs, num_frame_per_block):
     Returns:
         [B, total_len, num_heads, head_dim]
     """
-    frame_seqlen = grid_sizes[0, 1].item() * grid_sizes[0, 2].item()  # H * W (spatial tokens per frame)
+    frame_seqlen = grid_sizes[0, 1].item() * grid_sizes[0, 2].item()
     chunk_size = frame_seqlen * num_frame_per_block
     N = q.shape[1] // 2  # clean part length
     num_chunks = N // chunk_size
@@ -118,25 +122,28 @@ def chunked_tf_attention(q, k, v, grid_sizes, freqs, num_frame_per_block):
     v_clean = v[:, :N]
     v_noisy = v[:, N:]
 
+    # Apply RoPE to full halves first (matching original code's split-then-rope pattern)
+    # This avoids the shape mismatch from applying rope to short chunks
+    roped_q_clean = rope_apply_ref(q_clean, grid_sizes, freqs).type_as(v)
+    roped_k_clean = rope_apply_ref(k_clean, grid_sizes, freqs).type_as(v)
+    roped_q_noisy = rope_apply_ref(q_noisy, grid_sizes, freqs).type_as(v)
+    roped_k_noisy = rope_apply_ref(k_noisy, grid_sizes, freqs).type_as(v)
+
     outputs = []
 
     # Process clean chunks
     for chunk_idx in range(num_chunks):
         q_start = chunk_idx * chunk_size
         q_end = q_start + chunk_size
-        q_chunk = q_clean[:, q_start:q_end]
 
-        # Apply RoPE
-        roped_q = rope_apply_ref(q_chunk, grid_sizes, freqs).type_as(v)
-
+        roped_q_chunk = roped_q_clean[:, q_start:q_end]
         # KV: clean tokens [0, q_end) - block causal within clean part
-        k_slice = k_clean[:, :q_end]
+        roped_k_slice = roped_k_clean[:, :q_end]
         v_slice = v_clean[:, :q_end]
-        roped_k = rope_apply_ref(k_slice, grid_sizes, freqs).type_as(v)
 
-        # This is a standard causal pattern (lower triangular)
+        # Standard causal pattern (lower triangular) within [0, q_end)
         attn_out = F.scaled_dot_product_attention(
-            roped_q.transpose(1, 2), roped_k.transpose(1, 2), v_slice.transpose(1, 2),
+            roped_q_chunk.transpose(1, 2), roped_k_slice.transpose(1, 2), v_slice.transpose(1, 2),
             attn_mask=None, is_causal=True
         ).transpose(1, 2)
         outputs.append(attn_out)
@@ -145,10 +152,8 @@ def chunked_tf_attention(q, k, v, grid_sizes, freqs, num_frame_per_block):
     for chunk_idx in range(num_chunks):
         q_start = chunk_idx * chunk_size
         q_end = q_start + chunk_size
-        q_chunk = q_noisy[:, q_start:q_end]
 
-        # Apply RoPE
-        roped_q = rope_apply_ref(q_chunk, grid_sizes, freqs).type_as(v)
+        roped_q_chunk = roped_q_noisy[:, q_start:q_end]
 
         # KV range for noisy chunk k:
         # - clean tokens [0, chunk_idx * chunk_size)
@@ -157,22 +162,17 @@ def chunked_tf_attention(q, k, v, grid_sizes, freqs, num_frame_per_block):
         noisy_kv_start_in_noisy = chunk_idx * chunk_size
         noisy_kv_end_in_noisy = (chunk_idx + 1) * chunk_size
 
-        k_clean_slice = k_clean[:, :clean_kv_end]
+        roped_k_clean_slice = roped_k_clean[:, :clean_kv_end]
         v_clean_slice = v_clean[:, :clean_kv_end]
-        k_noisy_slice = k_noisy[:, noisy_kv_start_in_noisy:noisy_kv_end_in_noisy]
+        roped_k_noisy_slice = roped_k_noisy[:, noisy_kv_start_in_noisy:noisy_kv_end_in_noisy]
         v_noisy_slice = v_noisy[:, noisy_kv_start_in_noisy:noisy_kv_end_in_noisy]
 
-        k_combined = torch.cat([k_clean_slice, k_noisy_slice], dim=1)
+        roped_k_combined = torch.cat([roped_k_clean_slice, roped_k_noisy_slice], dim=1)
         v_combined = torch.cat([v_clean_slice, v_noisy_slice], dim=1)
-
-        # Apply RoPE to combined KV
-        roped_k_clean = rope_apply_ref(k_clean_slice, grid_sizes, freqs).type_as(v)
-        roped_k_noisy = rope_apply_ref(k_noisy_slice, grid_sizes, freqs).type_as(v)
-        roped_k = torch.cat([roped_k_clean, roped_k_noisy], dim=1)
 
         # No causal mask needed - we've already selected only allowed KV tokens
         attn_out = F.scaled_dot_product_attention(
-            roped_q.transpose(1, 2), roped_k.transpose(1, 2), v_combined.transpose(1, 2),
+            roped_q_chunk.transpose(1, 2), roped_k_combined.transpose(1, 2), v_combined.transpose(1, 2),
             attn_mask=None, is_causal=False
         ).transpose(1, 2)
         outputs.append(attn_out)
@@ -266,28 +266,22 @@ def main():
     v = torch.randn(1, total_len, args.num_heads, args.head_dim, device=device, dtype=dtype)
 
     # grid_sizes: [B, 3] = (F, H, W)
-    # We need H*W = frame_seqlen. Choose H and W such that H*W = frame_seqlen
-    # For frame_seqlen=256: H=16, W=16
-    # For frame_seqlen=1560: H=30, W=52
-    # Generic: find factors
     h = int(math.sqrt(args.frame_seqlen))
     while args.frame_seqlen % h != 0:
         h -= 1
     w = args.frame_seqlen // h
     grid_sizes = torch.tensor([[args.num_frames, h, w]], dtype=torch.long)
 
-    # Create RoPE frequencies (simplified - just need correct shape)
-    # freqs shape: [max_seq_len, head_dim // 2]
+    # Create RoPE frequencies on the same device as q/k/v
     max_seq_len = max(args.num_frames, h, w) + 100
     head_dim = args.head_dim
     dim = head_dim // 2
-    # Split into 3 parts for temporal, height, width
     t_dim = dim - 2 * (dim // 3)
     hw_dim = dim // 3
 
-    freqs_t = torch.randn(max_seq_len, t_dim, dtype=torch.float32)
-    freqs_h = torch.randn(max_seq_len, hw_dim, dtype=torch.float32)
-    freqs_w = torch.randn(max_seq_len, hw_dim, dtype=torch.float32)
+    freqs_t = torch.randn(max_seq_len, t_dim, dtype=torch.float32, device=device)
+    freqs_h = torch.randn(max_seq_len, hw_dim, dtype=torch.float32, device=device)
+    freqs_w = torch.randn(max_seq_len, hw_dim, dtype=torch.float32, device=device)
     freqs = torch.cat([freqs_t, freqs_h, freqs_w], dim=1)
 
     # Create BlockMask
@@ -350,7 +344,6 @@ def main():
         out_flex_f = out_flex.float()
         out_chunked_f = out_chunked.float()
 
-        # Overall stats
         abs_diff = (out_flex_f - out_chunked_f).abs()
         rel_diff = abs_diff / (out_flex_f.abs().clamp(min=1e-6))
 
@@ -361,7 +354,6 @@ def main():
 
         # Per-chunk comparison
         chunk_size = args.frame_seqlen * args.num_frame_per_block
-        N = args.num_frames * args.frame_seqlen
         num_chunks = N // chunk_size
 
         print(f"\n  Per-chunk analysis:")
