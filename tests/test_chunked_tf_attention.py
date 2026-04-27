@@ -137,14 +137,20 @@ def chunked_tf_attention(q, k, v, grid_sizes, freqs, num_frame_per_block):
         q_end = q_start + chunk_size
 
         roped_q_chunk = roped_q_clean[:, q_start:q_end]
-        # KV: clean tokens [0, q_end) - block causal within clean part
+        # KV: clean tokens [0, q_end)
+        # Block-causal: tokens within the same chunk attend to each other bidirectionally,
+        # plus all tokens in earlier chunks. This is NOT standard causal (lower triangular).
+        # context_ends for this chunk = q_end, so all KV in [0, q_end) are allowed.
+        # We need: for query token at position q_start+i, it attends to KV in [0, q_end).
+        # But we also need the diagonal q==kv (eye_mask) for out-of-range cases.
+        # Since q is in [q_start, q_end) and KV is [0, q_end), every query attends to every KV.
+        # So no mask needed - full attention within [0, q_end).
         roped_k_slice = roped_k_clean[:, :q_end]
         v_slice = v_clean[:, :q_end]
 
-        # Standard causal pattern (lower triangular) within [0, q_end)
         attn_out = F.scaled_dot_product_attention(
             roped_q_chunk.transpose(1, 2), roped_k_slice.transpose(1, 2), v_slice.transpose(1, 2),
-            attn_mask=None, is_causal=True
+            attn_mask=None, is_causal=False
         ).transpose(1, 2)
         outputs.append(attn_out)
 
@@ -222,7 +228,11 @@ def flex_attention_baseline(q, k, v, grid_sizes, freqs, block_mask):
         key=padded_roped_key.transpose(2, 1),
         value=padded_v.transpose(2, 1),
         block_mask=block_mask
-    )[:, :, :-padded_length].transpose(2, 1)
+    ).transpose(2, 1)
+
+    # Remove padding ([:, :, :-0] = [:, :, :0] which is wrong)
+    if padded_length > 0:
+        x = x[:, :-padded_length]
 
     return x
 
