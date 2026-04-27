@@ -3,6 +3,8 @@ real_score_fsdp_wrap_strategy: size
 fake_score_fsdp_wrap_strategy: size
 real_name: Wan2.1-T2V-1.3B
 text_encoder_fsdp_wrap_strategy: size
+real_score_cpu_offload: true
+text_encoder_cpu_offload: true
 warp_denoising_step: true 
 ts_schedule: false
 num_train_timestep: 1000

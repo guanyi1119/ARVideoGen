@@ -66,14 +66,16 @@ class Trainer:
             wrap_strategy=config.generator_fsdp_wrap_strategy,
             cpu_offload=False
         )
+        torch.cuda.empty_cache()
 
         self.model.real_score = fsdp_wrap(
             self.model.real_score,
             sharding_strategy=config.sharding_strategy,
             mixed_precision=config.mixed_precision,
             wrap_strategy=config.real_score_fsdp_wrap_strategy,
-            cpu_offload=False
+            cpu_offload=getattr(config, "real_score_cpu_offload", False)
         )
+        torch.cuda.empty_cache()
 
         self.model.fake_score = fsdp_wrap(
             self.model.fake_score,
@@ -82,6 +84,7 @@ class Trainer:
             wrap_strategy=config.fake_score_fsdp_wrap_strategy,
             cpu_offload=False
         )
+        torch.cuda.empty_cache()
 
         self.model.text_encoder = fsdp_wrap(
             self.model.text_encoder,
@@ -90,6 +93,7 @@ class Trainer:
             wrap_strategy=config.text_encoder_fsdp_wrap_strategy,
             cpu_offload=getattr(config, "text_encoder_cpu_offload", False)
         )
+        torch.cuda.empty_cache()
 
         if not config.no_visualize or config.load_raw_video:
             self.model.vae = self.model.vae.to(

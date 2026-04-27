@@ -4,6 +4,8 @@ real_score_fsdp_wrap_strategy: size
 fake_score_fsdp_wrap_strategy: size
 real_name: Wan2.1-T2V-14B
 text_encoder_fsdp_wrap_strategy: size
+real_score_cpu_offload: true
+text_encoder_cpu_offload: true
 denoising_step_list:
 - 1000
 - 750
