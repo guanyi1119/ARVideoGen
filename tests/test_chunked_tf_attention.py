@@ -1,23 +1,22 @@
 """
-Standalone test script for comparing _chunked_tf_attention vs flex_attention + BlockMask.
-
-This script:
-1. Creates a CausalWanSelfAttention-like setup with the TF mask
-2. Runs both flex_attention (with BlockMask) and _chunked_tf_attention
-3. Compares numerical results and GPU memory usage
+Standalone test script for comparing chunked_flex_attention vs flex_attention + BlockMask.
 
 Usage:
-    python tests/test_chunked_tf_attention.py [--num_frames 9] [--frame_seqlen 256] [--num_frame_per_block 3]
-    # Use small values for quick local testing
-    # Use production values (21, 1560, 3) on GPU with enough memory
+    # Quick test (small shapes, bf16)
+    python tests/test_chunked_tf_attention.py --num_frames 9 --frame_seqlen 256 --num_frame_per_block 3
+
+    # Float32 mode to check if differences are precision-related
+    python tests/test_chunked_tf_attention.py --num_frames 9 --frame_seqlen 256 --num_frame_per_block 3 --dtype float32
+
+    # Production scale
+    python tests/test_chunked_tf_attention.py --num_frames 21 --frame_seqlen 1560 --num_frame_per_block 3
 """
 
 import argparse
 import math
-import os
 import torch
 import torch.nn.functional as F
-from torch.nn.attention.flex_attention import create_block_mask, flex_attention as _flex_attention, BlockMask
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention as _flex_attention
 
 
 def rope_apply_ref(x, grid_sizes, freqs):
@@ -41,9 +40,7 @@ def rope_apply_ref(x, grid_sizes, freqs):
 
 
 def prepare_teacher_forcing_mask(device, num_frames, frame_seqlen, num_frame_per_block):
-    """
-    Recreate _prepare_teacher_forcing_mask from causal_model.py:578-664
-    """
+    """Recreate _prepare_teacher_forcing_mask from causal_model.py:578-664"""
     total_length = num_frames * frame_seqlen * 2
     padded_length = math.ceil(total_length / 128) * 128 - total_length
 
@@ -57,16 +54,14 @@ def prepare_teacher_forcing_mask(device, num_frames, frame_seqlen, num_frame_per
     attention_block_size = frame_seqlen * num_frame_per_block
     frame_indices = torch.arange(
         start=0, end=num_frames * frame_seqlen,
-        step=attention_block_size, device=device, dtype=torch.long
-    )
+        step=attention_block_size, device=device, dtype=torch.long)
 
     for start in frame_indices:
         context_ends[start:start + attention_block_size] = start + attention_block_size
 
     noisy_image_start_list = torch.arange(
         num_frames * frame_seqlen, total_length,
-        step=attention_block_size, device=device, dtype=torch.long
-    )
+        step=attention_block_size, device=device, dtype=torch.long)
     noisy_image_end_list = noisy_image_start_list + attention_block_size
 
     for block_index, (start, end) in enumerate(zip(noisy_image_start_list, noisy_image_end_list)):
@@ -86,165 +81,74 @@ def prepare_teacher_forcing_mask(device, num_frames, frame_seqlen, num_frame_per
         attention_mask, B=None, H=None,
         Q_LEN=total_length + padded_length,
         KV_LEN=total_length + padded_length,
-        _compile=False, device=device
-    )
+        _compile=False, device=device)
     return block_mask
 
 
-def chunked_tf_attention(q, k, v, grid_sizes, freqs, num_frame_per_block):
+def chunked_flex_attention(query, key, value, block_mask=None):
     """
-    Chunk-based attention for teacher forcing.
-    Mathematically equivalent to flex_attention with BlockMask,
-    but processes one query chunk at a time to reduce peak memory.
+    Drop-in replacement for flex_attention(query, key, value, block_mask).
+    Same [B, H, L, D] input/output format.
 
-    Key design: RoPE is applied to the full clean/noisy halves first (matching
-    the original code which applies rope to each half separately), then we slice
-    the already-roped tensors into chunks for per-chunk sdpa.
-
-    Args:
-        q, k, v: [B, total_len, num_heads, head_dim] where total_len = 2 * N
-        grid_sizes: [B, 3] tensor with (F, H, W) per sample
-        freqs: RoPE frequencies
-        num_frame_per_block: number of frames per causal block
-    Returns:
-        [B, total_len, num_heads, head_dim]
+    Processes attention per Q-block (128 tokens) using block_mask.kv_indices
+    to gather relevant KV, then computes sdpa with a fine-grained boolean
+    mask derived from block_mask.mask_mod. This avoids materializing the
+    full N×N attention matrix, reducing peak memory from O(N²) to
+    O(block_size × N).
     """
-    frame_seqlen = grid_sizes[0, 1].item() * grid_sizes[0, 2].item()
-    chunk_size = frame_seqlen * num_frame_per_block
-    N = q.shape[1] // 2  # clean part length
-    num_chunks = N // chunk_size
+    B, H, L, D = query.shape
+    BLOCK_SIZE = block_mask.BLOCK_SIZE
+    mask_mod = block_mask.mask_mod
+    num_q_blocks = L // BLOCK_SIZE + (1 if L % BLOCK_SIZE else 0)
 
-    # Split into clean and noisy halves
-    q_clean = q[:, :N]
-    q_noisy = q[:, N:]
-    k_clean = k[:, :N]
-    k_noisy = k[:, N:]
-    v_clean = v[:, :N]
-    v_noisy = v[:, N:]
+    output = torch.zeros_like(query)
 
-    # Apply RoPE to full halves first (matching original code's split-then-rope pattern)
-    # This avoids the shape mismatch from applying rope to short chunks
-    roped_q_clean = rope_apply_ref(q_clean, grid_sizes, freqs).type_as(v)
-    roped_k_clean = rope_apply_ref(k_clean, grid_sizes, freqs).type_as(v)
-    roped_q_noisy = rope_apply_ref(q_noisy, grid_sizes, freqs).type_as(v)
-    roped_k_noisy = rope_apply_ref(k_noisy, grid_sizes, freqs).type_as(v)
+    for q_bi in range(num_q_blocks):
+        q_start = q_bi * BLOCK_SIZE
+        q_end = min(q_start + BLOCK_SIZE, L)
+        if q_start >= L:
+            break
 
-    outputs = []
+        # Get allowed KV blocks (head 0 indices - same for all heads when mask is H-independent)
+        num_kv = block_mask.kv_num_blocks[0, 0, q_bi].item()
+        if num_kv == 0:
+            continue
+        kv_block_ids = block_mask.kv_indices[0, 0, q_bi, :num_kv]
 
-    # Process clean chunks
-    for chunk_idx in range(num_chunks):
-        q_start = chunk_idx * chunk_size
-        q_end = q_start + chunk_size
+        # Gather KV for all B, H at once
+        kv_slices = []
+        kv_positions = []
+        for kv_id in kv_block_ids.tolist():
+            ks = kv_id * BLOCK_SIZE
+            ke = min(ks + BLOCK_SIZE, L)
+            kv_slices.append((ks, ke))
+            kv_positions.append(torch.arange(ks, ke, device=query.device))
 
-        roped_q_chunk = roped_q_clean[:, q_start:q_end]
-        # KV: clean tokens [0, q_end)
-        # Block-causal: tokens within the same chunk attend to each other bidirectionally,
-        # plus all tokens in earlier chunks. This is NOT standard causal (lower triangular).
-        # context_ends for this chunk = q_end, so all KV in [0, q_end) are allowed.
-        # We need: for query token at position q_start+i, it attends to KV in [0, q_end).
-        # But we also need the diagonal q==kv (eye_mask) for out-of-range cases.
-        # Since q is in [q_start, q_end) and KV is [0, q_end), every query attends to every KV.
-        # So no mask needed - full attention within [0, q_end).
-        roped_k_slice = roped_k_clean[:, :q_end]
-        v_slice = v_clean[:, :q_end]
+        k_gathered = torch.cat([key[:, :, s:e] for s, e in kv_slices], dim=2)
+        v_gathered = torch.cat([value[:, :, s:e] for s, e in kv_slices], dim=2)
+        kv_indices = torch.cat(kv_positions)  # absolute positions in original sequence
 
-        attn_out = F.scaled_dot_product_attention(
-            roped_q_chunk.transpose(1, 2), roped_k_slice.transpose(1, 2), v_slice.transpose(1, 2),
-            attn_mask=None, is_causal=False
-        ).transpose(1, 2)
-        outputs.append(attn_out)
+        # Build fine-grained mask via mask_mod with broadcasting
+        q_indices = torch.arange(q_start, q_end, device=query.device)
+        q_2d = q_indices.unsqueeze(1)    # [q_size, 1]
+        kv_2d = kv_indices.unsqueeze(0)  # [1, kv_gathered_size]
+        fine_mask = mask_mod(0, 0, q_2d, kv_2d)  # [q_size, kv_gathered_size]
 
-    # Process noisy chunks
-    for chunk_idx in range(num_chunks):
-        q_start = chunk_idx * chunk_size
-        q_end = q_start + chunk_size
+        # sdpa: [B, H, q_size, D] x [B, H, kv_size, D] -> [B, H, q_size, D]
+        q_chunk = query[:, :, q_start:q_end]
+        attn_mask = fine_mask.unsqueeze(0).unsqueeze(0).expand(B, H, -1, -1)
 
-        roped_q_chunk = roped_q_noisy[:, q_start:q_end]
+        output[:, :, q_start:q_end] = F.scaled_dot_product_attention(
+            q_chunk, k_gathered, v_gathered, attn_mask=attn_mask)
 
-        # KV range for noisy chunk k:
-        # - clean tokens [0, chunk_idx * chunk_size)
-        # - noisy tokens in same block [N + chunk_idx * chunk_size, N + (chunk_idx+1) * chunk_size)
-        clean_kv_end = chunk_idx * chunk_size
-        noisy_kv_start_in_noisy = chunk_idx * chunk_size
-        noisy_kv_end_in_noisy = (chunk_idx + 1) * chunk_size
-
-        roped_k_clean_slice = roped_k_clean[:, :clean_kv_end]
-        v_clean_slice = v_clean[:, :clean_kv_end]
-        roped_k_noisy_slice = roped_k_noisy[:, noisy_kv_start_in_noisy:noisy_kv_end_in_noisy]
-        v_noisy_slice = v_noisy[:, noisy_kv_start_in_noisy:noisy_kv_end_in_noisy]
-
-        roped_k_combined = torch.cat([roped_k_clean_slice, roped_k_noisy_slice], dim=1)
-        v_combined = torch.cat([v_clean_slice, v_noisy_slice], dim=1)
-
-        # No causal mask needed - we've already selected only allowed KV tokens
-        attn_out = F.scaled_dot_product_attention(
-            roped_q_chunk.transpose(1, 2), roped_k_combined.transpose(1, 2), v_combined.transpose(1, 2),
-            attn_mask=None, is_causal=False
-        ).transpose(1, 2)
-        outputs.append(attn_out)
-
-    return torch.cat(outputs, dim=1)
-
-
-def flex_attention_baseline(q, k, v, grid_sizes, freqs, block_mask):
-    """
-    Baseline using flex_attention with BlockMask (matching causal_model.py:132-175)
-    """
-    N = q.shape[1] // 2
-
-    q_chunk = torch.chunk(q, 2, dim=1)
-    k_chunk = torch.chunk(k, 2, dim=1)
-    roped_query = []
-    roped_key = []
-    for ii in range(2):
-        rq = rope_apply_ref(q_chunk[ii], grid_sizes, freqs).type_as(v)
-        rk = rope_apply_ref(k_chunk[ii], grid_sizes, freqs).type_as(v)
-        roped_query.append(rq)
-        roped_key.append(rk)
-
-    roped_query = torch.cat(roped_query, dim=1)
-    roped_key = torch.cat(roped_key, dim=1)
-
-    # Padding to 128 alignment
-    padded_length = math.ceil(q.shape[1] / 128) * 128 - q.shape[1]
-    padded_roped_query = torch.cat([
-        roped_query,
-        torch.zeros([q.shape[0], padded_length, q.shape[2], q.shape[3]],
-                     device=q.device, dtype=v.dtype)
-    ], dim=1)
-    padded_roped_key = torch.cat([
-        roped_key,
-        torch.zeros([k.shape[0], padded_length, k.shape[2], k.shape[3]],
-                     device=k.device, dtype=v.dtype)
-    ], dim=1)
-    padded_v = torch.cat([
-        v,
-        torch.zeros([v.shape[0], padded_length, v.shape[2], v.shape[3]],
-                     device=v.device, dtype=v.dtype)
-    ], dim=1)
-
-    x = _flex_attention(
-        query=padded_roped_query.transpose(2, 1),
-        key=padded_roped_key.transpose(2, 1),
-        value=padded_v.transpose(2, 1),
-        block_mask=block_mask
-    ).transpose(2, 1)
-
-    # Remove padding ([:, :, :-0] = [:, :, :0] which is wrong)
-    if padded_length > 0:
-        x = x[:, :-padded_length]
-
-    return x
+    return output
 
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--num_frames', type=int, default=9,
-                        help='Number of frames (use 9 for quick test, 21 for production)')
-    parser.add_argument('--frame_seqlen', type=int, default=256,
-                        help='Tokens per frame (use 256 for quick test, 1560 for production)')
-    parser.add_argument('--num_frame_per_block', type=int, default=3,
-                        help='Frames per causal block')
+    parser.add_argument('--num_frames', type=int, default=9)
+    parser.add_argument('--frame_seqlen', type=int, default=256)
+    parser.add_argument('--num_frame_per_block', type=int, default=3)
     parser.add_argument('--num_heads', type=int, default=16)
     parser.add_argument('--head_dim', type=int, default=128)
     parser.add_argument('--dtype', type=str, default='bfloat16')
@@ -254,7 +158,6 @@ def main():
 
     dtype = getattr(torch, args.dtype)
     device = torch.device(args.device)
-
     torch.manual_seed(args.seed)
     if device.type == 'cuda':
         torch.cuda.manual_seed(args.seed)
@@ -262,148 +165,109 @@ def main():
     total_len = args.num_frames * args.frame_seqlen * 2
     N = args.num_frames * args.frame_seqlen
 
-    print(f"=== Configuration ===")
-    print(f"  num_frames={args.num_frames}, frame_seqlen={args.frame_seqlen}")
-    print(f"  num_frame_per_block={args.num_frame_per_block}")
-    print(f"  total_len={total_len} (clean={N}, noisy={N})")
-    print(f"  num_heads={args.num_heads}, head_dim={args.head_dim}")
-    print(f"  dtype={args.dtype}, device={args.device}")
-    print()
+    print(f"=== Config: {args.num_frames} frames, {args.frame_seqlen} tok/frame, "
+          f"{args.num_frame_per_block} frames/block, {args.dtype} ===\n")
 
-    # Create input tensors
+    # --- Prepare common inputs ---
     q = torch.randn(1, total_len, args.num_heads, args.head_dim, device=device, dtype=dtype)
     k = torch.randn(1, total_len, args.num_heads, args.head_dim, device=device, dtype=dtype)
     v = torch.randn(1, total_len, args.num_heads, args.head_dim, device=device, dtype=dtype)
 
-    # grid_sizes: [B, 3] = (F, H, W)
     h = int(math.sqrt(args.frame_seqlen))
     while args.frame_seqlen % h != 0:
         h -= 1
     w = args.frame_seqlen // h
     grid_sizes = torch.tensor([[args.num_frames, h, w]], dtype=torch.long)
 
-    # Create RoPE frequencies on the same device as q/k/v
     max_seq_len = max(args.num_frames, h, w) + 100
-    head_dim = args.head_dim
-    dim = head_dim // 2
-    t_dim = dim - 2 * (dim // 3)
-    hw_dim = dim // 3
+    dim = args.head_dim // 2
+    t_dim, hw_dim = dim - 2 * (dim // 3), dim // 3
+    freqs = torch.cat([
+        torch.randn(max_seq_len, t_dim, device=device),
+        torch.randn(max_seq_len, hw_dim, device=device),
+        torch.randn(max_seq_len, hw_dim, device=device),
+    ], dim=1)
 
-    freqs_t = torch.randn(max_seq_len, t_dim, dtype=torch.float32, device=device)
-    freqs_h = torch.randn(max_seq_len, hw_dim, dtype=torch.float32, device=device)
-    freqs_w = torch.randn(max_seq_len, hw_dim, dtype=torch.float32, device=device)
-    freqs = torch.cat([freqs_t, freqs_h, freqs_w], dim=1)
+    # Apply RoPE (same as causal_model.py:136-148)
+    q_c, q_n = torch.chunk(q, 2, dim=1)
+    k_c, k_n = torch.chunk(k, 2, dim=1)
+    roped_q = torch.cat([rope_apply_ref(q_c, grid_sizes, freqs).type_as(v),
+                         rope_apply_ref(q_n, grid_sizes, freqs).type_as(v)], dim=1)
+    roped_k = torch.cat([rope_apply_ref(k_c, grid_sizes, freqs).type_as(v),
+                         rope_apply_ref(k_n, grid_sizes, freqs).type_as(v)], dim=1)
 
-    # Create BlockMask
-    print("Creating BlockMask...")
-    block_mask = prepare_teacher_forcing_mask(
-        device, args.num_frames, args.frame_seqlen, args.num_frame_per_block
-    )
-    print(f"  BlockMask: {block_mask}")
-    print()
+    # Pad to 128 alignment (same as causal_model.py:150-168)
+    pad = math.ceil(total_len / 128) * 128 - total_len
+    p_q = torch.cat([roped_q, torch.zeros(1, pad, args.num_heads, args.head_dim, device=device, dtype=dtype)], dim=1)
+    p_k = torch.cat([roped_k, torch.zeros(1, pad, args.num_heads, args.head_dim, device=device, dtype=dtype)], dim=1)
+    p_v = torch.cat([v, torch.zeros(1, pad, args.num_heads, args.head_dim, device=device, dtype=dtype)], dim=1)
 
-    # --- Test flex_attention (baseline) ---
-    print("--- Running flex_attention (baseline) ---")
+    # BHLD format for both functions
+    bhld_q = p_q.transpose(1, 2)
+    bhld_k = p_k.transpose(1, 2)
+    bhld_v = p_v.transpose(1, 2)
+
+    # BlockMask
+    block_mask = prepare_teacher_forcing_mask(device, args.num_frames, args.frame_seqlen, args.num_frame_per_block)
+
+    # --- Run flex_attention ---
+    print("--- flex_attention ---")
     if device.type == 'cuda':
         torch.cuda.reset_peak_memory_stats()
-    torch.cuda.empty_cache()
-
     try:
         with torch.no_grad():
-            out_flex = flex_attention_baseline(q, k, v, grid_sizes, freqs, block_mask)
-        flex_success = True
-        if device.type == 'cuda':
-            flex_peak_mem = torch.cuda.max_memory_allocated() / 1024**3
-            print(f"  Output shape: {out_flex.shape}")
-            print(f"  Peak GPU memory: {flex_peak_mem:.2f} GB")
-        else:
-            print(f"  Output shape: {out_flex.shape}")
-            print(f"  Peak GPU memory: N/A (non-CUDA device)")
+            out_flex = _flex_attention(bhld_q, bhld_k, bhld_v, block_mask=block_mask)
+        flex_ok = True
+        flex_mem = torch.cuda.max_memory_allocated() / 1024**3 if device.type == 'cuda' else 0
+        print(f"  shape={out_flex.shape}, peak_mem={flex_mem:.2f} GB")
     except Exception as e:
-        flex_success = False
+        flex_ok = False
         print(f"  FAILED: {e}")
-    print()
 
-    # --- Test chunked_tf_attention ---
-    print("--- Running chunked_tf_attention ---")
+    # --- Run chunked_flex_attention ---
+    print("--- chunked_flex_attention ---")
     if device.type == 'cuda':
         torch.cuda.reset_peak_memory_stats()
-    torch.cuda.empty_cache()
-
     try:
         with torch.no_grad():
-            out_chunked = chunked_tf_attention(
-                q, k, v, grid_sizes, freqs, args.num_frame_per_block
-            )
-        chunked_success = True
-        if device.type == 'cuda':
-            chunked_peak_mem = torch.cuda.max_memory_allocated() / 1024**3
-            print(f"  Output shape: {out_chunked.shape}")
-            print(f"  Peak GPU memory: {chunked_peak_mem:.2f} GB")
-        else:
-            print(f"  Output shape: {out_chunked.shape}")
-            print(f"  Peak GPU memory: N/A (non-CUDA device)")
+            out_chunked = chunked_flex_attention(bhld_q, bhld_k, bhld_v, block_mask=block_mask)
+        chunked_ok = True
+        chunked_mem = torch.cuda.max_memory_allocated() / 1024**3 if device.type == 'cuda' else 0
+        print(f"  shape={out_chunked.shape}, peak_mem={chunked_mem:.2f} GB")
     except Exception as e:
-        chunked_success = False
+        chunked_ok = False
+        import traceback
         print(f"  FAILED: {e}")
-    print()
+        traceback.print_exc()
 
-    # --- Compare results ---
-    if flex_success and chunked_success:
-        print("--- Numerical Comparison ---")
-        out_flex_f = out_flex.float()
-        out_chunked_f = out_chunked.float()
+    # --- Compare ---
+    if flex_ok and chunked_ok:
+        a = out_flex[:, :, :total_len].transpose(1, 2).float()
+        b = out_chunked[:, :, :total_len].transpose(1, 2).float()
+        diff = (a - b).abs()
 
-        abs_diff = (out_flex_f - out_chunked_f).abs()
-        rel_diff = abs_diff / (out_flex_f.abs().clamp(min=1e-6))
+        print(f"\n--- Comparison ---")
+        print(f"  max_abs_diff:  {diff.max().item():.2e}")
+        print(f"  mean_abs_diff: {diff.mean().item():.2e}")
 
-        print(f"  Max absolute difference: {abs_diff.max().item():.2e}")
-        print(f"  Mean absolute difference: {abs_diff.mean().item():.2e}")
-        print(f"  Max relative difference: {rel_diff.max().item():.2e}")
-        print(f"  Mean relative difference: {rel_diff.mean().item():.2e}")
-
-        # Per-chunk comparison
-        chunk_size = args.frame_seqlen * args.num_frame_per_block
-        num_chunks = N // chunk_size
-
-        print(f"\n  Per-chunk analysis:")
-        for chunk_idx in range(num_chunks):
-            start = chunk_idx * chunk_size
-            end = start + chunk_size
-            diff_clean = (out_flex_f[:, start:end] - out_chunked_f[:, start:end]).abs()
-            print(f"    Clean chunk {chunk_idx}: max_diff={diff_clean.max().item():.2e}, mean_diff={diff_clean.mean().item():.2e}")
-
-        for chunk_idx in range(num_chunks):
-            start = N + chunk_idx * chunk_size
-            end = N + (chunk_idx + 1) * chunk_size
-            diff_noisy = (out_flex_f[:, start:end] - out_chunked_f[:, start:end]).abs()
-            print(f"    Noisy chunk {chunk_idx}: max_diff={diff_noisy.max().item():.2e}, mean_diff={diff_noisy.mean().item():.2e}")
-
-        # Cosine similarity
-        cos_sim = F.cosine_similarity(
-            out_flex_f.flatten(), out_chunked_f.flatten(), dim=0
-        )
-        print(f"\n  Cosine similarity: {cos_sim.item():.8f}")
-
-        # Verdict
-        if abs_diff.max().item() < 1e-3:
-            print(f"\n  VERDICT: PASS (max abs diff < 1e-3)")
-        elif abs_diff.max().item() < 1e-2:
-            print(f"\n  VERDICT: ACCEPTABLE (max abs diff < 1e-2, likely due to bf16 precision)")
-        else:
-            print(f"\n  VERDICT: MISMATCH (max abs diff >= 1e-2, needs investigation)")
+        cos = F.cosine_similarity(a.flatten(), b.flatten(), dim=0)
+        print(f"  cosine_sim:    {cos.item():.8f}")
 
         if device.type == 'cuda':
-            print(f"\n  Memory savings: {flex_peak_mem - chunked_peak_mem:.2f} GB ({(1 - chunked_peak_mem/flex_peak_mem)*100:.1f}% reduction)")
+            print(f"  memory saved:  {flex_mem - chunked_mem:.2f} GB ({(1 - chunked_mem/flex_mem)*100:.1f}%)")
 
-    elif chunked_success and not flex_success:
-        print("  flex_attention failed but chunked_tf_attention succeeded!")
-        print("  This suggests chunked_tf_attention is more memory-efficient.")
-    elif flex_success and not chunked_success:
-        print("  chunked_tf_attention failed but flex_attention succeeded!")
-        print("  This suggests a bug in the chunked implementation.")
-    else:
-        print("  Both methods failed!")
+        if diff.max().item() < 1e-5:
+            print(f"\n  VERDICT: EXACT MATCH")
+        elif diff.max().item() < 1e-3:
+            print(f"\n  VERDICT: PASS")
+        elif diff.max().item() < 5e-3:
+            print(f"\n  VERDICT: ACCEPTABLE (bf16 accumulation)")
+        else:
+            print(f"\n  VERDICT: MISMATCH (try --dtype float32 to diagnose)")
+    elif chunked_ok and not flex_ok:
+        print("\n  flex_attention OOM'd, chunked_flex_attention succeeded!")
+    elif flex_ok and not chunked_ok:
+        print("\n  chunked_flex_attention failed!")
 
 
 if __name__ == '__main__':
