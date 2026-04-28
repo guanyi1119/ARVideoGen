@@ -161,9 +161,9 @@ def chunked_flex_attention(query, key, value, block_mask=None):
         kv_2d = kv_indices.unsqueeze(0)  # [1, kv_gathered_size]
         fine_mask = mask_mod(0, 0, q_2d, kv_2d)  # [q_size, kv_gathered_size]
 
-        # Invert mask: mask_mod uses True=allowed, SDPA uses True=masked_out
+        # Bool attn_mask: True=attend, False=masked (same semantics as mask_mod)
         q_chunk = query[:, :, q_start:q_end]
-        attn_mask = (~fine_mask).unsqueeze(0).unsqueeze(0).expand(B, H, -1, -1)
+        attn_mask = fine_mask.unsqueeze(0).unsqueeze(0).expand(B, H, -1, -1)
 
         output[:, :, q_start:q_end] = F.scaled_dot_product_attention(
             q_chunk, k_gathered, v_gathered, attn_mask=attn_mask)
