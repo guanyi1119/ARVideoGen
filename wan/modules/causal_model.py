@@ -21,12 +21,98 @@ from diffusers.models.modeling_utils import ModelMixin
 import os
 import torch.nn as nn
 import torch
+import torch.nn.functional as F
 import math
 import torch.distributed as dist
 
+_IS_NPU = os.environ.get('DEVICE_TYPE', 'cuda') == 'npu'
+
+
+def chunked_flex_attention(query, key, value, block_mask=None):
+    """
+    Drop-in replacement for flex_attention(query, key, value, block_mask).
+    Same [B, H, L, D] input/output format.
+
+    Processes attention per Q-block using block_mask.mask_mod to determine
+    allowed KV blocks (via corner-checking) and fine-grained boolean masks.
+    This avoids materializing the full N*N attention matrix, reducing peak
+    memory from O(N^2) to O(block_size * N).
+
+    NOTE: We pre-compute block sparsity ourselves by evaluating mask_mod at
+    block corners, because block_mask.kv_num_blocks/kv_indices may be
+    unreliable when mask_mod uses tensor closures with advanced indexing
+    (e.g. context_ends[q_idx]) that don't compose well under vmap.
+    """
+    B, H, L, _ = query.shape
+    Q_BLOCK_SIZE, KV_BLOCK_SIZE = block_mask.BLOCK_SIZE
+    mask_mod = block_mask.mask_mod
+    num_q_blocks = L // Q_BLOCK_SIZE + (1 if L % Q_BLOCK_SIZE else 0)
+
+    # Pre-compute block-level sparsity by evaluating mask_mod at block corners.
+    # Checking all 4 corners ensures we don't miss blocks where the mask
+    # transitions within the block.
+    q_starts = torch.arange(0, L, Q_BLOCK_SIZE, device=query.device)
+    kv_starts = torch.arange(0, L, KV_BLOCK_SIZE, device=query.device)
+    q_ends = torch.minimum(q_starts + Q_BLOCK_SIZE - 1,
+                           torch.tensor(L - 1, device=query.device))
+    kv_ends = torch.minimum(kv_starts + KV_BLOCK_SIZE - 1,
+                            torch.tensor(L - 1, device=query.device))
+
+    # Evaluate at 4 corners with broadcasting: [num_q, 1] vs [1, num_kv]
+    qs = q_starts.unsqueeze(1)
+    qe = q_ends.unsqueeze(1)
+    kss = kv_starts.unsqueeze(0)
+    ke = kv_ends.unsqueeze(0)
+
+    block_allowed = (
+        mask_mod(0, 0, qs, kss) |
+        mask_mod(0, 0, qs, ke) |
+        mask_mod(0, 0, qe, kss) |
+        mask_mod(0, 0, qe, ke)
+    )
+
+    output = torch.zeros_like(query)
+
+    for q_bi in range(num_q_blocks):
+        q_start = q_bi * Q_BLOCK_SIZE
+        q_end = min(q_start + Q_BLOCK_SIZE, L)
+        if q_start >= L:
+            break
+
+        allowed_kv = block_allowed[q_bi].nonzero().squeeze(-1)
+        if len(allowed_kv) == 0:
+            continue
+
+        kv_slices = []
+        kv_positions = []
+        for kv_bi in allowed_kv.tolist():
+            ks = kv_bi * KV_BLOCK_SIZE
+            ke = min(ks + KV_BLOCK_SIZE, L)
+            kv_slices.append((ks, ke))
+            kv_positions.append(torch.arange(ks, ke, device=query.device))
+
+        k_gathered = torch.cat([key[:, :, s:e] for s, e in kv_slices], dim=2)
+        v_gathered = torch.cat([value[:, :, s:e] for s, e in kv_slices], dim=2)
+        kv_indices = torch.cat(kv_positions)
+
+        q_indices = torch.arange(q_start, q_end, device=query.device)
+        q_2d = q_indices.unsqueeze(1)
+        kv_2d = kv_indices.unsqueeze(0)
+        fine_mask = mask_mod(0, 0, q_2d, kv_2d)
+
+        # Bool attn_mask: True=attend, False=masked
+        q_chunk = query[:, :, q_start:q_end]
+        attn_mask = fine_mask.unsqueeze(0).unsqueeze(0).expand(B, H, -1, -1)
+
+        output[:, :, q_start:q_end] = F.scaled_dot_product_attention(
+            q_chunk, k_gathered, v_gathered, attn_mask=attn_mask)
+
+    return output
+
+
 # torch.compile relies on Triton/CUDA backends which are not supported on NPU
-if os.environ.get('DEVICE_TYPE', 'cuda') == 'npu':
-    flex_attention = _flex_attention
+if _IS_NPU:
+    flex_attention = chunked_flex_attention
 else:
     # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
     # see https://github.com/pytorch/pytorch/issues/133254
