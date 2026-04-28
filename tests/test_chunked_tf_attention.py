@@ -90,43 +90,70 @@ def chunked_flex_attention(query, key, value, block_mask=None):
     Drop-in replacement for flex_attention(query, key, value, block_mask).
     Same [B, H, L, D] input/output format.
 
-    Processes attention per Q-block (128 tokens) using block_mask.kv_indices
-    to gather relevant KV, then computes sdpa with a fine-grained boolean
-    mask derived from block_mask.mask_mod. This avoids materializing the
-    full N×N attention matrix, reducing peak memory from O(N²) to
-    O(block_size × N).
+    Processes attention per Q-block using block_mask.mask_mod to determine
+    allowed KV blocks (via corner-checking) and fine-grained boolean masks.
+    This avoids materializing the full N*N attention matrix, reducing peak
+    memory from O(N^2) to O(block_size * N).
+
+    NOTE: We pre-compute block sparsity ourselves by evaluating mask_mod at
+    block corners, because block_mask.kv_num_blocks/kv_indices may be
+    unreliable when mask_mod uses tensor closures with advanced indexing
+    (e.g. context_ends[q_idx]) that don't compose well under vmap.
     """
     B, H, L, D = query.shape
-    BLOCK_SIZE = block_mask.BLOCK_SIZE
+    Q_BLOCK_SIZE, KV_BLOCK_SIZE = block_mask.BLOCK_SIZE
     mask_mod = block_mask.mask_mod
-    num_q_blocks = L // BLOCK_SIZE + (1 if L % BLOCK_SIZE else 0)
+    num_q_blocks = L // Q_BLOCK_SIZE + (1 if L % Q_BLOCK_SIZE else 0)
+    num_kv_blocks = L // KV_BLOCK_SIZE + (1 if L % KV_BLOCK_SIZE else 0)
+
+    # Pre-compute block-level sparsity by evaluating mask_mod at block corners.
+    # Checking all 4 corners ensures we don't miss blocks where the mask
+    # transitions within the block.
+    q_starts = torch.arange(0, L, Q_BLOCK_SIZE, device=query.device)
+    kv_starts = torch.arange(0, L, KV_BLOCK_SIZE, device=query.device)
+    q_ends = torch.minimum(q_starts + Q_BLOCK_SIZE - 1,
+                           torch.tensor(L - 1, device=query.device))
+    kv_ends = torch.minimum(kv_starts + KV_BLOCK_SIZE - 1,
+                            torch.tensor(L - 1, device=query.device))
+
+    # Evaluate at 4 corners with broadcasting: [num_q, 1] vs [1, num_kv]
+    qs = q_starts.unsqueeze(1)   # [nq, 1]
+    qe = q_ends.unsqueeze(1)     # [nq, 1]
+    kss = kv_starts.unsqueeze(0) # [1, nkv]
+    ke = kv_ends.unsqueeze(0)    # [1, nkv]
+
+    block_allowed = (
+        mask_mod(0, 0, qs, kss) |
+        mask_mod(0, 0, qs, ke) |
+        mask_mod(0, 0, qe, kss) |
+        mask_mod(0, 0, qe, ke)
+    )  # [num_q_blocks, num_kv_blocks]
 
     output = torch.zeros_like(query)
 
     for q_bi in range(num_q_blocks):
-        q_start = q_bi * BLOCK_SIZE
-        q_end = min(q_start + BLOCK_SIZE, L)
+        q_start = q_bi * Q_BLOCK_SIZE
+        q_end = min(q_start + Q_BLOCK_SIZE, L)
         if q_start >= L:
             break
 
-        # Get allowed KV blocks (head 0 indices - same for all heads when mask is H-independent)
-        num_kv = block_mask.kv_num_blocks[0, 0, q_bi].item()
-        if num_kv == 0:
+        # Get allowed KV blocks for this Q block
+        allowed_kv = block_allowed[q_bi].nonzero().squeeze(-1)
+        if len(allowed_kv) == 0:
             continue
-        kv_block_ids = block_mask.kv_indices[0, 0, q_bi, :num_kv]
 
-        # Gather KV for all B, H at once
+        # Gather KV for all allowed blocks
         kv_slices = []
         kv_positions = []
-        for kv_id in kv_block_ids.tolist():
-            ks = kv_id * BLOCK_SIZE
-            ke = min(ks + BLOCK_SIZE, L)
+        for kv_bi in allowed_kv.tolist():
+            ks = kv_bi * KV_BLOCK_SIZE
+            ke = min(ks + KV_BLOCK_SIZE, L)
             kv_slices.append((ks, ke))
             kv_positions.append(torch.arange(ks, ke, device=query.device))
 
         k_gathered = torch.cat([key[:, :, s:e] for s, e in kv_slices], dim=2)
         v_gathered = torch.cat([value[:, :, s:e] for s, e in kv_slices], dim=2)
-        kv_indices = torch.cat(kv_positions)  # absolute positions in original sequence
+        kv_indices = torch.cat(kv_positions)
 
         # Build fine-grained mask via mask_mod with broadcasting
         q_indices = torch.arange(q_start, q_end, device=query.device)
@@ -134,9 +161,9 @@ def chunked_flex_attention(query, key, value, block_mask=None):
         kv_2d = kv_indices.unsqueeze(0)  # [1, kv_gathered_size]
         fine_mask = mask_mod(0, 0, q_2d, kv_2d)  # [q_size, kv_gathered_size]
 
-        # sdpa: [B, H, q_size, D] x [B, H, kv_size, D] -> [B, H, q_size, D]
+        # Invert mask: mask_mod uses True=allowed, SDPA uses True=masked_out
         q_chunk = query[:, :, q_start:q_end]
-        attn_mask = fine_mask.unsqueeze(0).unsqueeze(0).expand(B, H, -1, -1)
+        attn_mask = (~fine_mask).unsqueeze(0).unsqueeze(0).expand(B, H, -1, -1)
 
         output[:, :, q_start:q_end] = F.scaled_dot_product_attention(
             q_chunk, k_gathered, v_gathered, attn_mask=attn_mask)
