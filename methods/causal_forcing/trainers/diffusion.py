@@ -1,6 +1,6 @@
 import gc
 import logging
-import datetime
+from datetime import datetime
 
 from methods.causal_forcing import CausalDiffusion
 from core.data.dataset import cycle, LatentLMDBDataset
