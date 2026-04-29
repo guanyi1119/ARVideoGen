@@ -28,7 +28,7 @@ import torch.distributed as dist
 
 
 _IS_NPU = os.environ.get('DEVICE_TYPE', 'cuda') == 'npu'
-_USE_NPU_FLEX_ATTENTION_VERSION = 2
+_USE_NPU_FLEX_ATTENTION_VERSION = 1
 
 # torch.compile relies on Triton/CUDA backends which are not supported on NPU
 if _IS_NPU:

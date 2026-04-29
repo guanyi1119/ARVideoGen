@@ -188,7 +188,6 @@ class Trainer:
                   f"checkpoint_model_{self.step:06d}", "model.pt"))
 
     def train_one_step(self, batch):
-        self.log_iters = 1
         VISUALIZE = self.step % self.config.log_iters == 0 and not self.config.no_visualize
 
         if self.step % 20 == 0:
@@ -260,10 +259,10 @@ class Trainer:
         if self.step % self.config.gc_interval == 0:
             if dist.get_rank() == 0:
                 logging.info("DistGarbageCollector: Running GC.")
-            gc.collect()
             torch.cuda.empty_cache()
+            gc.collect()
 
-        if (self.step + 1) % 50 == 0:
+        if (self.step + 1) % 20 == 0:
             end_time = time.time()
             end_step = self.step + 1
 
