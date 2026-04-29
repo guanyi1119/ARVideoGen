@@ -1,4 +1,5 @@
 from .attention import attention
+from .npu_attention import chunked_flex_attention, npu_flex_attention, npu_flex_attention_v2
 from .model import WanModel
 from .t5 import T5Decoder, T5Encoder, T5EncoderModel, T5Model
 from .tokenizers import HuggingfaceTokenizer
@@ -14,6 +15,9 @@ __all__ = [
     'HuggingfaceTokenizer',
     'attention',
     'get_causal_model_class',
+    'chunked_flex_attention',
+    'npu_flex_attention',
+    'npu_flex_attention_v2'
 ]
 
 
