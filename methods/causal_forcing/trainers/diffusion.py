@@ -1,5 +1,6 @@
 import gc
 import logging
+import datetime
 
 from methods.causal_forcing import CausalDiffusion
 from core.data.dataset import cycle, LatentLMDBDataset
@@ -256,9 +257,30 @@ class Trainer:
             gc.collect()
             torch.cuda.empty_cache()
 
+        if (self.step + 1) % 50 == 0:
+            end_time = time.time()
+            end_step = self.step + 1
+
+            # 计算吞吐量
+            step_diff = end_step - self.start_step
+            time_diff = end_time - self.start_time
+            seconds_per_iter = time_diff / step_diff
+            throughput = batch_size / seconds_per_iter
+
+            # 打印训练日志，吞吐加在最后
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(
+                f"{timestamp}: [step {self.step}]" \
+                f"generator_loss: {wandb_loss_dict['generator_loss'].mean().item():.4f}" \
+                f"DI_throughput: {throughput:.2f} samples/s/npu"
+            )
+            self.start_time = time.time()
+            self.start_step = end_step
+
 
     def train(self):
-
+        self.start_step = 0
+        self.start_time = time.time()
         while True:
             batch = next(self.dataloader)
             self.train_one_step(batch)
