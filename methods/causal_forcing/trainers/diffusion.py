@@ -189,6 +189,7 @@ class Trainer:
 
     def train_one_step(self, batch):
         self.log_iters = 1
+        VISUALIZE = self.step % self.config.log_iters == 0 and not self.config.no_visualize
 
         if self.step % 20 == 0:
             torch.cuda.empty_cache()
@@ -250,6 +251,11 @@ class Trainer:
         if self.is_main_process:
             if not self.disable_logging:
                 self.writer.log(wandb_loss_dict, step=self.step)
+                if VISUALIZE:
+                    clean = (self.model.vae.decode_to_pixel(log_dict["x0"]).squeeze(1) * 255).cpu().to(torch.uint8).numpy()
+                    pred = (self.model.vae.decode_to_pixel(log_dict["x0_pred"]).squeeze(1) * 255).cpu().to(torch.uint8).numpy()
+                    self.writer.log_video("clean", clean, self.step, fps=16)
+                    self.writer.log_video("gen", pred, self.step, fps=16)
 
         if self.step % self.config.gc_interval == 0:
             if dist.get_rank() == 0:
