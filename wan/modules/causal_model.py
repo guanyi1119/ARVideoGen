@@ -138,11 +138,17 @@ def npu_flex_attention_v2(query, key, value, block_mask=None):
     block_size = frame_seqlen * num_frame_per_block
     num_blocks = num_frames * frame_seqlen // block_size
     N = num_frames * frame_seqlen  # boundary between clean and noisy tokens
+    real_L = 2 * N  # actual token count (without 128-alignment padding)
 
-    # Convert BNSD [1, H, L, D] to TND-sliced [L, H, D] for easier slicing
-    q_tnd = query[0].permute(1, 0, 2)  # [L, H, D]
-    k_tnd = key[0].permute(1, 0, 2)
-    v_tnd = value[0].permute(1, 0, 2)
+    # Strip 128-alignment padding — TND decomposition only covers real tokens
+    q_real = query[:, :, :real_L]
+    k_real = key[:, :, :real_L]
+    v_real = value[:, :, :real_L]
+
+    # Convert BNSD [1, H, real_L, D] to TND-sliced [real_L, H, D]
+    q_tnd = q_real[0].permute(1, 0, 2)
+    k_tnd = k_real[0].permute(1, 0, 2)
+    v_tnd = v_real[0].permute(1, 0, 2)
 
     # Build TND-format Q, K, V and metadata
     tnd_q_list = []
@@ -150,8 +156,6 @@ def npu_flex_attention_v2(query, key, value, block_mask=None):
     tnd_v_list = []
     q_seq_lengths = []
     kv_seq_lengths = []
-    output_q_starts = []
-    output_q_ends = []
 
     for i in range(num_blocks):
         # --- Clean block i ---
@@ -165,8 +169,6 @@ def npu_flex_attention_v2(query, key, value, block_mask=None):
 
         q_seq_lengths.append(block_size)
         kv_seq_lengths.append(kv_end)
-        output_q_starts.append(q_start)
-        output_q_ends.append(q_end)
 
     for i in range(num_blocks):
         # --- Noisy block i ---
@@ -184,8 +186,6 @@ def npu_flex_attention_v2(query, key, value, block_mask=None):
         tnd_q_list.append(q_tnd[q_start:q_end])
         q_seq_lengths.append(block_size)
         kv_seq_lengths.append(context_len + block_size)
-        output_q_starts.append(q_start)
-        output_q_ends.append(q_end)
 
     # Concatenate all sub-sequences into TND format: [total_len, H, D]
     tnd_q = torch.cat(tnd_q_list, dim=0)
@@ -210,15 +210,16 @@ def npu_flex_attention_v2(query, key, value, block_mask=None):
         actual_seq_kvlen=actual_seq_kvlen,
     )
 
-    # Reconstruct output from TND format back to BNSD [1, H, L, D]
-    attn_out = torch.zeros(1, L, H, D, device=query.device, dtype=query.dtype)
-    offset = 0
-    for seg_len, q_start, q_end in zip(q_seq_lengths, output_q_starts, output_q_ends):
-        attn_out[0, q_start:q_end] = attn_out_tnd[offset:offset + seg_len]
-        offset += seg_len
+    # TND output segments are already in sequential order:
+    #   clean_0, clean_1, ..., clean_{n-1}, noisy_0, noisy_1, ..., noisy_{n-1}
+    # which maps to positions [0, real_L) directly.
+    # [total_q_len, H, D] -> [1, real_L, H, D] -> [1, H, real_L, D]
+    attn_out = attn_out_tnd.reshape(1, real_L, H, D).permute(0, 2, 1, 3)
 
-    # Convert back to BNSD format: [1, L, H, D] -> [1, H, L, D]
-    attn_out = attn_out.permute(0, 2, 1, 3)
+    # Restore 128-alignment padding (caller will slice it off with [:, :, :-padded_length])
+    if L > real_L:
+        attn_out = F.pad(attn_out, (0, 0, 0, L - real_L))
+
     return attn_out
 
 
