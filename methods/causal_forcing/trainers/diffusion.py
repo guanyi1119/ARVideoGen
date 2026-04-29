@@ -276,7 +276,7 @@ class Trainer:
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             print(
                 f"{timestamp}: [step {self.step}]" \
-                f"generator_loss: {wandb_loss_dict['generator_loss'].mean().item():.4f}" \
+                f"generator_loss: {wandb_loss_dict['generator_loss']:.4f}" \
                 f"DI_throughput: {throughput:.2f} samples/s/npu"
             )
             self.start_time = time.time()
