@@ -1,4 +1,4 @@
-export MODELS_DIR="/cache"
+export MODELS_DIR="/cache/wan_models"
 export DEVICE_TYPE="npu"
 export PYTHONPATH=$PYTHONPATH:"/use/local/Ascend/ascend-toolkit/latest/python/site-packages":"./"
 
