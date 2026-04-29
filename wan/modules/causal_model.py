@@ -26,6 +26,13 @@ import math
 import torch.distributed as dist
 
 _IS_NPU = os.environ.get('DEVICE_TYPE', 'cuda') == 'npu'
+_NPU_FUSION_AVAILABLE = False
+if _IS_NPU:
+    try:
+        import torch_npu
+        _NPU_FUSION_AVAILABLE = True
+    except ModuleNotFoundError:
+        pass
 
 
 def chunked_flex_attention(query, key, value, block_mask=None):
@@ -110,8 +117,115 @@ def chunked_flex_attention(query, key, value, block_mask=None):
     return output
 
 
+def npu_flex_attention_v2(query, key, value, block_mask=None):
+    """
+    Drop-in replacement for flex_attention using TND layout + varlen sparse mode.
+
+    When block_mask has _tf_mask_meta (set by _prepare_teacher_forcing_mask),
+    uses TND layout + sparse_mode=7 to avoid materializing the full [L, L]
+    dense atten_mask. Otherwise falls back to chunked_flex_attention.
+    """
+    if not hasattr(block_mask, '_tf_mask_meta'):
+        return chunked_flex_attention(query, key, value, block_mask)
+
+    import torch_npu
+
+    num_frames, frame_seqlen, num_frame_per_block = block_mask._tf_mask_meta
+
+    B, H, L, D = query.shape
+    assert B == 1, "TND layout only supports batch_size=1 currently"
+
+    block_size = frame_seqlen * num_frame_per_block
+    num_blocks = num_frames * frame_seqlen // block_size
+    N = num_frames * frame_seqlen  # boundary between clean and noisy tokens
+
+    # Convert BNSD [1, H, L, D] to TND-sliced [L, H, D] for easier slicing
+    q_tnd = query[0].permute(1, 0, 2)  # [L, H, D]
+    k_tnd = key[0].permute(1, 0, 2)
+    v_tnd = value[0].permute(1, 0, 2)
+
+    # Build TND-format Q, K, V and metadata
+    tnd_q_list = []
+    tnd_k_list = []
+    tnd_v_list = []
+    q_seq_lengths = []
+    kv_seq_lengths = []
+    output_q_starts = []
+    output_q_ends = []
+
+    for i in range(num_blocks):
+        # --- Clean block i ---
+        q_start = i * block_size
+        q_end = (i + 1) * block_size
+        kv_end = (i + 1) * block_size  # KV includes context blocks 0..i
+
+        tnd_q_list.append(q_tnd[q_start:q_end])
+        tnd_k_list.append(k_tnd[:kv_end])
+        tnd_v_list.append(v_tnd[:kv_end])
+
+        q_seq_lengths.append(block_size)
+        kv_seq_lengths.append(kv_end)
+        output_q_starts.append(q_start)
+        output_q_ends.append(q_end)
+
+    for i in range(num_blocks):
+        # --- Noisy block i ---
+        q_start = N + i * block_size
+        q_end = N + (i + 1) * block_size
+        context_len = i * block_size
+
+        if context_len > 0:
+            tnd_k_list.append(torch.cat([k_tnd[:context_len], k_tnd[q_start:q_end]], dim=0))
+            tnd_v_list.append(torch.cat([v_tnd[:context_len], v_tnd[q_start:q_end]], dim=0))
+        else:
+            tnd_k_list.append(k_tnd[q_start:q_end])
+            tnd_v_list.append(v_tnd[q_start:q_end])
+
+        tnd_q_list.append(q_tnd[q_start:q_end])
+        q_seq_lengths.append(block_size)
+        kv_seq_lengths.append(context_len + block_size)
+        output_q_starts.append(q_start)
+        output_q_ends.append(q_end)
+
+    # Concatenate all sub-sequences into TND format: [total_len, H, D]
+    tnd_q = torch.cat(tnd_q_list, dim=0)
+    tnd_k = torch.cat(tnd_k_list, dim=0)
+    tnd_v = torch.cat(tnd_v_list, dim=0)
+
+    # Cumulative sequence lengths for npu_fusion_attention
+    actual_seq_qlen = torch.cumsum(torch.tensor(q_seq_lengths, dtype=torch.int64), dim=0).tolist()
+    actual_seq_kvlen = torch.cumsum(torch.tensor(kv_seq_lengths, dtype=torch.int64), dim=0).tolist()
+
+    scale_val = 1.0 / math.sqrt(D)
+
+    # sparse_mode=7 (varlen外切): optimized for variable-length sequences
+    # Each sub-sequence computes full bidirectional attention, no atten_mask needed
+    attn_out_tnd, _, _, _, _, _, _ = torch_npu.npu_fusion_attention(
+        tnd_q, tnd_k, tnd_v,
+        head_num=H,
+        input_layout="TND",
+        scale=scale_val,
+        sparse_mode=7,
+        actual_seq_qlen=actual_seq_qlen,
+        actual_seq_kvlen=actual_seq_kvlen,
+    )
+
+    # Reconstruct output from TND format back to BNSD [1, H, L, D]
+    attn_out = torch.zeros(1, L, H, D, device=query.device, dtype=query.dtype)
+    offset = 0
+    for seg_len, q_start, q_end in zip(q_seq_lengths, output_q_starts, output_q_ends):
+        attn_out[0, q_start:q_end] = attn_out_tnd[offset:offset + seg_len]
+        offset += seg_len
+
+    # Convert back to BNSD format: [1, L, H, D] -> [1, H, L, D]
+    attn_out = attn_out.permute(0, 2, 1, 3)
+    return attn_out
+
+
 # torch.compile relies on Triton/CUDA backends which are not supported on NPU
-if _IS_NPU:
+if _IS_NPU and _NPU_FUSION_AVAILABLE:
+    flex_attention = npu_flex_attention_v2
+elif _IS_NPU:
     flex_attention = chunked_flex_attention
 else:
     # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
@@ -734,6 +848,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         block_mask = create_block_mask(attention_mask, B=None, H=None, Q_LEN=total_length + padded_length,
                                        KV_LEN=total_length + padded_length, _compile=False, device=device)
+
+        block_mask._tf_mask_meta = (num_frames, frame_seqlen, num_frame_per_block)
 
         if DEBUG:
             print(block_mask)
