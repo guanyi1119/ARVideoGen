@@ -1,10 +1,13 @@
 """
 Compare npu_flex_attention vs flex_attention + BlockMask.
 
-npu_flex_attention is a drop-in replacement for flex_attention that uses
+npu_flex_attention (v1) is a drop-in replacement for flex_attention that uses
 torch_npu.npu_fusion_attention internally. It generates a token-level
 atten_mask from block_mask.mask_mod and calls npu_fusion_attention once
 with sparse_mode=1 (allMask).
+
+npu_flex_attention_v2 uses TND layout + prefix sparse mode (sparse_mode=5/7)
+to avoid materializing the full [L, L] dense atten_mask.
 
 Usage (CUDA — tests mask generation + SDPA fallback):
     python tests/test_npu_flex_attention.py --num_frames 9 --frame_seqlen 256 --num_frame_per_block 3
@@ -17,6 +20,12 @@ Usage (CUDA — tests mask generation + SDPA fallback):
 
 Usage (NPU — tests with actual npu_fusion_attention):
     python tests/test_npu_flex_attention.py --num_frames 9 --frame_seqlen 256 --num_frame_per_block 3 --device npu
+
+Usage (v2 — TND + prefix sparse mode):
+    python tests/test_npu_flex_attention.py --test_v2 --num_frames 9 --frame_seqlen 256 --num_frame_per_block 3
+
+    # v2 on NPU
+    python tests/test_npu_flex_attention.py --test_v2 --num_frames 9 --frame_seqlen 256 --num_frame_per_block 3 --device npu
 """
 
 import argparse
@@ -383,6 +392,351 @@ def test_npu_flex_attention_vs_flex(args):
                 print(f"  npu_flex_attention FAILED: {e}")
 
 
+def npu_flex_attention_v2(query, key, value, block_mask=None,
+                          num_frames=None, frame_seqlen=None, num_frame_per_block=None):
+    """
+    Drop-in replacement for flex_attention using TND layout + varlen sparse mode.
+
+    Instead of materializing a full [L, L] dense atten_mask (sparse_mode=1),
+    this version splits the TF sequence into independent sub-sequences and uses
+    TND layout + varlen optimization (sparse_mode=7/8) to avoid the dense mask.
+
+    Key insight: TF mask attention within each sub-sequence is fully bidirectional
+    (all Q tokens attend to all KV tokens). By splitting into sub-sequences and
+    using TND layout, no atten_mask is needed at all.
+
+    Args:
+        query, key, value: [B, H, L, D] tensors (BNSD format, same as flex_attention)
+        block_mask: BlockMask from create_block_mask (unused, kept for API compatibility)
+        num_frames: number of frames (required for TF mask decomposition)
+        frame_seqlen: tokens per frame (required for TF mask decomposition)
+        num_frame_per_block: frames per attention block (required for TF mask decomposition)
+
+    Returns:
+        attn_out: [B, H, L, D] tensor, same as flex_attention output
+
+    TF mask decomposition into TND sub-sequences:
+        For each block i (0 to num_blocks-1):
+        - Clean block i: Q=block_i, KV=blocks_0..i (all bidirectional)
+        - Noisy block i: Q=noisy_block_i, KV=context_blocks_0..i-1 + noisy_block_i (all bidirectional)
+    """
+    import torch_npu
+
+    B, H, L, D = query.shape
+    assert B == 1, "TND layout only supports batch_size=1 currently"
+    assert num_frames is not None and frame_seqlen is not None and num_frame_per_block is not None, \
+        "num_frames, frame_seqlen, num_frame_per_block are required for v2"
+
+    block_size = frame_seqlen * num_frame_per_block
+    num_blocks = num_frames * frame_seqlen // block_size
+    N = num_frames * frame_seqlen  # boundary between clean and noisy tokens
+
+    # Convert BNSD [1, H, L, D] to TND-sliced [L, H, D] for easier slicing
+    q_tnd = query[0].permute(1, 0, 2)  # [L, H, D] — same as squeeze(0).transpose(0,1) from BNSD
+    k_tnd = key[0].permute(1, 0, 2)
+    v_tnd = value[0].permute(1, 0, 2)
+
+    # Build TND-format Q, K, V and metadata
+    tnd_q_list = []
+    tnd_k_list = []
+    tnd_v_list = []
+    q_seq_lengths = []
+    kv_seq_lengths = []
+    # Maps from TND sub-sequence index to output position in the original sequence
+    output_q_starts = []
+    output_q_ends = []
+
+    for i in range(num_blocks):
+        # --- Clean block i ---
+        q_start = i * block_size
+        q_end = (i + 1) * block_size
+        kv_end = (i + 1) * block_size  # KV includes context blocks 0..i
+
+        tnd_q_list.append(q_tnd[q_start:q_end])   # [block_size, H, D]
+        tnd_k_list.append(k_tnd[:kv_end])           # [(i+1)*block_size, H, D]
+        tnd_v_list.append(v_tnd[:kv_end])
+
+        q_seq_lengths.append(block_size)
+        kv_seq_lengths.append(kv_end)
+        output_q_starts.append(q_start)
+        output_q_ends.append(q_end)
+
+    for i in range(num_blocks):
+        # --- Noisy block i ---
+        q_start = N + i * block_size
+        q_end = N + (i + 1) * block_size
+        # KV = context blocks 0..i-1 + noisy block i
+        context_len = i * block_size
+
+        if context_len > 0:
+            tnd_k_list.append(torch.cat([k_tnd[:context_len], k_tnd[q_start:q_end]], dim=0))
+            tnd_v_list.append(torch.cat([v_tnd[:context_len], v_tnd[q_start:q_end]], dim=0))
+        else:
+            tnd_k_list.append(k_tnd[q_start:q_end])
+            tnd_v_list.append(v_tnd[q_start:q_end])
+
+        tnd_q_list.append(q_tnd[q_start:q_end])    # [block_size, H, D]
+        q_seq_lengths.append(block_size)
+        kv_seq_lengths.append(context_len + block_size)
+        output_q_starts.append(q_start)
+        output_q_ends.append(q_end)
+
+    # Concatenate all sub-sequences into TND format: [total_len, H, D]
+    tnd_q = torch.cat(tnd_q_list, dim=0)
+    tnd_k = torch.cat(tnd_k_list, dim=0)
+    tnd_v = torch.cat(tnd_v_list, dim=0)
+
+    # Cumulative sequence lengths for npu_fusion_attention
+    actual_seq_qlen = torch.cumsum(torch.tensor(q_seq_lengths, dtype=torch.int64), dim=0).tolist()
+    actual_seq_kvlen = torch.cumsum(torch.tensor(kv_seq_lengths, dtype=torch.int64), dim=0).tolist()
+
+    scale_val = 1.0 / math.sqrt(D)
+
+    # sparse_mode=7 (varlen外切): optimized for variable-length sequences
+    # Each sub-sequence computes full bidirectional attention, no atten_mask needed
+    sparse_mode = 7
+
+    attn_out_tnd, _, _, _, _, _, _ = torch_npu.npu_fusion_attention(
+        tnd_q, tnd_k, tnd_v,
+        head_num=H,
+        input_layout="TND",
+        scale=scale_val,
+        sparse_mode=sparse_mode,
+        actual_seq_qlen=actual_seq_qlen,
+        actual_seq_kvlen=actual_seq_kvlen,
+    )
+
+    # Reconstruct output from TND format back to BNSD [1, H, L, D]
+    attn_out = torch.zeros(1, L, H, D, device=query.device, dtype=query.dtype)
+    offset = 0
+    for seg_len, q_start, q_end in zip(q_seq_lengths, output_q_starts, output_q_ends):
+        attn_out[0, q_start:q_end] = attn_out_tnd[offset:offset + seg_len]
+        offset += seg_len
+
+    # Convert back to BNSD format: [1, L, H, D] -> [1, H, L, D]
+    attn_out = attn_out.permute(0, 2, 1, 3)
+    return attn_out
+
+
+def npu_flex_attention_v2_sdpa_fallback(query, key, value, block_mask=None,
+                                         num_frames=None, frame_seqlen=None, num_frame_per_block=None):
+    """
+    CUDA/CPU fallback for npu_flex_attention_v2 using SDPA + manual TND decomposition.
+
+    This verifies the TND decomposition logic is correct by computing each sub-sequence
+    independently with SDPA. Each sub-sequence uses full bidirectional attention (no mask).
+    """
+    B, H, L, D = query.shape
+    block_size = frame_seqlen * num_frame_per_block
+    num_blocks = num_frames * frame_seqlen // block_size
+    N = num_frames * frame_seqlen
+
+    # Convert BNSD [1, H, L, D] to TND [L, H, D] for slicing
+    q_tnd = query[0].permute(1, 0, 2)  # [L, H, D]
+    k_tnd = key[0].permute(1, 0, 2)
+    v_tnd = value[0].permute(1, 0, 2)
+
+    attn_out = torch.zeros(1, L, H, D, device=query.device, dtype=query.dtype)
+
+    for i in range(num_blocks):
+        # --- Clean block i ---
+        q_start = i * block_size
+        q_end = (i + 1) * block_size
+        kv_end = (i + 1) * block_size
+
+        seg_q = q_tnd[q_start:q_end].unsqueeze(0)          # [1, block_size, H, D]
+        seg_k = k_tnd[:kv_end].unsqueeze(0)                  # [1, kv_len, H, D]
+        seg_v = v_tnd[:kv_end].unsqueeze(0)
+
+        # BNSD format for SDPA: [1, H, q_len, D]
+        seg_q_bn = seg_q.transpose(1, 2)
+        seg_k_bn = seg_k.transpose(1, 2)
+        seg_v_bn = seg_v.transpose(1, 2)
+
+        # Full bidirectional attention within this sub-sequence — no mask needed
+        with torch.no_grad():
+            seg_out = F.scaled_dot_product_attention(seg_q_bn, seg_k_bn, seg_v_bn)
+        # seg_out: [1, H, q_len, D] -> [1, q_len, H, D]
+        attn_out[0, q_start:q_end] = seg_out[0].permute(1, 0, 2)
+
+    for i in range(num_blocks):
+        # --- Noisy block i ---
+        q_start = N + i * block_size
+        q_end = N + (i + 1) * block_size
+        context_len = i * block_size
+
+        seg_q = q_tnd[q_start:q_end].unsqueeze(0)
+        if context_len > 0:
+            seg_k = torch.cat([k_tnd[:context_len], k_tnd[q_start:q_end]], dim=0).unsqueeze(0)
+            seg_v = torch.cat([v_tnd[:context_len], v_tnd[q_start:q_end]], dim=0).unsqueeze(0)
+        else:
+            seg_k = k_tnd[q_start:q_end].unsqueeze(0)
+            seg_v = v_tnd[q_start:q_end].unsqueeze(0)
+
+        seg_q_bn = seg_q.transpose(1, 2)
+        seg_k_bn = seg_k.transpose(1, 2)
+        seg_v_bn = seg_v.transpose(1, 2)
+
+        # Full bidirectional attention — no mask needed
+        with torch.no_grad():
+            seg_out = F.scaled_dot_product_attention(seg_q_bn, seg_k_bn, seg_v_bn)
+        attn_out[0, q_start:q_end] = seg_out[0].permute(1, 0, 2)
+
+    # Convert [1, L, H, D] -> [1, H, L, D]
+    attn_out = attn_out.permute(0, 2, 1, 3)
+    return attn_out
+
+
+def test_npu_flex_attention_v2(args):
+    """Test npu_flex_attention_v2 vs flex_attention."""
+    dtype = getattr(torch, args.dtype)
+    device = torch.device(args.device)
+    torch.manual_seed(args.seed)
+    if device.type == 'cuda':
+        torch.cuda.manual_seed(args.seed)
+
+    total_len = args.num_frames * args.frame_seqlen * 2
+    N = args.num_frames * args.frame_seqlen
+    block_size = args.frame_seqlen * args.num_frame_per_block
+    num_blocks = N // block_size
+
+    print(f"=== V2 Config: {args.num_frames} frames, {args.frame_seqlen} tok/frame, "
+          f"{args.num_frame_per_block} frames/block, {args.dtype}, {args.device} ===")
+    print(f"  total_len={total_len}, N={N}, block_size={block_size}, num_blocks={num_blocks}\n")
+
+    # --- Prepare inputs ---
+    q = torch.randn(1, total_len, args.num_heads, args.head_dim, device=device, dtype=dtype)
+    k = torch.randn(1, total_len, args.num_heads, args.head_dim, device=device, dtype=dtype)
+    v = torch.randn(1, total_len, args.num_heads, args.head_dim, device=device, dtype=dtype)
+
+    # Pad to 128 alignment
+    pad = math.ceil(total_len / 128) * 128 - total_len
+    p_q = torch.cat([q, torch.zeros(1, pad, args.num_heads, args.head_dim, device=device, dtype=dtype)], dim=1)
+    p_k = torch.cat([k, torch.zeros(1, pad, args.num_heads, args.head_dim, device=device, dtype=dtype)], dim=1)
+    p_v = torch.cat([v, torch.zeros(1, pad, args.num_heads, args.head_dim, device=device, dtype=dtype)], dim=1)
+
+    bhld_q = p_q.transpose(1, 2)
+    bhld_k = p_k.transpose(1, 2)
+    bhld_v = p_v.transpose(1, 2)
+
+    # BlockMask
+    block_mask = prepare_teacher_forcing_mask(device, args.num_frames, args.frame_seqlen, args.num_frame_per_block)
+
+    # --- Run flex_attention (reference) ---
+    print("--- flex_attention ---")
+    if device.type == 'cuda':
+        torch.cuda.reset_peak_memory_stats()
+    try:
+        with torch.no_grad():
+            out_flex = _flex_attention(bhld_q, bhld_k, bhld_v, block_mask=block_mask)
+        flex_ok = True
+        flex_mem = torch.cuda.max_memory_allocated() / 1024**3 if device.type == 'cuda' else 0
+        print(f"  shape={out_flex.shape}, peak_mem={flex_mem:.2f} GB")
+    except Exception as e:
+        flex_ok = False
+        flex_mem = 0
+        print(f"  FAILED: {e}")
+
+    # --- Run v2 SDPA fallback (validate decomposition) ---
+    print("\n--- npu_flex_attention_v2 SDPA fallback ---")
+    try:
+        with torch.no_grad():
+            out_v2_sdpa = npu_flex_attention_v2_sdpa_fallback(
+                bhld_q, bhld_k, bhld_v,
+                num_frames=args.num_frames, frame_seqlen=args.frame_seqlen,
+                num_frame_per_block=args.num_frame_per_block
+            )
+        v2_sdpa_ok = True
+        print(f"  shape={out_v2_sdpa.shape}")
+    except Exception as e:
+        v2_sdpa_ok = False
+        import traceback
+        print(f"  FAILED: {e}")
+        traceback.print_exc()
+
+    if flex_ok and v2_sdpa_ok:
+        a = out_flex[:, :, :total_len].float()
+        b = out_v2_sdpa[:, :, :total_len].float()
+        diff = (a - b).abs()
+        print(f"  max_abs_diff:  {diff.max().item():.2e}")
+        print(f"  mean_abs_diff: {diff.mean().item():.2e}")
+        cos = F.cosine_similarity(a.flatten(), b.flatten(), dim=0)
+        print(f"  cosine_sim:    {cos.item():.8f}")
+
+        threshold = 1e-5 if dtype == torch.float32 else 5e-3
+        if diff.max().item() < 1e-5:
+            print("  VERDICT: EXACT MATCH")
+        elif diff.max().item() < threshold:
+            print(f"  VERDICT: PASS (within {args.dtype} tolerance)")
+        else:
+            print("  VERDICT: MISMATCH")
+
+    # --- Run v2 on NPU ---
+    print("\n--- npu_flex_attention_v2 (NPU) ---")
+    try:
+        import torch_npu
+        has_npu = True
+    except ModuleNotFoundError:
+        has_npu = False
+
+    npu_v2_ok = False
+    out_v2_npu = None
+
+    if has_npu:
+        if device.type == 'npu':
+            torch.npu.reset_peak_memory_stats()
+        elif device.type == 'cuda':
+            torch.cuda.reset_peak_memory_stats()
+        try:
+            with torch.no_grad():
+                out_v2_npu = npu_flex_attention_v2(
+                    bhld_q, bhld_k, bhld_v,
+                    num_frames=args.num_frames, frame_seqlen=args.frame_seqlen,
+                    num_frame_per_block=args.num_frame_per_block
+                )
+            npu_v2_ok = True
+            if device.type == 'npu':
+                npu_mem = torch.npu.max_memory_allocated() / 1024**3
+            elif device.type == 'cuda':
+                npu_mem = torch.cuda.max_memory_allocated() / 1024**3
+            else:
+                npu_mem = 0
+            print(f"  shape={out_v2_npu.shape}, peak_mem={npu_mem:.2f} GB")
+        except Exception as e:
+            import traceback
+            print(f"  FAILED: {e}")
+            traceback.print_exc()
+    else:
+        print("  torch_npu not available, skipping NPU test")
+
+    # --- Compare v2 NPU vs flex ---
+    if flex_ok and npu_v2_ok:
+        a = out_flex[:, :, :total_len].float()
+        b = out_v2_npu[:, :, :total_len].float()
+        diff = (a - b).abs()
+        print(f"\n--- Comparison (v2 NPU vs flex) ---")
+        print(f"  max_abs_diff:  {diff.max().item():.2e}")
+        print(f"  mean_abs_diff: {diff.mean().item():.2e}")
+        cos = F.cosine_similarity(a.flatten(), b.flatten(), dim=0)
+        print(f"  cosine_sim:    {cos.item():.8f}")
+
+        threshold = 1e-5 if dtype == torch.float32 else 5e-3
+        if diff.max().item() < 1e-5:
+            print("\n  VERDICT: EXACT MATCH")
+        elif diff.max().item() < 1e-3:
+            print("\n  VERDICT: PASS")
+        elif diff.max().item() < threshold:
+            print(f"\n  VERDICT: ACCEPTABLE ({args.dtype} accumulation)")
+        else:
+            print(f"\n  VERDICT: MISMATCH (try --dtype float32)")
+
+    # --- Memory comparison v1 vs v2 ---
+    if flex_ok and npu_v2_ok:
+        print(f"\n  V2 avoids full [L,L] dense mask (~{total_len**2 / 1024**3:.2f} GB)")
+        print(f"  V2 KV duplication overhead: ~{sum((i+1)*2 for i in range(num_blocks)) * block_size * args.num_heads * args.head_dim * 2 / 1024**3:.2f} GB")
+
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--num_frames', type=int, default=9)
@@ -395,9 +749,14 @@ def main():
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--test_non_tf', action='store_true',
                         help='Also test with blockwise causal (non-TF) mask')
+    parser.add_argument('--test_v2', action='store_true',
+                        help='Test npu_flex_attention_v2 (TND + prefix sparse mode)')
     args = parser.parse_args()
 
-    test_npu_flex_attention_vs_flex(args)
+    if args.test_v2:
+        test_npu_flex_attention_v2(args)
+    else:
+        test_npu_flex_attention_vs_flex(args)
 
 
 if __name__ == '__main__':
