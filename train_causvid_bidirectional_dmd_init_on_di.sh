@@ -16,5 +16,5 @@ python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-trai
 
 MASTER_ADDR=$(echo $VC_WORKER_HOSTS | cut -d',' -f1)
 
-torchrun --nproc_per_node=8 --rdzv_conf="timeout=7200" --nnodes=$VC_WORKER_NUM --node_rank=$VC_TASK_INDEX --master_addr $MASTER_ADDR --master_port 12345 train_causal_forcing.py \
+torchrun --nproc_per_node=8 --rdzv_conf="timeout=7200" --nnodes=$VC_WORKER_NUM --node_rank=$VC_TASK_INDEX --master_addr $MASTER_ADDR --master_port 12345 train_causvid.py \
     --config_path configs/causvid/bidirectional_dmd_init.yaml
