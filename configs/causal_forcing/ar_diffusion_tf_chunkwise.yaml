@@ -17,7 +17,7 @@ wandb_host: https://api.wandb.ai
 wandb_key: {your key}
 wandb_entity: {your entity}
 wandb_project: {your project}
-sharding_strategy: hybrid_full
+sharding_strategy: full
 lr: 2.0e-06
 lr_critic: 4.0e-07
 beta1: 0.0
@@ -46,4 +46,4 @@ model_kwargs:
   timestep_shift: 5.0
 data_path: /cache/clean_data 
 teacher_forcing: true # TF/DF
-gc_interval: 1
+gc_interval: 100
