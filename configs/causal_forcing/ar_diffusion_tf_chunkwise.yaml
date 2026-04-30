@@ -46,3 +46,4 @@ model_kwargs:
   timestep_shift: 5.0
 data_path: /cache/clean_data 
 teacher_forcing: true # TF/DF
+gc_interval: 100

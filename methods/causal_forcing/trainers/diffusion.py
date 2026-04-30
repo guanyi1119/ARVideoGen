@@ -262,7 +262,7 @@ class Trainer:
             torch.cuda.empty_cache()
             gc.collect()
 
-        if (self.step + 1) % 20 == 0:
+        if (self.step + 1) % 1 == 0:
             end_time = time.time()
             end_step = self.step + 1
 
