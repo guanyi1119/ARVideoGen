@@ -207,12 +207,12 @@ class Trainer:
         self.generator_optimizer.step()
 
         # Step 4: Logging
+        wandb_loss_dict = {
+            "generator_loss": generator_loss.item(),
+            "generator_grad_norm": generator_grad_norm.item(),
+            **stats
+        }
         if self.is_main_process and not self.disable_logging:
-            wandb_loss_dict = {
-                "generator_loss": generator_loss.item(),
-                "generator_grad_norm": generator_grad_norm.item(),
-                **stats
-            }
             self.writer.log(wandb_loss_dict, step=self.step)
             if VISUALIZE:
                 noisy = self.model.vae.decode_to_pixel(log_dict["input"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
