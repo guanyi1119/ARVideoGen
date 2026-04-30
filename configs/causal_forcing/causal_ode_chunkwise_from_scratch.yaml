@@ -16,7 +16,7 @@ wandb_key: {your key}
 wandb_entity: {your entity}
 wandb_project: {your project}
 wandb_name: ode
-sharding_strategy: hybrid_full
+sharding_strategy: full
 lr: 2.0e-06
 beta1: 0.9
 beta2: 0.999
