@@ -45,6 +45,7 @@ image_or_video_shape:
 - 60
 - 104
 output_path: train_outputs/causvid_bidirectional_dmd_init
+trainer: distillation
 distillation_loss: dmd
 gradient_checkpointing: true
 backward_simulation: false

@@ -212,25 +212,24 @@ class Trainer:
         self.critic_optimizer.step()
 
         # Step 5: Logging
+        log_dict = {
+            "critic_loss": critic_loss.item(),
+            "critic_grad_norm": critic_grad_norm.item()
+        }
+
+        if TRAIN_GENERATOR:
+            log_dict.update(
+                {
+                    "generator_loss": generator_loss.item(),
+                    "generator_grad_norm": generator_grad_norm.item(),
+                    "dmdtrain_gradient_norm": generator_log_dict["dmdtrain_gradient_norm"].item()
+                }
+            )
         if self.is_main_process:
-            log_dict = {
-                "critic_loss": critic_loss.item(),
-                "critic_grad_norm": critic_grad_norm.item()
-            }
-
-            if TRAIN_GENERATOR:
-                log_dict.update(
-                    {
-                        "generator_loss": generator_loss.item(),
-                        "generator_grad_norm": generator_grad_norm.item(),
-                        "dmdtrain_gradient_norm": generator_log_dict["dmdtrain_gradient_norm"].item()
-                    }
-                )
-
+            self.writer.log(log_dict, step=self.step)
             if VISUALIZE:
                 self.add_visualization(generator_log_dict, critic_log_dict, log_dict)
 
-            self.writer.log(log_dict, step=self.step)
 
         if (self.step + 1) % 1 == 0:
             end_time = time.time()
@@ -261,9 +260,9 @@ class Trainer:
                 critic_log_dict['critictrain_pred_image']]
         )
 
-        self.writer.log_video("critictrain_latent", prepare_for_saving(critictrain_latent), step=self.step, fs=16)
-        self.writer.log_video("critictrain_noisy_latent", prepare_for_saving(critictrain_noisy_latent), step=self.step, fs=16)
-        self.writer.log_video("critictrain_pred_image", prepare_for_saving(critictrain_pred_image), step=self.step, fs=16)
+        self.writer.log_video("critictrain_latent", prepare_for_saving(critictrain_latent), step=self.step, fps=16)
+        self.writer.log_video("critictrain_noisy_latent", prepare_for_saving(critictrain_noisy_latent), step=self.step, fps=16)
+        self.writer.log_video("critictrain_pred_image", prepare_for_saving(critictrain_pred_image), step=self.step, fps=16)
 
         if "dmdtrain_clean_latent" in generator_log_dict:
             (dmdtrain_clean_latent, dmdtrain_noisy_latent, dmdtrain_pred_real_image, dmdtrain_pred_fake_image) = map(
@@ -273,10 +272,10 @@ class Trainer:
                     generator_log_dict['dmdtrain_pred_real_image'], generator_log_dict['dmdtrain_pred_fake_image']]
             )
 
-            self.writer.log_video("dmdtrain_clean_latent", prepare_for_saving(dmdtrain_clean_latent), step=self.step, fs=16)
-            self.writer.log_video("dmdtrain_noisy_latent", prepare_for_saving(dmdtrain_noisy_latent), step=self.step, fs=16)
-            self.writer.log_video("dmdtrain_pred_real_image", prepare_for_saving(dmdtrain_pred_real_image), step=self.step, fs=16)
-            self.writer.log_video("dmdtrain_pred_fake_image", prepare_for_saving(dmdtrain_pred_fake_image), step=self.step, fs=16)
+            self.writer.log_video("dmdtrain_clean_latent", prepare_for_saving(dmdtrain_clean_latent), step=self.step, fps=16)
+            self.writer.log_video("dmdtrain_noisy_latent", prepare_for_saving(dmdtrain_noisy_latent), step=self.step, fps=16)
+            self.writer.log_video("dmdtrain_pred_real_image", prepare_for_saving(dmdtrain_pred_real_image), step=self.step, fps=16)
+            self.writer.log_video("dmdtrain_pred_fake_image", prepare_for_saving(dmdtrain_pred_fake_image), step=self.step, fps=16)
 
     def train(self):
         self.start_step = 0
