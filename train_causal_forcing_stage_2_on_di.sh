@@ -8,7 +8,7 @@ export HCCL_OP_EXPANSION_MODE="AIV"
 
 export HCCL_DETERMINISTIC=TRUE
 export HCCL_DATA_PARALLEL_OPTIMIZE=TRUE
-export TASK_QUEUE_ENABLE=2
+export TASK_QUEUE_ENABLE=1
 
 python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/data/CausalForcingData/ODE6KCausal_chunkwise', '/cache/ODE6KCausal_chunkwise')"
 python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/models/wan_models/Wan2.1-T2V-1.3B', '/cache/wan_models/Wan2.1-T2V-1.3B')"

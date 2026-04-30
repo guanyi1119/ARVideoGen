@@ -88,6 +88,7 @@ class ODERegression(BaseModel):
                 -1, -1, -1, num_channels, height, width).to(self.device)
         ).squeeze(1)
 
+        self.denoising_step_list = self.denoising_step_list.to(index.device)
         timestep = self.denoising_step_list[index].to(self.device)
 
         return noisy_input, timestep
