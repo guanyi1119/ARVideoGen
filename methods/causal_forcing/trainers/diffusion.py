@@ -251,8 +251,8 @@ class Trainer:
             if not self.disable_logging:
                 self.writer.log(wandb_loss_dict, step=self.step)
                 if VISUALIZE:
-                    clean = (self.model.vae.decode_to_pixel(log_dict["x0"]).squeeze(1) * 255).cpu().to(torch.uint8).numpy()
-                    pred = (self.model.vae.decode_to_pixel(log_dict["x0_pred"]).squeeze(1) * 255).cpu().to(torch.uint8).numpy()
+                    clean = self.model.vae.decode_to_pixel(log_dict["x0"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
+                    pred = self.model.vae.decode_to_pixel(log_dict["x0_pred"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
                     self.writer.log_video("clean", clean, self.step, fps=16)
                     self.writer.log_video("gen", pred, self.step, fps=16)
 
