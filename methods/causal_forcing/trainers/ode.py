@@ -1,5 +1,6 @@
 import gc
 import logging
+from datetime import datetime
 from core.data.dataset import ODERegressionLMDBDataset, cycle
 from methods.causal_forcing import ODERegression
 from collections import defaultdict
@@ -148,11 +149,14 @@ class Trainer:
         
         self.model.eval()  # prevent any randomness (e.g. dropout)
 
+        VISUALIZE = self.step % self.config.log_iters == 0 and not self.config.no_visualize
+
         # Step 1: Get the next batch of text prompts
         batch = next(self.dataloader)
         text_prompts = batch["prompts"]
         ode_latent = batch["ode_latent"].to(
             device=self.device, dtype=self.dtype)
+        batch_size = len(text_prompts)
         # Step 2: Extract the conditional infos
         with torch.no_grad():
             conditional_dict = self.model.text_encoder(
@@ -207,14 +211,40 @@ class Trainer:
                 **stats
             }
             self.writer.log(wandb_loss_dict, step=self.step)
+            if VISUALIZE:
+                noisy = self.model.vae.decode_to_pixel(log_dict["input"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
+                pred = self.model.vae.decode_to_pixel(log_dict["output"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
+                self.writer.log_video("noisy", noisy, self.step, fps=16)
+                self.writer.log_video("pred", pred, self.step, fps=16)
 
         if self.step % self.config.gc_interval == 0:
             if dist.get_rank() == 0:
                 logging.info("DistGarbageCollector: Running GC.")
             gc.collect()
 
-    def train(self):
+        if (self.step + 1) % 1 == 0:
+            end_time = time.time()
+            end_step = self.step + 1
 
+            # 计算吞吐量
+            step_diff = end_step - self.start_step
+            time_diff = end_time - self.start_time
+            seconds_per_iter = time_diff / step_diff
+            throughput = batch_size / seconds_per_iter
+
+            # 打印训练日志，吞吐加在最后
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(
+                f"{timestamp}: [step {self.step}]" \
+                f"generator_loss: {wandb_loss_dict['generator_loss']:.4f}" \
+                f"DI_throughput: {throughput:.2f} samples/s/npu"
+            )
+            self.start_time = time.time()
+            self.start_step = end_step
+
+    def train(self):
+        self.start_step = 0
+        self.start_time = time.time()
         while True:
             self.train_one_step()
             if (not self.config.no_save) and self.step % self.config.log_iters == 0 and self.step > 0:

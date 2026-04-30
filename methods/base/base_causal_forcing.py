@@ -34,7 +34,7 @@ class BaseModel(nn.Module):
             self.denoising_step_list = torch.tensor(args.denoising_step_list, dtype=torch.long)
             # [DIFF-LongLive] LongLive puts these on device instead of CPU
             if args.warp_denoising_step:
-                timesteps = torch.cat((self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32)))
+                timesteps = torch.cat((self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32))).cuda()
                 self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
 
     def _initialize_models(self, args, device):
