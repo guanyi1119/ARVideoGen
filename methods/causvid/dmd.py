@@ -96,7 +96,7 @@ class DMD(nn.Module):
             args.denoising_loss_type)()
 
         if args.warp_denoising_step:  # Warp the denoising step according to the scheduler time
-            timesteps = torch.cat((self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32))).cuda().cuda()
+            timesteps = torch.cat((self.scheduler.timesteps.cpu(), torch.tensor([0], dtype=torch.float32))).cuda()
             self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
 
         if getattr(self.scheduler, "alphas_cumprod", None) is not None:

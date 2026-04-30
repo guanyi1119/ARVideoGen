@@ -1,3 +1,4 @@
+from datetime import datetime
 from methods.causvid.data import ODERegressionLMDBDataset
 from transformers.models.t5.modeling_t5 import T5Block
 from methods.causvid.data import TextDataset
@@ -231,6 +232,27 @@ class Trainer:
 
             self.writer.log(log_dict, step=self.step)
 
+        if (self.step + 1) % 1 == 0:
+            end_time = time.time()
+            end_step = self.step + 1
+
+            # 计算吞吐量
+            step_diff = end_step - self.start_step
+            time_diff = end_time - self.start_time
+            seconds_per_iter = time_diff / step_diff
+            throughput = batch_size / seconds_per_iter
+
+            # 打印训练日志，吞吐加在最后
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(
+                f"{timestamp}: [step {self.step}]" \
+                f"generator_loss: {log_dict['generator_loss'] if TRAIN_GENERATOR else 0.0:.4f}" \
+                f"critic_loss: {log_dict['critic_loss']:.4f}" \
+                f"DI_throughput: {throughput:.2f} samples/s/npu"
+            )
+            self.start_time = time.time()
+            self.start_step = end_step
+
     def add_visualization(self, generator_log_dict, critic_log_dict, log_dict):
         critictrain_latent, critictrain_noisy_latent, critictrain_pred_image = map(
             lambda x: self.distillation_model.vae.decode_to_pixel(
@@ -239,9 +261,9 @@ class Trainer:
                 critic_log_dict['critictrain_pred_image']]
         )
 
-        self.writer.log_image("critictrain_latent", prepare_for_saving(critictrain_latent), step=self.step)
-        self.writer.log_image("critictrain_noisy_latent", prepare_for_saving(critictrain_noisy_latent), step=self.step)
-        self.writer.log_image("critictrain_pred_image", prepare_for_saving(critictrain_pred_image), step=self.step)
+        self.writer.log_video("critictrain_latent", prepare_for_saving(critictrain_latent), step=self.step, fs=16)
+        self.writer.log_video("critictrain_noisy_latent", prepare_for_saving(critictrain_noisy_latent), step=self.step, fs=16)
+        self.writer.log_video("critictrain_pred_image", prepare_for_saving(critictrain_pred_image), step=self.step, fs=16)
 
         if "dmdtrain_clean_latent" in generator_log_dict:
             (dmdtrain_clean_latent, dmdtrain_noisy_latent, dmdtrain_pred_real_image, dmdtrain_pred_fake_image) = map(
@@ -251,12 +273,14 @@ class Trainer:
                     generator_log_dict['dmdtrain_pred_real_image'], generator_log_dict['dmdtrain_pred_fake_image']]
             )
 
-            self.writer.log_image("dmdtrain_clean_latent", prepare_for_saving(dmdtrain_clean_latent), step=self.step)
-            self.writer.log_image("dmdtrain_noisy_latent", prepare_for_saving(dmdtrain_noisy_latent), step=self.step)
-            self.writer.log_image("dmdtrain_pred_real_image", prepare_for_saving(dmdtrain_pred_real_image), step=self.step)
-            self.writer.log_image("dmdtrain_pred_fake_image", prepare_for_saving(dmdtrain_pred_fake_image), step=self.step)
+            self.writer.log_video("dmdtrain_clean_latent", prepare_for_saving(dmdtrain_clean_latent), step=self.step, fs=16)
+            self.writer.log_video("dmdtrain_noisy_latent", prepare_for_saving(dmdtrain_noisy_latent), step=self.step, fs=16)
+            self.writer.log_video("dmdtrain_pred_real_image", prepare_for_saving(dmdtrain_pred_real_image), step=self.step, fs=16)
+            self.writer.log_video("dmdtrain_pred_fake_image", prepare_for_saving(dmdtrain_pred_fake_image), step=self.step, fs=16)
 
     def train(self):
+        self.start_step = 0
+        self.start_time = time.time()
         while True:
             self.train_one_step()
             if (not self.config.no_save) and self.step % self.config.log_iters == 0:
