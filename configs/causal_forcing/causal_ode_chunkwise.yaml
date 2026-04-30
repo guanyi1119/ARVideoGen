@@ -21,7 +21,8 @@ sharding_strategy: hybrid_full
 lr: 2.0e-06
 beta1: 0.9
 beta2: 0.999
-data_path: /cache/ODE6KCausal_chunkwise
+data_path: /cache/CausalForcingData
+data_name_pattern: ODE6KCausal_chunkwise
 batch_size: 1
 log_iters: 1000
 trainer: ode

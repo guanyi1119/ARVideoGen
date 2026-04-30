@@ -1,6 +1,7 @@
 from .dataset import (
     TextDataset,
     ODERegressionLMDBDataset,
+    MultiODERegressionLMDBDataset,
     ODERegressionDataset,
     LatentLMDBDataset,
     ShardingLMDBDataset,

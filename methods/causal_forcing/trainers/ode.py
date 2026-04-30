@@ -1,7 +1,7 @@
 import gc
 import logging
 from datetime import datetime
-from core.data.dataset import ODERegressionLMDBDataset, cycle
+from core.data.dataset import MultiODERegressionLMDBDataset, cycle
 from methods.causal_forcing import ODERegression
 from collections import defaultdict
 from core.misc import (
@@ -87,8 +87,8 @@ class Trainer:
         )
 
         # Step 3: Initialize the dataloader
-        dataset = ODERegressionLMDBDataset(
-            config.data_path, max_pair=getattr(config, "max_pair", int(1e8)))
+        dataset = MultiODERegressionLMDBDataset(
+            config.data_path, config.data_name_pattern, max_pair=getattr(config, "max_pair", int(1e8)))
         sampler = torch.utils.data.distributed.DistributedSampler(
             dataset, shuffle=True, drop_last=True)
         dataloader = torch.utils.data.DataLoader(
