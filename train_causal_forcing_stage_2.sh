@@ -12,5 +12,5 @@ export HCCL_DATA_PARALLEL_OPTIMIZE=TRUE
 export TASK_QUEUE_ENABLE=2
 
 torchrun --nproc_per_node=8 train_causal_forcing.py \
-    --config_path configs/causal_forcing/ar_diffusion_tf_chunkwise.yaml \
-    --logdir train_outputs/causal_forcing_ar_tf_chunkwise
+    --config_path configs/causal_forcing/causal_ode_chunkwise.yaml \
+    --logdir train_outputs/causal_forcing_ode_chunkwise
