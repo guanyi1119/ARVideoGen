@@ -1,7 +1,7 @@
 import gc
 import logging
 from datetime import datetime
-from core.data.dataset import MultiODERegressionLMDBDataset, cycle
+from core.data.dataset import MultiODERegressionLMDBDataset, ODERegressionLMDBDataset, cycle
 from methods.causal_forcing import ODERegression
 from collections import defaultdict
 from core.misc import (
@@ -87,8 +87,11 @@ class Trainer:
         )
 
         # Step 3: Initialize the dataloader
-        dataset = MultiODERegressionLMDBDataset(
-            config.data_path, config.data_name_pattern, max_pair=getattr(config, "max_pair", int(1e8)))
+        # dataset = MultiODERegressionLMDBDataset(
+        #     config.data_path, config.data_name_pattern, max_pair=getattr(config, "max_pair", int(1e8)))
+        dataset = ODERegressionLMDBDataset(
+            config.data_path, max_pair=getattr(config, "max_pair", int(1e8))
+        )
         sampler = torch.utils.data.distributed.DistributedSampler(
             dataset, shuffle=True, drop_last=True)
         dataloader = torch.utils.data.DataLoader(
@@ -235,8 +238,8 @@ class Trainer:
             # 打印训练日志，吞吐加在最后
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             print(
-                f"{timestamp}: [step {self.step}]" \
-                f"generator_loss: {wandb_loss_dict['generator_loss']:.4f}" \
+                f"{timestamp}: [step {self.step}] " \
+                f"generator_loss: {wandb_loss_dict['generator_loss']:.4f} " \
                 f"DI_throughput: {throughput:.2f} samples/s/npu"
             )
             self.start_time = time.time()

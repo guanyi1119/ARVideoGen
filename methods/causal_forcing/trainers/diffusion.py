@@ -275,8 +275,8 @@ class Trainer:
             # 打印训练日志，吞吐加在最后
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             print(
-                f"{timestamp}: [step {self.step}]" \
-                f"generator_loss: {wandb_loss_dict['generator_loss']:.4f}" \
+                f"{timestamp}: [step {self.step}] " \
+                f"generator_loss: {wandb_loss_dict['generator_loss']:.4f} " \
                 f"DI_throughput: {throughput:.2f} samples/s/npu"
             )
             self.start_time = time.time()
