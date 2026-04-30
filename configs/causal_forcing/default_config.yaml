@@ -6,7 +6,7 @@ discriminator_lr_multiplier: 1.0
 last_step_only: false
 i2v: false
 num_training_frames: 21
-gc_interval: 100
+gc_interval: 1
 context_noise: 0
 causal: true
 text_encoder_cpu_offload: false
