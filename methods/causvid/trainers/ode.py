@@ -69,6 +69,10 @@ class Trainer:
                                 ) if config.text_encoder_fsdp_wrap_strategy == "transformer" else None
         )
 
+        if not config.no_visualize:
+            self.distillation_model.vae = self.distillation_model.vae.to(
+                device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
+
         self.generator_optimizer = torch.optim.AdamW(
             [param for param in self.distillation_model.generator.parameters()
              if param.requires_grad],
