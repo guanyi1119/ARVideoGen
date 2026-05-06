@@ -173,8 +173,8 @@ class Trainer:
             }
             self.writer.log(log_dict_write, step=self.step)
             if VISUALIZE:
-                noisy = self.model.vae.decode_to_pixel(log_dict["input"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
-                pred = self.model.vae.decode_to_pixel(log_dict["output"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
+                noisy = self.distillation_model.vae.decode_to_pixel(log_dict["input"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
+                pred = self.distillation_model.vae.decode_to_pixel(log_dict["output"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
                 self.writer.log_video("noisy", noisy, self.step, fps=16)
                 self.writer.log_video("pred", pred, self.step, fps=16)
 
