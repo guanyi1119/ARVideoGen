@@ -164,7 +164,9 @@ class ODERegression(nn.Module):
 
         log_dict = {
             "unnormalized_loss": F.mse_loss(pred_image_or_video, target_latent, reduction='none').mean(dim=[1, 2, 3, 4]).detach(),
-            "timestep": timestep.float().mean(dim=1).detach()
+            "timestep": timestep.float().mean(dim=1).detach(),
+            "input": noisy_input.detach(),
+            "output": pred_image_or_video.detach(),
         }
 
         return loss, log_dict

@@ -7,6 +7,7 @@
 #   - Returns pred_x0 only (not tuple)
 #   - Different timestep sampling approach
 from wan.modules.attention import attention
+from wan.modules.npu_attention import chunked_flex_attention, npu_flex_attention, npu_flex_attention_v2
 from wan.modules.model import (
     WanRMSNorm,
     rope_apply,
@@ -26,14 +27,28 @@ import torch.nn as nn
 import torch
 import math
 
+
+_IS_NPU = os.environ.get('DEVICE_TYPE', 'cuda') == 'npu'
+_USE_NPU_FLEX_ATTENTION_VERSION = 1
+
 # torch.compile relies on Triton/CUDA backends which are not supported on NPU
-if os.environ.get('DEVICE_TYPE', 'cuda') == 'npu':
-    flex_attention = _flex_attention
+if _IS_NPU:
+    if _USE_NPU_FLEX_ATTENTION_VERSION == 0:
+        flex_attention = chunked_flex_attention
+    elif _USE_NPU_FLEX_ATTENTION_VERSION == 1:
+        flex_attention = npu_flex_attention
+    elif _USE_NPU_FLEX_ATTENTION_VERSION == 2:
+        flex_attention = npu_flex_attention_v2
+    else:
+        flex_attention = chunked_flex_attention
 else:
     # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
     # see https://github.com/pytorch/pytorch/issues/133254
     flex_attention = torch.compile(
-        _flex_attention, dynamic=False, mode="max-autotune")
+        _flex_attention,
+        dynamic=False,
+        mode="max-autotune-no-cudagraphs"
+    )
 
 
 def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
