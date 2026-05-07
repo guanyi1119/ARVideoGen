@@ -1,5 +1,6 @@
 export MODELS_DIR="/cache/wan_models"
 export DEVICE_TYPE="npu"
+export USE_NPU_FLEX_ATTENTION_VERSION="1"
 export PYTHONPATH=$PYTHONPATH:"/use/local/Ascend/ascend-toolkit/latest/python/site-packages":"./"
 
 export HCCL_INTER_HCCS_DISABLE=TRUE

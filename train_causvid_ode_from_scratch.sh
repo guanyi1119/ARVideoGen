@@ -1,6 +1,7 @@
 export MODELS_DIR="/data/z00546255/models/wan_models"
 export OUTPUT_URL="./"
 export DEVICE_TYPE="npu"
+export USE_NPU_FLEX_ATTENTION_VERSION="1"
 export PYTHONPATH=$PYTHONPATH:"/use/local/Ascend/ascend-toolkit/latest/python/site-packages":"./"
 
 export HCCL_INTER_HCCS_DISABLE=TRUE

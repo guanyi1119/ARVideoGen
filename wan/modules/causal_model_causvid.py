@@ -29,18 +29,18 @@ import math
 
 
 _IS_NPU = os.environ.get('DEVICE_TYPE', 'cuda') == 'npu'
-_USE_NPU_FLEX_ATTENTION_VERSION = 1
+_USE_NPU_FLEX_ATTENTION_VERSION = os.environ.get('USE_NPU_FLEX_ATTENTION_VERSION', '1')
 
 # torch.compile relies on Triton/CUDA backends which are not supported on NPU
 if _IS_NPU:
-    if _USE_NPU_FLEX_ATTENTION_VERSION == 0:
+    if _USE_NPU_FLEX_ATTENTION_VERSION == '0':
         flex_attention = chunked_flex_attention
-    elif _USE_NPU_FLEX_ATTENTION_VERSION == 1:
+    elif _USE_NPU_FLEX_ATTENTION_VERSION == '1':
         flex_attention = npu_flex_attention
-    elif _USE_NPU_FLEX_ATTENTION_VERSION == 2:
+    elif _USE_NPU_FLEX_ATTENTION_VERSION == '2':
         flex_attention = npu_flex_attention_v2
     else:
-        flex_attention = chunked_flex_attention
+        flex_attention = _flex_attention
 else:
     # wan 1.3B model has a weird channel / head configurations and require max-autotune to work with flexattention
     # see https://github.com/pytorch/pytorch/issues/133254
