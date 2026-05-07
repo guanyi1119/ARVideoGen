@@ -26,7 +26,7 @@ beta2: 0.999
 data_path: /cache/mixkit_ode_lmdb
 batch_size: 2
 log_iters: 200
-output_path: train_outputs/causvid_causal_ode_init
+output_path: train_outputs/causvid_causal_ode_continue
 trainer: ode
 distillation_loss: ode
 gradient_checkpointing: true
