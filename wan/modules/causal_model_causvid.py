@@ -153,17 +153,19 @@ class CausalWanSelfAttention(nn.Module):
                 dim=1
             )
 
-            # x = flex_attention(
-            #     query=padded_roped_query.transpose(2, 1),
-            #     key=padded_roped_key.transpose(2, 1),
-            #     value=padded_v.transpose(2, 1),
-            #     block_mask=block_mask
-            # )[:, :, :-padded_length].transpose(2, 1)
-            x = block_mask(
-                query=padded_roped_query.transpose(2, 1),
-                key=padded_roped_key.transpose(2, 1),
-                value=padded_v.transpose(2, 1),
-            )[:, :, :-padded_length].transpose(2, 1)
+            if _IS_NPU:
+                x = block_mask(
+                    query=padded_roped_query.transpose(2, 1),
+                    key=padded_roped_key.transpose(2, 1),
+                    value=padded_v.transpose(2, 1),
+                )[:, :, :-padded_length].transpose(2, 1)
+            else:
+                x = flex_attention(
+                    query=padded_roped_query.transpose(2, 1),
+                    key=padded_roped_key.transpose(2, 1),
+                    value=padded_v.transpose(2, 1),
+                    block_mask=block_mask
+                )[:, :, :-padded_length].transpose(2, 1)
         else:
             roped_query = causal_rope_apply(
                 q, grid_sizes, freqs, start_frame=current_start // math.prod(grid_sizes[0][1:]).item()).type_as(v)
@@ -477,62 +479,19 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             return (kv_idx < ends[q_idx]) | (q_idx == kv_idx)
             # return ((kv_idx < total_length) & (q_idx < total_length))  | (q_idx == kv_idx) # bidirectional mask
 
-        block_mask = create_block_mask(attention_mask, B=None, H=None, Q_LEN=total_length + padded_length,
-                                       KV_LEN=total_length + padded_length, _compile=False, device=device)
+        if _IS_NPU:
+            flex_attn = FlexAttentionNPU(mask_mod=attention_mask)
+            return flex_attn
+        else:
+            block_mask = create_block_mask(attention_mask, B=None, H=None, Q_LEN=total_length + padded_length,
+                                        KV_LEN=total_length + padded_length, _compile=False, device=device)
 
-        import torch.distributed as dist
-        if not dist.is_initialized() or dist.get_rank() == 0:
-            print(
-                f" cache a block wise causal mask with block size of {num_frame_per_block} frames")
-            print(block_mask)
-
-        return block_mask
-
-    @staticmethod
-    def _prepare_blockwise_causal_attn_mask_npu(
-        device: torch.device | str, num_frames: int = 21,
-        frame_seqlen: int = 1560, num_frame_per_block=1
-    ) -> BlockMask:
-        """
-        we will divide the token sequence into the following format
-        [1 latent frame] [1 latent frame] ... [1 latent frame]
-        We use flexattention to construct the attention mask
-        """
-        total_length = num_frames * frame_seqlen
-
-        # we do right padding to get to a multiple of 128
-        padded_length = math.ceil(total_length / 128) * 128 - total_length
-
-        ends = torch.zeros(total_length + padded_length,
-                           device=device, dtype=torch.long)
-
-        # Block-wise causal mask will attend to all elements that are before the end of the current chunk
-        frame_indices = torch.arange(
-            start=0,
-            end=total_length,
-            step=frame_seqlen * num_frame_per_block,
-            device=device
-        )
-
-        for tmp in frame_indices:
-            ends[tmp:tmp + frame_seqlen * num_frame_per_block] = tmp + \
-                frame_seqlen * num_frame_per_block
-
-        def attention_mask(b, h, q_idx, kv_idx):
-            return (kv_idx < ends[q_idx]) | (q_idx == kv_idx)
-            # return ((kv_idx < total_length) & (q_idx < total_length))  | (q_idx == kv_idx) # bidirectional mask
-
-        # block_mask = create_block_mask(attention_mask, B=None, H=None, Q_LEN=total_length + padded_length,
-        #                                KV_LEN=total_length + padded_length, _compile=False, device=device)
-        flex_attn = FlexAttentionNPU(mask_mod=attention_mask)
-
-        # import torch.distributed as dist
-        # if not dist.is_initialized() or dist.get_rank() == 0:
-        #     print(
-        #         f" cache a block wise causal mask with block size of {num_frame_per_block} frames")
-        #     print(block_mask)
-
-        return flex_attn
+            import torch.distributed as dist
+            if not dist.is_initialized() or dist.get_rank() == 0:
+                print(
+                    f" cache a block wise causal mask with block size of {num_frame_per_block} frames")
+                print(block_mask)
+            return block_mask
 
     def _forward_inference(
         self,
@@ -693,13 +652,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         # Construct blockwise causal attn mask
         if self.block_mask is None:
-            # self.block_mask = self._prepare_blockwise_causal_attn_mask(
-            #     device, num_frames=x.shape[2],
-            #     frame_seqlen=x.shape[-2] *
-            #     x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),
-            #     num_frame_per_block=self.num_frame_per_block
-            # )
-            self.block_mask = self._prepare_blockwise_causal_attn_mask_npu(
+            self.block_mask = self._prepare_blockwise_causal_attn_mask(
                 device, num_frames=x.shape[2],
                 frame_seqlen=x.shape[-2] *
                 x.shape[-1] // (self.patch_size[1] * self.patch_size[2]),

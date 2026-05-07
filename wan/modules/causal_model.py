@@ -48,7 +48,7 @@ else:
         dynamic=False,
         mode="max-autotune-no-cudagraphs"
     )
-
+# TODO: use FlexAttentionNPU on NPU
 
 
 def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
