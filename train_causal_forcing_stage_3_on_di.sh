@@ -26,13 +26,13 @@ export TASK_QUEUE_ENABLE=1
 # python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/data/CausalForcingData/ODE6KCausal_chunkwise_12', '/cache/CausalForcingData/ODE6KCausal_chunkwise_12')"
 # python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/data/CausalForcingData/ODE6KCausal_chunkwise_13', '/cache/CausalForcingData/ODE6KCausal_chunkwise_13')"
 # python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/data/CausalForcingData/ODE6KCausal_chunkwise_14', '/cache/CausalForcingData/ODE6KCausal_chunkwise_14')"
-python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/data/mixkit/mixkit_ode_lmdb', '/cache/mixkit_ode_lmdb')"
 python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/models/wan_models/Wan2.1-T2V-1.3B', '/cache/wan_models/Wan2.1-T2V-1.3B')"
-python -c "import moxing as mox; mox.file.copy('obs://yw-ads-model-training-gy1/model-dev/pixelgeek/video-gen-ar/2026/04/30/b1c7e8b82f94432fab915369c8046201/output/train_outputs/causvid_bidirectional_dmd_init/2026-04-30-17-30-48.319004_seed9760847/checkpoint_model_008000/model.pt', '/cache/init_model.pt')"
-
+python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/models/wan_models/Wan2.1-T2V-14B', '/cache/wan_models/Wan2.1-T2V-14B')"
+python -c "import moxing as mox; mox.file.copy('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/models/Self-Forcing/vidprom_filtered_extended.txt', '/cache/vidprom_filtered_extended.txt')"
+python -c "import moxing as mox; mox.file.copy('obs://yw-ads-model-training-gy1/model-dev/pixelgeek/video-gen-ar/2026/05/06/5bebc8999d6548058cb10dc99bdbe2d1/output/train_outputs/causvid_causal_ode_init/2026-05-06-17-19-36.493263_seed6873622/checkpoint_model_003000/model.pt', '/cache/ode_model.pt')"
 
 MASTER_ADDR=$(echo $VC_WORKER_HOSTS | cut -d',' -f1)
 
 torchrun --nproc_per_node=8 --rdzv_conf="timeout=7200" --nnodes=$VC_WORKER_NUM --node_rank=$VC_TASK_INDEX --master_addr $MASTER_ADDR --master_port 12345 train_causal_forcing.py \
-    --config_path configs/causal_forcing/causal_ode_chunkwise_continue.yaml \
-    --logdir train_outputs/causal_forcing_ode_chunkwise_continue
+    --config_path configs/causal_forcing/causal_forcing_dmd_chunkwise.yaml \
+    --logdir train_outputs/causal_forcing_dmd_chunkwise

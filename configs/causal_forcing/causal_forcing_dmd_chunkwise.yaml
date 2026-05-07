@@ -1,4 +1,4 @@
-generator_ckpt: checkpoints/chunkwise/causal_ode.pt
+generator_ckpt: /cache/ode_model.pt
 generator_fsdp_wrap_strategy: size
 real_score_fsdp_wrap_strategy: size
 fake_score_fsdp_wrap_strategy: size
@@ -50,4 +50,4 @@ num_frame_per_block: 3
 load_raw_video: false
 model_kwargs:
   timestep_shift: 5.0
-data_path: prompts/vidprom_filtered_extended.txt 
+data_path: /cache/vidprom_filtered_extended.txt 
