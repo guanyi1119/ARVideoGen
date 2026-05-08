@@ -90,6 +90,7 @@ class MultiODERegressionLMDBDataset(Dataset):
     """
     def __init__(self, data_path: str, folder_name_pattern: str, max_pair: int = int(1e8)):
         self.envs = []
+        self.latents_shape = []
         self.index = []
         valid_fnames = []
 
@@ -103,17 +104,22 @@ class MultiODERegressionLMDBDataset(Dataset):
                                 lock=False,
                                 readahead=False,
                                 meminit=False)
-                self.envs.append(env)
+                latents_shape = get_array_shape_from_lmdb(env, 'latents')
                 valid_fnames.append(fname)
+                self.envs.append(env)
+                self.latents_shape.append(latents_shape)
             except:
                 continue
         print(f"Loaded {len(valid_fnames)} datasets: {valid_fnames}")
-
-        self.latents_shape = [None] * len(self.envs)
-        for shard_id, env in enumerate(self.envs):
-            self.latents_shape[shard_id] = get_array_shape_from_lmdb(env, 'latents')
-            for local_i in range(self.latents_shape[shard_id][0]):
+        for shard_id, latents_shape in enumerate(self.latents_shape):
+            for local_i in range(latents_shape[0]):
                 self.index.append((shard_id, local_i))
+
+        # self.latents_shape = [None] * len(self.envs)
+        # for shard_id, env in enumerate(self.envs):
+        #     self.latents_shape[shard_id] = get_array_shape_from_lmdb(env, 'latents')
+        #     for local_i in range(self.latents_shape[shard_id][0]):
+        #         self.index.append((shard_id, local_i))
 
         self.max_pair = max_pair
 
