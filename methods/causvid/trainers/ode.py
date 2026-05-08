@@ -1,5 +1,6 @@
 from datetime import datetime
 from methods.causvid.data import ODERegressionDataset, ODERegressionLMDBDataset
+from core.data.dataset import MultiODERegressionLMDBDataset
 from methods.causvid.ode_regression import ODERegression
 from transformers.models.t5.modeling_t5 import T5Block
 from collections import defaultdict
@@ -82,8 +83,14 @@ class Trainer:
 
         # Step 3: Initialize the dataloader
         # dataset = ODERegressionDataset(config.data_path)
-        dataset = ODERegressionLMDBDataset(
-            config.data_path, max_pair=getattr(config, "max_pair", int(1e8)))
+        data_name_pattern = getattr(config, "data_name_pattern", "")
+        if data_name_pattern:
+            dataset = MultiODERegressionLMDBDataset(
+                config.data_path, data_name_pattern, max_pair=getattr(config, "max_pair", int(1e8))
+            )
+        else:
+            dataset = ODERegressionLMDBDataset(
+                config.data_path, max_pair=getattr(config, "max_pair", int(1e8)))
         sampler = torch.utils.data.distributed.DistributedSampler(
             dataset, shuffle=True, drop_last=True)
         dataloader = torch.utils.data.DataLoader(

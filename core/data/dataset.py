@@ -91,17 +91,23 @@ class MultiODERegressionLMDBDataset(Dataset):
     def __init__(self, data_path: str, folder_name_pattern: str, max_pair: int = int(1e8)):
         self.envs = []
         self.index = []
+        valid_fnames = []
 
         for fname in sorted(os.listdir(data_path)):
             if not (folder_name_pattern in fname):
                 continue
             path = os.path.join(data_path, fname)
-            env = lmdb.open(path,
-                            readonly=True,
-                            lock=False,
-                            readahead=False,
-                            meminit=False)
-            self.envs.append(env)
+            try:
+                env = lmdb.open(path,
+                                readonly=True,
+                                lock=False,
+                                readahead=False,
+                                meminit=False)
+                self.envs.append(env)
+                valid_fnames.append(fname)
+            except:
+                continue
+        print(f"Loaded {len(valid_fnames)} datasets: {valid_fnames}")
 
         self.latents_shape = [None] * len(self.envs)
         for shard_id, env in enumerate(self.envs):
