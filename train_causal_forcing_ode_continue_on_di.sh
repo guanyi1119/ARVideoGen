@@ -28,7 +28,8 @@ python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-trai
 python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/data/CausalForcingData/ODE6KCausal_chunkwise_14', '/cache/CausalForcingData/ODE6KCausal_chunkwise_14')"
 # python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/data/mixkit/mixkit_ode_lmdb', '/cache/mixkit_ode_lmdb')"
 python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/models/wan_models/Wan2.1-T2V-1.3B', '/cache/wan_models/Wan2.1-T2V-1.3B')"
-python -c "import moxing as mox; mox.file.copy('obs://yw-ads-model-training-gy1/model-dev/pixelgeek/video-gen-ar/2026/04/30/b1c7e8b82f94432fab915369c8046201/output/train_outputs/causvid_bidirectional_dmd_init/2026-04-30-17-30-48.319004_seed9760847/checkpoint_model_008000/model.pt', '/cache/init_model.pt')"
+# python -c "import moxing as mox; mox.file.copy('obs://yw-ads-model-training-gy1/model-dev/pixelgeek/video-gen-ar/2026/04/30/b1c7e8b82f94432fab915369c8046201/output/train_outputs/causvid_bidirectional_dmd_init/2026-04-30-17-30-48.319004_seed9760847/checkpoint_model_008000/model.pt', '/cache/init_model.pt')"
+python -c "import moxing as mox; mox.file.copy('obs://yw-ads-model-training-gy1/model-dev/pixelgeek/video-gen-ar/2026/04/30/cdcb0ac86c944a5ca761a998ac976b56/output/train_outputs/causal_forcing_ar_tf_chunkwise/checkpoint_model_008000/model.pt', '/cache/init_model.pt')"
 
 
 MASTER_ADDR=$(echo $VC_WORKER_HOSTS | cut -d',' -f1)
