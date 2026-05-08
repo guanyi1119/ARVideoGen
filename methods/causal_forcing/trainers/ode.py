@@ -87,11 +87,14 @@ class Trainer:
         )
 
         # Step 3: Initialize the dataloader
-        # dataset = MultiODERegressionLMDBDataset(
-        #     config.data_path, config.data_name_pattern, max_pair=getattr(config, "max_pair", int(1e8)))
-        dataset = ODERegressionLMDBDataset(
-            config.data_path, max_pair=getattr(config, "max_pair", int(1e8))
-        )
+        data_name_pattern = getattr(config, "data_name_pattern", "")
+        if data_name_pattern:
+            dataset = MultiODERegressionLMDBDataset(
+                config.data_path, data_name_pattern, max_pair=getattr(config, "max_pair", int(1e8))
+            )
+        else:
+            dataset = ODERegressionLMDBDataset(
+                config.data_path, max_pair=getattr(config, "max_pair", int(1e8)))
         sampler = torch.utils.data.distributed.DistributedSampler(
             dataset, shuffle=True, drop_last=True)
         dataloader = torch.utils.data.DataLoader(

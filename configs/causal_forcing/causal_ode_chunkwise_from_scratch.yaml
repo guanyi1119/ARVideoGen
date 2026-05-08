@@ -20,11 +20,11 @@ sharding_strategy: full
 lr: 2.0e-06
 beta1: 0.9
 beta2: 0.999
-# data_path: /cache/CausalForcingData
-# data_name_pattern: ODE6KCausal_chunkwise
-data_path: /cache/mixkit_ode_lmdb
+data_path: /cache/CausalForcingData
+data_name_pattern: ODE6KCausal_chunkwise
+# data_path: /cache/mixkit_ode_lmdb
 batch_size: 1
-log_iters: 1000
+log_iters: 200
 trainer: ode
 gradient_checkpointing: true
 num_frame_per_block: 3
