@@ -108,7 +108,7 @@ class WanDiffusionWrapper(DiffusionModelInterface):
         self.uniform_timestep = True
 
         self.scheduler = FlowMatchScheduler(
-            shift=8.0, sigma_min=0.0, extra_one_step=True
+            shift=5.0, sigma_min=0.0, extra_one_step=True
         )
         self.scheduler.set_timesteps(1000, training=True)
 
