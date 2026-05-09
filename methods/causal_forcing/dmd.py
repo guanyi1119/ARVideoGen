@@ -123,6 +123,10 @@ class DMD(SelfForcingModel):
         grad = torch.nan_to_num(grad)
 
         return grad, {
+            "dmdtrain_clean_latent": estimated_clean_image_or_video.detach(),
+            "dmdtrain_noisy_latent": noisy_image_or_video.detach(),
+            "dmdtrain_pred_real_image": pred_real_image.detach(),
+            "dmdtrain_pred_fake_image": pred_fake_image.detach(),
             "dmdtrain_gradient_norm": torch.mean(torch.abs(grad)).detach(),
             "timestep": timestep.detach()
         }
@@ -329,6 +333,9 @@ class DMD(SelfForcingModel):
 
         # Step 5: Debugging Log
         critic_log_dict = {
+            "critictrain_latent": generated_image.detach(),
+            "critictrain_noisy_latent": noisy_generated_image.detach(),
+            "critictrain_pred_image": pred_fake_image.detach(),
             "critic_timestep": critic_timestep.detach()
         }
 

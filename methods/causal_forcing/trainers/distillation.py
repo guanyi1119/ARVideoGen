@@ -1,5 +1,6 @@
 import gc
 import logging
+from datetime import datetime
 from core.data.dataset import cycle
 from core.data.dataset import TextDataset
 from core.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
@@ -303,9 +304,11 @@ class Trainer:
 
     def train(self):
         start_step = self.step
-       
+        self.start_step = 0
+        self.start_time = time.time()
         while True:
             TRAIN_GENERATOR = self.step % self.config.dfake_gen_update_ratio == 0
+            VISUALIZE = self.step % self.config.log_iters == 0 and not self.config.no_visualize
 
             # Train the generator
             if TRAIN_GENERATOR:
@@ -343,26 +346,40 @@ class Trainer:
                 torch.cuda.empty_cache()
 
             # Logging
-            if self.is_main_process:
-                log_dict = {}
-                if TRAIN_GENERATOR:
-                    log_dict.update(
-                        {
-                            "generator_loss": generator_log_dict["generator_loss"].mean().item(),
-                            "generator_grad_norm": generator_log_dict["generator_grad_norm"].mean().item(),
-                            "dmdtrain_gradient_norm": generator_log_dict["dmdtrain_gradient_norm"].mean().item()
-                        }
-                    )
-
+            log_dict = {}
+            if TRAIN_GENERATOR:
                 log_dict.update(
                     {
-                        "critic_loss": critic_log_dict["critic_loss"].mean().item(),
-                        "critic_grad_norm": critic_log_dict["critic_grad_norm"].mean().item()
+                        "generator_loss": generator_log_dict["generator_loss"].mean().item(),
+                        "generator_grad_norm": generator_log_dict["generator_grad_norm"].mean().item(),
+                        "dmdtrain_gradient_norm": generator_log_dict["dmdtrain_gradient_norm"].mean().item()
                     }
                 )
-
+            log_dict.update(
+                {
+                    "critic_loss": critic_log_dict["critic_loss"].mean().item(),
+                    "critic_grad_norm": critic_log_dict["critic_grad_norm"].mean().item()
+                }
+            )
+            if self.is_main_process:
                 if not self.disable_logging:
                     self.writer.log(log_dict, step=self.step)
+                    if VISUALIZE:
+                        if TRAIN_GENERATOR:
+                            dmdtrain_clean_latent = self.model.vae.decode_to_pixel(generator_log_dict["dmdtrain_clean_latent"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
+                            dmdtrain_noisy_latent = self.model.vae.decode_to_pixel(generator_log_dict["dmdtrain_noisy_latent"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
+                            dmdtrain_pred_real_image = self.model.vae.decode_to_pixel(generator_log_dict["dmdtrain_pred_real_image"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
+                            dmdtrain_pred_fake_image = self.model.vae.decode_to_pixel(generator_log_dict["dmdtrain_pred_fake_image"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
+                            self.writer.log_video("dmdtrain_clean_latent", dmdtrain_clean_latent, self.step, fps=16)
+                            self.writer.log_video("dmdtrain_noisy_latent", dmdtrain_noisy_latent, self.step, fps=16)
+                            self.writer.log_video("dmdtrain_pred_real_image", dmdtrain_pred_real_image, self.step, fps=16)
+                            self.writer.log_video("dmdtrain_pred_fake_image", dmdtrain_pred_fake_image, self.step, fps=16)
+                        critictrain_latent = self.model.vae.decode_to_pixel(critic_log_dict["critictrain_latent"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
+                        critictrain_noisy_latent = self.model.vae.decode_to_pixel(critic_log_dict["critictrain_noisy_latent"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
+                        critictrain_pred_image = self.model.vae.decode_to_pixel(critic_log_dict["critictrain_pred_image"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
+                        self.writer.log_video("critictrain_latent", critictrain_latent, self.step, fps=16)
+                        self.writer.log_video("critictrain_noisy_latent", critictrain_noisy_latent, self.step, fps=16)
+                        self.writer.log_video("critictrain_pred_image", critictrain_pred_image, self.step, fps=16)
 
             if self.step % self.config.gc_interval == 0:
                 if dist.get_rank() == 0:
@@ -378,3 +395,25 @@ class Trainer:
                     if not self.disable_logging:
                         self.writer.log({"per iteration time": current_time - self.previous_time}, step=self.step)
                     self.previous_time = current_time
+
+            batch_size = len(batch["prompts"])
+            if (self.step + 1) % 1 == 0:
+                end_time = time.time()
+                end_step = self.step + 1
+
+                # 计算吞吐量
+                step_diff = end_step - self.start_step
+                time_diff = end_time - self.start_time
+                seconds_per_iter = time_diff / step_diff
+                throughput = batch_size / seconds_per_iter
+
+                # 打印训练日志，吞吐加在最后
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                print(
+                    f"{timestamp}: [step {self.step}] " \
+                    f"generator_loss: {log_dict['generator_loss'] if TRAIN_GENERATOR else 0.0:.4f} " \
+                    f"critic_loss: {log_dict['critic_loss']:.4f} " \
+                    f"DI_throughput: {throughput:.2f} samples/s/npu"
+                )
+                self.start_time = time.time()
+                self.start_step = end_step
