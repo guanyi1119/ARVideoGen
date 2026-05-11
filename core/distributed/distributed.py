@@ -137,7 +137,7 @@ class EMA_FSDP:
         """
         live_state = {}
         for n, p in fsdp_module.module.named_parameters():
-            live_state[n] = p.detach().clone()
+            live_state[n] = p.detach().clone().cpu()
         for n, p in fsdp_module.module.named_parameters():
             if n in self.shadow:
                 p.data.copy_(self.shadow[n].to(dtype=p.dtype, device=p.device))

@@ -96,9 +96,7 @@ class Trainer:
         )
         torch.cuda.empty_cache()
 
-        if not config.no_visualize or config.load_raw_video:
-            self.model.vae = self.model.vae.to(
-                device=self.device, dtype=torch.bfloat16 if config.mixed_precision else torch.float32)
+        self.vae_dtype = torch.bfloat16 if config.mixed_precision else torch.float32
 
         self.generator_optimizer = torch.optim.AdamW(
             [param for param in self.model.generator.parameters()
@@ -189,19 +187,19 @@ class Trainer:
 
     def save(self):
         print("Start gathering distributed model states...")
-        generator_state_dict = fsdp_state_dict(
-            self.model.generator)
-        critic_state_dict = fsdp_state_dict(
-            self.model.fake_score)
 
         if self.config.ema_start_step < self.step:
             state_dict = {
                 "generator_ema": self.generator_ema.full_state_dict(self.model.generator),
             }
         else:
+            generator_state_dict = fsdp_state_dict(
+                self.model.generator)
             state_dict = {
                 "generator": generator_state_dict,
             }
+
+        torch.cuda.empty_cache()
 
         if self.is_main_process:
             os.makedirs(os.path.join(self.output_path,
@@ -365,6 +363,8 @@ class Trainer:
                 if not self.disable_logging:
                     self.writer.log(log_dict, step=self.step)
                     if VISUALIZE:
+                        self.model.vae = self.model.vae.to(
+                            device=self.device, dtype=self.vae_dtype)
                         if TRAIN_GENERATOR:
                             dmdtrain_clean_latent = self.model.vae.decode_to_pixel(generator_log_dict["dmdtrain_clean_latent"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
                             dmdtrain_noisy_latent = self.model.vae.decode_to_pixel(generator_log_dict["dmdtrain_noisy_latent"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
@@ -380,6 +380,8 @@ class Trainer:
                         self.writer.log_video("critictrain_latent", critictrain_latent, self.step, fps=16)
                         self.writer.log_video("critictrain_noisy_latent", critictrain_noisy_latent, self.step, fps=16)
                         self.writer.log_video("critictrain_pred_image", critictrain_pred_image, self.step, fps=16)
+                        self.model.vae = self.model.vae.to(device='cpu')
+                        torch.cuda.empty_cache()
 
             if self.step % self.config.gc_interval == 0:
                 if dist.get_rank() == 0:
