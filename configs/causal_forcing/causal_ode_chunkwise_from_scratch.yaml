@@ -30,3 +30,4 @@ gradient_checkpointing: true
 num_frame_per_block: 3
 model_kwargs:
   timestep_shift: 5.0
+  model_name: Wan2.1-T2V-14B
