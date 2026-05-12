@@ -135,16 +135,20 @@ class EMA_FSDP:
         """[DIFF-Causal-Forcing] Returns EMA shadow as a state dict, temporarily
         loading EMA weights into the model to use fsdp_state_dict().
         """
-        live_state = {}
-        for n, p in fsdp_module.module.named_parameters():
-            live_state[n] = p.detach().clone().cpu()
-        for n, p in fsdp_module.module.named_parameters():
-            if n in self.shadow:
-                # dtype conversion on CPU, then copy_ handles device transfer via
-                # pinned buffer reuse — avoids allocating a full GPU temporary
-                p.data.copy_(self.shadow[n].to(dtype=p.dtype))
+        # Step 1: Save live params and swap in EMA shadow.
+        # summon_full_params ensures p has full (unsharded) shape matching shadow.
+        # writeback=True persists the EMA values to sharded params on exit.
+        with FSDP.summon_full_params(fsdp_module, writeback=True):
+            live_state = {}
+            for n, p in fsdp_module.module.named_parameters():
+                live_state[n] = p.detach().clone().cpu()
+            for n, p in fsdp_module.module.named_parameters():
+                if n in self.shadow:
+                    p.data.copy_(self.shadow[n].to(dtype=p.dtype))
 
+        # Step 2: Get state dict with EMA weights (now in sharded params)
         checkpoint = fsdp_state_dict(fsdp_module)
+
         shadow_checkpoint = {}
         for n in self.shadow:
             k = n
@@ -152,8 +156,11 @@ class EMA_FSDP:
                 k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
             if k in checkpoint:
                 shadow_checkpoint[n] = checkpoint[k]
-        for n, p in fsdp_module.module.named_parameters():
-            if n in live_state:
-                p.data.copy_(live_state[n].to(dtype=p.dtype))
+
+        # Step 3: Restore live params
+        with FSDP.summon_full_params(fsdp_module, writeback=True):
+            for n, p in fsdp_module.module.named_parameters():
+                if n in live_state:
+                    p.data.copy_(live_state[n].to(dtype=p.dtype))
 
         return shadow_checkpoint
