@@ -140,7 +140,9 @@ class EMA_FSDP:
             live_state[n] = p.detach().clone().cpu()
         for n, p in fsdp_module.module.named_parameters():
             if n in self.shadow:
-                p.data.copy_(self.shadow[n].to(dtype=p.dtype, device=p.device))
+                # dtype conversion on CPU, then copy_ handles device transfer via
+                # pinned buffer reuse — avoids allocating a full GPU temporary
+                p.data.copy_(self.shadow[n].to(dtype=p.dtype))
 
         checkpoint = fsdp_state_dict(fsdp_module)
         shadow_checkpoint = {}
@@ -152,6 +154,6 @@ class EMA_FSDP:
                 shadow_checkpoint[n] = checkpoint[k]
         for n, p in fsdp_module.module.named_parameters():
             if n in live_state:
-                p.data.copy_(live_state[n].to(dtype=p.dtype, device=p.device))
+                p.data.copy_(live_state[n].to(dtype=p.dtype))
 
         return shadow_checkpoint
