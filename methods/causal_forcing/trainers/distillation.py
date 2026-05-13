@@ -189,7 +189,6 @@ class Trainer:
         print("Start gathering distributed model states...")
 
         if self.config.ema_start_step < self.step:
-            print("[TEMP DEBUG] Save generator EMA")
             state_dict = {
                 "generator_ema": self.generator_ema.full_state_dict(self.model.generator),
             }

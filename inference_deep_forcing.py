@@ -1,5 +1,6 @@
 # LongLive inference entry point
 # Based on archive/DeepForcing/inference.py
+import os
 import argparse
 import torch
 DEVICE_TYPE = os.environ.get('DEVICE_TYPE', 'cuda')
