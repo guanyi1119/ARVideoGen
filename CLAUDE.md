@@ -4,12 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-ARVideoGen是一个包含多种自回归视频生成方法的研究项目集合，基于Wan2.1基础模型。项目整合了五种主要方法：
+ARVideoGen是一个包含多种自回归视频生成方法的研究项目集合，基于Wan2.1基础模型。项目整合了六种主要方法：
 - **Causal-Forcing**：使用teacher forcing训练自回归模型
 - **Self-Forcing**：使用自强迫训练消除train-test mismatch
 - **CausVid**：双向扩散初始化后蒸馏为因果模型
 - **LongLive**：面向长视频生成的流式训练框架
 - **DeepForcing**：使用Prompt Context机制增强长视频上下文建模
+- **Rolling Forcing**：使用滚动窗口训练和随机选择推理策略的长视频生成方法
 
 ## 常用命令
 
@@ -31,6 +32,9 @@ python train_longlive.py --config configs/longlive/longlive_train_long.yaml
 
 # DeepForcing 训练（待添加）
 # python train_deep_forcing.py --config configs/deep_forcing/deep_forcing_dmd.yaml
+
+# Rolling Forcing 训练
+python train_rolling_forcing.py --config configs/rolling_forcing/rolling_forcing_dmd.yaml
 ```
 
 ### 推理命令
@@ -68,6 +72,12 @@ python inference_deep_forcing.py \
   --checkpoint_path checkpoints/deep_forcing/ \
   --data_path prompts.txt --output_folder outputs/ \
   --num_output_frames 126 --is_ds_only 1
+
+# Rolling Forcing 推理
+python inference_rolling_forcing.py \
+  --config_path configs/rolling_forcing/rolling_forcing_dmd.yaml \
+  --checkpoint_path checkpoints/rolling_forcing/ \
+  --data_path prompts.txt --output_folder outputs/
 ```
 
 ### 数据处理脚本
@@ -107,7 +117,8 @@ ARVideoGen/
 │   ├── self_forcing/         # Self-Forcing方法
 │   ├── causvid/              # CausVid方法
 │   ├── longlive/             # LongLive方法
-│   └── deep_forcing/         # DeepForcing方法
+│   ├── deep_forcing/         # DeepForcing方法
+│   └── rolling_forcing/      # Rolling Forcing方法
 ├── configs/                  # 各方法配置文件
 ├── scripts/                  # 数据处理脚本
 ├── train_<method>.py         # 训练入口脚本
@@ -125,12 +136,14 @@ ARVideoGen/
 | CausVid | `core.wan_wrapper.wan_wrapper_causvid` | `get_wan_wrapper_classes('causvid')` |
 | LongLive | `core.wan_wrapper.wan_wrapper_longlive` | `get_wan_wrapper_classes('longlive')` |
 | DeepForcing | `core.wan_wrapper.wan_wrapper_deepforcing` | `get_wan_wrapper_classes('deepforcing')` |
+| Rolling Forcing | `core.wan_wrapper.wan_wrapper_rollingforcing` | `get_wan_wrapper_classes('rollingforcing')` |
 
 关键差异：
 - Base (CF/SF): `cache_start`, `classify_mode`, `clean_x`/`aug_t`, 返回 `(flow_pred, pred_x0)`
 - CausVid: `current_end`, 返回 `pred_x0`
 - LongLive: `sink_recache_after_switch`, `decode_to_pixel_chunk()`
 - DeepForcing: `is_ds_only`, `budget`, `recent`, 支持 CausalWanModelDS
+- Rolling Forcing: `updating_cache`, `kv_cache_clean`, 支持滚动窗口推理
 
 #### CausalModel变体
 
@@ -141,6 +154,7 @@ ARVideoGen/
 | LongLive | `wan.modules.causal_model_longlive` | `get_causal_model_class('longlive')` |
 | LongLive (Infinity) | `wan.modules.causal_model_infinity` | `get_causal_model_class('infinity')` |
 | DeepForcing | `wan.modules.causal_model` / `wan.modules.causal_model_DS` | `get_causal_model_class('default')` 或 `CausalWanModelDS.from_pretrained()` |
+| Rolling Forcing | `wan.modules.causal_model_rolling_forcing` | `get_causal_model_class('rolling_forcing')` |
 
 ### BaseModel继承体系
 
@@ -155,6 +169,9 @@ BaseModel (methods/base/base_self_forcing.py)
 
 BaseModel (methods/base/base_longlive.py)
 └── SelfForcingModel       → args.causal标志, GPU denoising_step_list, 调试支持
+
+BaseModel (methods/base/base_rolling_forcing.py)
+└── RollingForcingModel    → 滚动窗口训练, 随机选择推理策略, 支持`updating_cache`
 ```
 
 ## 各方法关键差异
@@ -198,6 +215,14 @@ BaseModel (methods/base/base_longlive.py)
 - **CLI参数**：支持`--extended_prompt_path`、`--num_samples`、`--save_with_index`
 - **WanWrapper**：`wan_wrapper_deepforcing.py`提供完整支持
 
+### Rolling Forcing
+- **滚动窗口训练**：使用滚动窗口机制进行训练，支持长视频生成
+- **随机选择推理策略**：训练时随机选择使用 rolling forcing 或 self forcing 进行推理
+- **updating_cache参数**：支持在推理过程中更新 KV 缓存
+- **kv_cache_clean管理**：使用单独的 KV 缓存管理策略
+- **推理管道**：支持 `inference_with_rolling_forcing` 和 `inference_with_self_forcing` 两种模式
+- **WanWrapper**：`wan_wrapper_rollingforcing.py`提供完整支持
+
 ## 常见陷阱
 
 1. **WanWrapper返回值不一致**：CausVid返回单个tensor，其他返回元组
@@ -209,6 +234,8 @@ BaseModel (methods/base/base_longlive.py)
 7. **LongLive `is_causal`标志**：可以为False，其他方法始终为True
 8. **DeepForcing参数传递**：`is_ds_only`, `budget`, `recent`通过`model_kwargs`传递，需在配置中正确设置
 9. **CausalWanModelDS可用性**：如果没有该类，代码会自动回退到CausalWanModel，但PC功能会受限
+10. **Rolling Forcing的updating_cache参数**：该参数用于控制在推理过程中是否更新KV缓存，需要正确传递给CausalWanModel
+11. **Rolling Forcing的随机选择推理策略**：在`_consistency_backward_simulation`方法中会随机选择使用rolling forcing或self forcing进行推理
 
 ## 配置文件说明
 

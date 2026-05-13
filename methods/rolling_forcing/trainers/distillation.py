@@ -1,0 +1,431 @@
+import gc
+import logging
+from datetime import datetime
+from core.data.dataset import cycle
+from core.data.dataset import ShardingLMDBDataset, TextDataset
+from core.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
+from core.misc import set_seed, TensorBoardLogger
+import torch.distributed as dist
+from omegaconf import OmegaConf
+from methods.rolling_forcing import DMD
+import torch
+import time
+import os
+
+
+class Trainer:
+    def __init__(self, config):
+        self.config = config
+        self.step = 0
+
+        # Step 1: Initialize the distributed training environment (rank, seed, dtype, logging etc.)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+        launch_distributed_job()
+        global_rank = dist.get_rank()
+        self.world_size = dist.get_world_size()
+
+        self.dtype = torch.bfloat16 if config.mixed_precision else torch.float32
+        self.device = torch.cuda.current_device()
+        self.is_main_process = global_rank == 0
+        self.causal = config.causal
+        self.disable_logging = getattr(config, "disable_logging", False) or getattr(config, "disable_wandb", False)
+
+        self.output_path = config.logdir
+
+        # use a random seed for the training
+        if config.seed == 0:
+            random_seed = torch.randint(0, 10000000, (1,), device=self.device)
+            dist.broadcast(random_seed, src=0)
+            config.seed = random_seed.item()
+
+        set_seed(config.seed + global_rank)
+
+        if self.is_main_process and not self.disable_logging:
+            tensorboard_dir = os.path.join(self.output_path, "tensorboard")
+            os.makedirs(tensorboard_dir, exist_ok=True)
+            self.writer = TensorBoardLogger(
+                log_dir=tensorboard_dir,
+                config=config,
+                name=getattr(config, "config_name", None)
+            )
+
+        # Step 2: Initialize the model and optimizer
+        if config.distribution_loss == "dmd":
+            self.model = DMD(config, device=self.device)
+        else:
+            raise ValueError("Invalid distribution matching loss")
+
+        # Save pretrained model state_dicts to CPU
+        self.fake_score_state_dict_cpu = self.model.fake_score.state_dict()
+
+        self.model.generator = fsdp_wrap(
+            self.model.generator,
+            sharding_strategy=config.sharding_strategy,
+            mixed_precision=config.mixed_precision,
+            wrap_strategy=config.generator_fsdp_wrap_strategy,
+            cpu_offload=False
+        )
+        torch.cuda.empty_cache()
+
+        self.model.real_score = fsdp_wrap(
+            self.model.real_score,
+            sharding_strategy=config.sharding_strategy,
+            mixed_precision=config.mixed_precision,
+            wrap_strategy=config.real_score_fsdp_wrap_strategy,
+            cpu_offload=getattr(config, "real_score_cpu_offload", False)
+        )
+        torch.cuda.empty_cache()
+
+        self.model.fake_score = fsdp_wrap(
+            self.model.fake_score,
+            sharding_strategy=config.sharding_strategy,
+            mixed_precision=config.mixed_precision,
+            wrap_strategy=config.fake_score_fsdp_wrap_strategy,
+            cpu_offload=False
+        )
+        torch.cuda.empty_cache()
+
+        self.model.text_encoder = fsdp_wrap(
+            self.model.text_encoder,
+            sharding_strategy=config.sharding_strategy,
+            mixed_precision=config.mixed_precision,
+            wrap_strategy=config.text_encoder_fsdp_wrap_strategy,
+            cpu_offload=getattr(config, "text_encoder_cpu_offload", False)
+        )
+        torch.cuda.empty_cache()
+
+        self.vae_dtype = torch.bfloat16 if config.mixed_precision else torch.float32
+
+        self.generator_optimizer = torch.optim.AdamW(
+            [param for param in self.model.generator.parameters()
+            if param.requires_grad],
+            lr=config.lr,
+            betas=(config.beta1, config.beta2),
+            weight_decay=config.weight_decay
+        )
+
+        self.critic_optimizer = torch.optim.AdamW(
+            [param for param in self.model.fake_score.parameters()
+            if param.requires_grad],
+            lr=config.lr_critic if hasattr(config, "lr_critic") else config.lr,
+            betas=(config.beta1_critic, config.beta2_critic),
+            weight_decay=config.weight_decay
+        )
+
+        # Step 3: Initialize the dataloader
+        if self.config.i2v:
+            dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
+        else:
+            dataset = TextDataset(config.data_path)
+        sampler = torch.utils.data.distributed.DistributedSampler(
+            dataset, shuffle=True, drop_last=True)
+        dataloader = torch.utils.data.DataLoader(
+            dataset,
+            batch_size=config.batch_size,
+            sampler=sampler,
+            num_workers=8)
+
+        if dist.get_rank() == 0:
+            print("DATASET SIZE %d" % len(dataset))
+        self.dataloader = cycle(dataloader)
+
+        # Set up EMA parameter containers
+        rename_param = (
+            lambda name: name.replace("_fsdp_wrapped_module.", "")
+            .replace("_checkpoint_wrapped_module.", "")
+            .replace("_orig_mod.", "")
+        )
+        self.name_to_trainable_params = {}
+        for n, p in self.model.generator.named_parameters():
+            if not p.requires_grad:
+                continue
+
+            renamed_n = rename_param(n)
+            self.name_to_trainable_params[renamed_n] = p
+        ema_weight = config.ema_weight
+        self.generator_ema = None
+        if (ema_weight is not None) and (ema_weight > 0.0):
+            print(f"Setting up EMA with weight {ema_weight}")
+            self.generator_ema = EMA_FSDP(self.model.generator, decay=ema_weight)
+
+        # (If resuming) Load the model and optimizer, lr_scheduler, ema's statedicts
+        if getattr(config, "generator_ckpt", False):
+            print(f"Loading pretrained generator from {config.generator_ckpt}")
+            state_dict = torch.load(config.generator_ckpt, map_location="cpu")
+            if "generator" in state_dict:
+                state_dict = state_dict["generator"]
+                fixed = {}
+                for k, v in state_dict.items():
+                    if k.startswith("model._fsdp_wrapped_module."):
+                        k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
+                    fixed[k] = v
+                state_dict = fixed
+            elif "model" in state_dict:
+                state_dict = state_dict["model"]
+            elif "generator_ema" in state_dict:
+                gen_sd = state_dict["generator_ema"]
+                fixed = {}
+                for k, v in gen_sd.items():
+                    if k.startswith("model._fsdp_wrapped_module."):
+                        k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
+                    fixed[k] = v
+                state_dict = fixed
+            self.model.generator.load_state_dict(
+                state_dict, strict=True
+            )
+
+        # Let's delete EMA params for early steps to save some computes at training and inference
+        if self.step < config.ema_start_step:
+            self.generator_ema = None
+
+        self.max_grad_norm_generator = getattr(config, "max_grad_norm_generator", 10.0)
+        self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
+        self.previous_time = None
+
+    def save(self):
+        print("Start gathering distributed model states...")
+        generator_state_dict = fsdp_state_dict(
+            self.model.generator)
+        critic_state_dict = fsdp_state_dict(
+            self.model.fake_score)
+
+        if self.config.ema_start_step < self.step:
+            state_dict = {
+                "generator": generator_state_dict,
+                "critic": critic_state_dict,
+                "generator_ema": self.generator_ema.state_dict(),
+            }
+        else:
+            state_dict = {
+                "generator": generator_state_dict,
+                "critic": critic_state_dict,
+            }
+
+        torch.cuda.empty_cache()
+
+        if self.is_main_process:
+            os.makedirs(os.path.join(self.output_path,
+                        f"checkpoint_model_{self.step:06d}"), exist_ok=True)
+            torch.save(state_dict, os.path.join(self.output_path,
+                       f"checkpoint_model_{self.step:06d}", "model.pt"))
+            print("Model saved to", os.path.join(self.output_path,
+                  f"checkpoint_model_{self.step:06d}", "model.pt"))
+
+    def fwdbwd_one_step(self, batch, train_generator, clean_latent=None):
+        self.model.eval()  # prevent any randomness (e.g. dropout)
+
+        if self.step % 20 == 0:
+            torch.cuda.empty_cache()
+
+        # Step 1: Get the next batch of text prompts
+        text_prompts = batch["prompts"]
+        if self.config.i2v:
+            image_latent = batch["ode_latent"][:, -1][:, 0:1, ].to(
+                device=self.device, dtype=self.dtype)
+        else:
+            image_latent = None
+
+        batch_size = len(text_prompts)
+        image_or_video_shape = list(self.config.image_or_video_shape)
+        image_or_video_shape[0] = batch_size
+
+        # Step 2: Extract the conditional infos
+        with torch.no_grad():
+            conditional_dict = self.model.text_encoder(
+                text_prompts=text_prompts)
+
+            if not getattr(self, "unconditional_dict", None):
+                unconditional_dict = self.model.text_encoder(
+                    text_prompts=[self.config.negative_prompt] * batch_size)
+                unconditional_dict = {k: v.detach()
+                                      for k, v in unconditional_dict.items()}
+                self.unconditional_dict = unconditional_dict
+            else:
+                unconditional_dict = self.unconditional_dict
+
+        # Step 3: Store gradients for the generator (if training the generator)
+        if train_generator:
+            generator_loss, generator_log_dict = self.model.generator_loss(
+                image_or_video_shape=image_or_video_shape,
+                conditional_dict=conditional_dict,
+                unconditional_dict=unconditional_dict,
+                clean_latent=clean_latent,
+                initial_latent=image_latent if self.config.i2v else None
+            )
+
+            generator_loss.backward()
+            generator_grad_norm = self.model.generator.clip_grad_norm_(
+                self.max_grad_norm_generator
+            )
+
+            generator_log_dict.update({"generator_loss": generator_loss,
+                                      "generator_grad_norm": generator_grad_norm})
+
+            return generator_log_dict
+        else:
+            generator_log_dict = {}
+
+        # Step 4: Store gradients for the critic (if training the critic)
+        critic_loss, critic_log_dict = self.model.critic_loss(
+            image_or_video_shape=image_or_video_shape,
+            conditional_dict=conditional_dict,
+            unconditional_dict=unconditional_dict,
+            clean_latent=clean_latent,
+            initial_latent=image_latent if self.config.i2v else None
+        )
+
+        critic_loss.backward()
+        critic_grad_norm = self.model.fake_score.clip_grad_norm_(
+            self.max_grad_norm_critic
+        )
+
+        critic_log_dict.update({"critic_loss": critic_loss,
+                                 "critic_grad_norm": critic_grad_norm})
+
+        return critic_log_dict
+
+    def generate_video(self, pipeline, prompts, image=None):
+        batch_size = len(prompts)
+        if image is not None:
+            image = image.squeeze(0).unsqueeze(0).unsqueeze(2).to(device="cuda", dtype=torch.bfloat16)
+
+            # Encode the input image as the first latent
+            initial_latent = pipeline.vae.encode_to_latent(image).to(device="cuda", dtype=torch.bfloat16)
+            initial_latent = initial_latent.repeat(batch_size, 1, 1, 1, 1)
+            sampled_noise = torch.randn(
+                [batch_size, self.model.num_training_frames - 1, 16, 60, 104],
+                device="cuda",
+                dtype=self.dtype
+            )
+        else:
+            initial_latent = None
+            sampled_noise = torch.randn(
+                [batch_size, self.model.num_training_frames, 16, 60, 104],
+                device="cuda",
+                dtype=self.dtype
+            )
+
+        video, _ = pipeline.inference(
+            noise=sampled_noise,
+            text_prompts=prompts,
+            return_latents=True,
+            initial_latent=initial_latent
+        )
+        current_video = video.permute(0, 1, 3, 4, 2).cpu().numpy() * 255.0
+        return current_video
+
+    def train(self):
+        start_step = self.step
+        self.start_step = 0
+        self.start_time = time.time()
+        while True:
+            TRAIN_GENERATOR = self.step % self.config.dfake_gen_update_ratio == 0
+            VISUALIZE = self.step % self.config.log_iters == 0 and not self.config.no_visualize
+
+            # Train the generator
+            if TRAIN_GENERATOR:
+                self.generator_optimizer.zero_grad(set_to_none=True)
+
+                batch = next(self.dataloader)
+                generator_log_dict = self.fwdbwd_one_step(batch, True)
+
+                self.generator_optimizer.step()
+                if self.generator_ema is not None:
+                    self.generator_ema.update(self.model.generator)
+
+            # Train the critic
+            self.critic_optimizer.zero_grad(set_to_none=True)
+            batch = next(self.dataloader)
+            critic_log_dict = self.fwdbwd_one_step(batch, False)
+
+            self.critic_optimizer.step()
+
+            # Increment the step since we finished gradient update
+            self.step += 1
+
+            # Create EMA params (if not already created)
+            if (self.step >= self.config.ema_start_step) and \
+                    (self.generator_ema is None) and (self.config.ema_weight > 0):
+                self.generator_ema = EMA_FSDP(self.model.generator, decay=self.config.ema_weight)
+
+            # Save the model
+            if (not self.config.no_save) and (self.step - start_step) > 0 and self.step % self.config.log_iters == 0:
+                torch.cuda.empty_cache()
+                self.save()
+                torch.cuda.empty_cache()
+
+            # Logging
+            log_dict = {}
+            if TRAIN_GENERATOR:
+                log_dict.update({
+                    "generator_loss": generator_log_dict["generator_loss"].mean().item(),
+                    "generator_grad_norm": generator_log_dict["generator_grad_norm"].mean().item(),
+                    "dmdtrain_gradient_norm": generator_log_dict["dmdtrain_gradient_norm"].mean().item()
+                })
+            log_dict.update({
+                "critic_loss": critic_log_dict["critic_loss"].mean().item(),
+                "critic_grad_norm": critic_log_dict["critic_grad_norm"].mean().item()
+            })
+            if self.is_main_process:
+                if not self.disable_logging:
+                    self.writer.log(log_dict, step=self.step)
+                    if VISUALIZE:
+                        self.model.vae = self.model.vae.to(
+                            device=self.device, dtype=self.vae_dtype
+                        )
+                        if TRAIN_GENERATOR:
+                            dmdtrain_clean_latent = self.model.vae.decode_to_pixel(generator_log_dict["dmdtrain_clean_latent"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
+                            dmdtrain_noisy_latent = self.model.vae.decode_to_pixel(generator_log_dict["dmdtrain_noisy_latent"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
+                            dmdtrain_pred_real_image = self.model.vae.decode_to_pixel(generator_log_dict["dmdtrain_pred_real_image"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
+                            dmdtrain_pred_fake_image = self.model.vae.decode_to_pixel(generator_log_dict["dmdtrain_pred_fake_image"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
+                            self.writer.log_video("dmdtrain_clean_latent", dmdtrain_clean_latent, self.step, fps=16)
+                            self.writer.log_video("dmdtrain_noisy_latent", dmdtrain_noisy_latent, self.step, fps=16)
+                            self.writer.log_video("dmdtrain_pred_real_image", dmdtrain_pred_real_image, self.step, fps=16)
+                            self.writer.log_video("dmdtrain_pred_fake_image", dmdtrain_pred_fake_image, self.step, fps=16)
+                        critictrain_latent = self.model.vae.decode_to_pixel(critic_log_dict["critictrain_latent"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
+                        critictrain_noisy_latent = self.model.vae.decode_to_pixel(critic_log_dict["critictrain_noisy_latent"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
+                        critictrain_pred_image = self.model.vae.decode_to_pixel(critic_log_dict["critictrain_pred_image"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
+                        self.writer.log_video("critictrain_latent", critictrain_latent, self.step, fps=16)
+                        self.writer.log_video("critictrain_noisy_latent", critictrain_noisy_latent, self.step, fps=16)
+                        self.writer.log_video("critictrain_pred_image", critictrain_pred_image, self.step, fps=16)
+                        self.model.vae = self.model.vae.to(device="cpu")
+                        torch.cuda.empty_cache()
+
+            if self.step % self.config.gc_interval == 0:
+                if dist.get_rank() == 0:
+                    logging.info("DistGarbageCollector: Running GC.")
+                gc.collect()
+                torch.cuda.empty_cache()
+
+            if self.is_main_process:
+                current_time = time.time()
+                if self.previous_time is None:
+                    self.previous_time = current_time
+                else:
+                    if not self.disable_logging:
+                        self.writer.log({"per iteration time": current_time - self.previous_time}, step=self.step)
+                    self.previous_time = current_time
+
+            batch_size = len(batch["prompts"])
+            if (self.step + 1) % 1 == 0:
+                end_time = time.time()
+                end_step = self.step + 1
+
+                # Calculate throughput
+                step_diff = end_step - self.start_step
+                time_diff = end_time - self.start_time
+                seconds_per_iter = time_diff / step_diff
+                throughput = batch_size / seconds_per_iter
+
+                # Print training log with throughput at the end
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                print(
+                    f"{timestamp}: [step {self.step}] "
+                    f"generator_loss: {log_dict['generator_loss'] if TRAIN_GENERATOR else 0.0:.4f} "
+                    f"critic_loss: {log_dict['critic_loss']:.4f} "
+                    f"DI_throughput: {throughput:.2f} samples/s/npu"
+                )
+                self.start_time = time.time()
+                self.start_step = end_step

@@ -27,11 +27,12 @@ def get_causal_model_class(model_type='default'):
     """Factory function to return the appropriate CausalWanModel class.
 
     Args:
-        model_type: One of 'default', 'causvid', 'longlive', 'infinity'.
+        model_type: One of 'default', 'causvid', 'longlive', 'infinity', 'rolling_forcing'.
             - 'default': Causal-Forcing/Self-Forcing version (teacher forcing, I2V, cache_start)
             - 'causvid': CausVid version (window_size, simplified KV cache, current_end)
             - 'longlive': LongLive version (deferred cache update, sink_recache_after_switch)
             - 'infinity': LongLive Infinity version (infinite length attention)
+            - 'rolling_forcing': RollingForcing version (rolling window training, updating_cache)
 
     Returns:
         CausalWanModel class from the corresponding module.
@@ -48,8 +49,11 @@ def get_causal_model_class(model_type='default'):
     elif model_type == 'infinity':
         from .causal_model_infinity import CausalWanModel
         return CausalWanModel
+    elif model_type == 'rolling_forcing':
+        from .causal_model_rolling_forcing import CausalWanModel
+        return CausalWanModel
     else:
         raise ValueError(
             f"Unknown causal_model_type '{model_type}'. "
-            f"Choose from: 'default', 'causvid', 'longlive', 'infinity'"
+            f"Choose from: 'default', 'causvid', 'longlive', 'infinity', 'rolling_forcing'"
         )
