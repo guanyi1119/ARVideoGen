@@ -21,6 +21,7 @@ ARVideoGen/
     self_forcing/          #   Self-Forcing
     causvid/               #   CausVid
     longlive/              #   LongLive
+    deep_forcing/          #   DeepForcing
   configs/                 # 各方法配置文件
   scripts/                 # 数据处理脚本
   tests/                   # 测试脚本
@@ -31,15 +32,15 @@ ARVideoGen/
 
 ## 四种方法概览
 
-| | Causal-Forcing | Self-Forcing | CausVid | LongLive |
-|---|---|---|---|---|
-| **核心理念** | 自回归+teacher forcing训练 | 自回归+self-forcing训练（无teacher signal） | 双向扩散初始化→因果蒸馏 | 流式训练+延迟cache更新 |
-| **DMD继承** | `SelfForcingModel(BaseModel)` | `SelfForcingModel(BaseModel)` | `nn.Module`（自包含） | `SelfForcingModel(BaseModel)` |
-| **WanWrapper** | `wan_wrapper.py` | `wan_wrapper.py` | `wan_wrapper_causvid.py` | `wan_wrapper_longlive.py` |
-| **CausalModel** | `causal_model.py` | `causal_model.py` | `causal_model_causvid.py` | `causal_model_longlive.py` / `causal_model_infinity.py` |
-| **Config加载** | `load_config(path, default)` | `load_config(path, default)` | `load_config(path)` | `load_config(path, default)` |
-| **训练脚本** | `train_causal_forcing.py` | `train_self_forcing.py` | `train_causvid.py` | `train_longlive.py` |
-| **推理脚本** | `inference_causal_forcing.py` | `inference_self_forcing.py` | `inference_causvid.py` | `inference_longlive.py` |
+| | Causal-Forcing | Self-Forcing | CausVid | LongLive | DeepForcing |
+|---|---|---|---|---|---|
+| **核心理念** | 自回归+teacher forcing训练 | 自回归+self-forcing训练（无teacher signal） | 双向扩散初始化→因果蒸馏 | 流式训练+延迟cache更新 | 自回归+DeepForcing机制（增强上下文建模） |
+| **DMD继承** | `SelfForcingModel(BaseModel)` | `SelfForcingModel(BaseModel)` | `nn.Module`（自包含） | `SelfForcingModel(BaseModel)` | `SelfForcingModel(BaseModel)` |
+| **WanWrapper** | `wan_wrapper.py` | `wan_wrapper.py` | `wan_wrapper_causvid.py` | `wan_wrapper_longlive.py` | `wan_wrapper_deepforcing.py` |
+| **CausalModel** | `causal_model.py` | `causal_model.py` | `causal_model_causvid.py` | `causal_model_longlive.py` / `causal_model_infinity.py` | `causal_model.py` + optional `causal_model_DS.py` |
+| **Config加载** | `load_config(path, default)` | `load_config(path, default)` | `load_config(path)` | `load_config(path, default)` | `load_config(path, default)` |
+| **训练脚本** | `train_causal_forcing.py` | `train_self_forcing.py` | `train_causvid.py` | `train_longlive.py` | `train_deep_forcing.py`（待添加） |
+| **推理脚本** | `inference_causal_forcing.py` | `inference_self_forcing.py` | `inference_causvid.py` | `inference_longlive.py` | `inference_deep_forcing.py` |
 
 ---
 
@@ -243,6 +244,71 @@ torchrun --nproc_per_node=8 inference_longlive.py \
 
 ---
 
+## 5. DeepForcing
+
+### 核心思想
+
+自回归视频生成框架，使用 DeepForcing 机制增强上下文建模能力。通过 Prompt Context（PC）机制实现灵活的长视频生成，支持动态的最近帧上下文和固定的历史上下文，在生成长视频时保持连贯性和质量。支持 DS-Only 模式，针对特定场景优化。
+
+### 关键差异（与 Causal-Forcing/Self-Forcing 对比）
+
+- **DeepForcing 特有参数**：[DIFF-DeepForcing] 新增 `is_ds_only`、`budget`、`recent` 三个核心参数，通过 `model_kwargs` 传递
+  - `is_ds_only`：启用 DS-Only 模式，使用 `CausalWanModelDS`
+  - `budget`：设置 Prompt Context 的预算大小（帧数量）
+  - `recent`：设置最近帧窗口大小
+- **PC 容量计算**：[DIFF-DeepForcing] PC 容量 = `1560 * budget`，最近窗口 = `1560 * recent`（与其他方法不同，以 token 数计算）
+- **CausalWanModelDS**：[DIFF-DeepForcing] 新增 `wan.modules.causal_model_DS.CausalWanModelDS`，支持 DS 模式的注意力机制
+- **推理过程打印**：[DIFF-DeepForcing] 在推理过程中打印 `current_timestep`，便于调试和监控
+- **扩展的 CLI 参数**：[DIFF-DeepForcing] 推理脚本支持 `--extended_prompt_path`、`--num_samples`、`--save_with_index` 等
+- **Denoising step list 在 CPU**：与 Causal-Forcing/Self-Forcing 一致
+
+### 配置示例
+
+```yaml
+# configs/deep_forcing/deep_forcing_dmd.yaml
+denoising_step_list: [1000, 750, 500, 250]
+model_kwargs:
+  timestep_shift: 5.0
+  is_ds_only: false          # [DIFF-DeepForcing] 是否启用 DS-Only 模式
+  budget: 16                  # [DIFF-DeepForcing] PC 预算（帧数）
+  recent: 4                   # [DIFF-DeepForcing] 最近帧窗口大小
+num_frame_per_block: 3
+trainer: score_distillation
+```
+
+### 使用方法
+
+```bash
+# 推理（DeepForcing 特有参数）
+python inference_deep_forcing.py \
+  --config_path configs/deep_forcing/deep_forcing_dmd.yaml \
+  --checkpoint_path path/to/checkpoint \
+  --data_path prompts.txt \
+  --output_folder outputs/ \
+  --num_output_frames 126 \
+  --Budget 16 \
+  --Recent 4 \
+  --num_samples 4
+
+# DS-Only 模式
+python inference_deep_forcing.py \
+  --config_path configs/deep_forcing/deep_forcing_ds.yaml \
+  --checkpoint_path path/to/checkpoint \
+  --data_path prompts.txt \
+  --output_folder outputs/ \
+  --is_ds_only 1
+```
+
+### 注意事项
+
+- DeepForcing 的 `default_config.yaml` 会与指定配置合并（与 CausVid 不同）
+- `CausalWanModelDS` 是可选的，默认使用标准的 `CausalWanModel` 并应用 PC 机制
+- `budget` 和 `recent` 参数通过 `model_kwargs` 传递，需要在 config 或 CLI 中指定
+- 原始 DeepForcing 代码位于 `archive/DeepForcing/` 目录，作为参考
+- 训练脚本 `train_deep_forcing.py` 待添加（目前可使用其他方法的训练脚本）
+
+---
+
 ## WanDiffusionWrapper 选择指南
 
 | 方法 | Wrapper 模块 | 选择方式 |
@@ -250,19 +316,23 @@ torchrun --nproc_per_node=8 inference_longlive.py \
 | Causal-Forcing / Self-Forcing | `core.wan_wrapper.wan_wrapper` | `get_wan_wrapper_classes('default')` |
 | CausVid | `core.wan_wrapper.wan_wrapper_causvid` | `get_wan_wrapper_classes('causvid')` |
 | LongLive | `core.wan_wrapper.wan_wrapper_longlive` | `get_wan_wrapper_classes('longlive')` |
+| DeepForcing | `core.wan_wrapper.wan_wrapper_deepforcing` | `get_wan_wrapper_classes('deepforcing')` |
 
 关键差异：
 
-| 参数 | Base (CF/SF) | CausVid | LongLive |
-|------|-------------|---------|----------|
-| `cache_start` | 有 | 无 | 有 |
-| `current_end` | 无 | 有 | 无 |
-| `sink_recache_after_switch` | 无 | 无 | 有 |
-| `classify_mode` | 有 | 无 | 有 |
-| `concat_time_embeddings` | 有 | 无 | 有 |
-| `clean_x` / `aug_t` | 有 | 无 | 有 |
-| 返回值 | `(flow_pred, pred_x0)` | `pred_x0` | `(flow_pred, pred_x0)` |
-| `decode_to_pixel_chunk()` | 无 | 无 | 有 |
+| 参数 | Base (CF/SF) | CausVid | LongLive | DeepForcing |
+|------|-------------|---------|----------|----------|
+| `cache_start` | 有 | 无 | 有 | 有 |
+| `current_end` | 无 | 有 | 无 | 无 |
+| `sink_recache_after_switch` | 无 | 无 | 有 | 无 |
+| `classify_mode` | 有 | 无 | 有 | 有 |
+| `concat_time_embeddings` | 有 | 无 | 有 | 有 |
+| `clean_x` / `aug_t` | 有 | 无 | 有 | 有 |
+| `is_ds_only` | 无 | 无 | 无 | 有 |
+| `budget` | 无 | 无 | 无 | 有 |
+| `recent` | 无 | 无 | 无 | 有 |
+| 返回值 | `(flow_pred, pred_x0)` | `pred_x0` | `(flow_pred, pred_x0)` | `(flow_pred, pred_x0)` |
+| `decode_to_pixel_chunk()` | 无 | 无 | 有 | 无 |
 
 ## CausalModel 选择指南
 
@@ -272,17 +342,20 @@ torchrun --nproc_per_node=8 inference_longlive.py \
 | CausVid | `wan.modules.causal_model_causvid` | `get_causal_model_class('causvid')` |
 | LongLive | `wan.modules.causal_model_longlive` | `get_causal_model_class('longlive')` |
 | LongLive (Infinity) | `wan.modules.causal_model_infinity` | `get_causal_model_class('infinity')` |
+| DeepForcing | `wan.modules.causal_model` 或 `causal_model_DS` | `get_causal_model_class('default')` + 配置参数 |
 
 关键差异：
 
-| 特性 | Default (CF/SF) | CausVid | LongLive | Infinity |
-|------|----------------|---------|----------|----------|
-| 局部注意力参数 | `local_attn_size`, `sink_size` | `window_size` | `local_attn_size`, `sink_size` | `local_attn_size`, `sink_size` |
-| cache 控制 | `cache_start` | `current_end` | `cache_start` + 延迟更新 | `cache_start` + 延迟更新 |
-| Teacher Forcing | 有 | 无 | 有 | 未实现 |
-| 延迟 cache 更新 | 无 | 无 | `_apply_cache_updates()` | `_apply_cache_updates()` |
-| RoPE | `causal_rope_apply()` | `causal_rope_apply()` | `causal_rope_apply()` | `block_relativistic_rope()` |
-| Sink recache | 无 | 无 | `sink_recache_after_switch` | `sink_recache_after_switch` |
+| 特性 | Default (CF/SF) | CausVid | LongLive | Infinity | DeepForcing |
+|------|----------------|---------|----------|----------|----------|
+| 局部注意力参数 | `local_attn_size`, `sink_size` | `window_size` | `local_attn_size`, `sink_size` | `local_attn_size`, `sink_size` | `local_attn_size`, `sink_size` |
+| cache 控制 | `cache_start` | `current_end` | `cache_start` + 延迟更新 | `cache_start` + 延迟更新 | `cache_start` |
+| Teacher Forcing | 有 | 无 | 有 | 未实现 | 无（待验证） |
+| 延迟 cache 更新 | 无 | 无 | `_apply_cache_updates()` | `_apply_cache_updates()` | 无 |
+| RoPE | `causal_rope_apply()` | `causal_rope_apply()` | `causal_rope_apply()` | `block_relativistic_rope()` | `causal_rope_apply()` |
+| Sink recache | 无 | 无 | `sink_recache_after_switch` | `sink_recache_after_switch` | 无 |
+| Prompt Context (PC) | 无 | 无 | 无 | 无 | `PC_capacity`, `PC_window` |
+| DS 模式支持 | 无 | 无 | 无 | 无 | `CausalWanModelDS` |
 
 ## BaseModel 继承体系
 
