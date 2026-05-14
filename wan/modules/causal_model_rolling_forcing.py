@@ -1,5 +1,5 @@
 from wan.modules.attention import attention
-from wan.modules.npu_attention import FlexAttentionNPU
+from wan.modules.npu_flex_attention import FlexAttentionNPU
 from wan.modules.model import (
     WanRMSNorm,
     rope_apply,

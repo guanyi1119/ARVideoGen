@@ -97,6 +97,7 @@ class Trainer:
         torch.cuda.empty_cache()
 
         self.vae_dtype = torch.bfloat16 if config.mixed_precision else torch.float32
+        self.model.vae = self.model.vae.to(device=self.device, dtype=self.vae_dtype)
 
         self.generator_optimizer = torch.optim.AdamW(
             [param for param in self.model.generator.parameters()
@@ -372,9 +373,6 @@ class Trainer:
                 if not self.disable_logging:
                     self.writer.log(log_dict, step=self.step)
                     if VISUALIZE:
-                        self.model.vae = self.model.vae.to(
-                            device=self.device, dtype=self.vae_dtype
-                        )
                         if TRAIN_GENERATOR:
                             dmdtrain_clean_latent = self.model.vae.decode_to_pixel(generator_log_dict["dmdtrain_clean_latent"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
                             dmdtrain_noisy_latent = self.model.vae.decode_to_pixel(generator_log_dict["dmdtrain_noisy_latent"]).squeeze(1).add_(1.0).div_(2.0).clamp_(0.0, 1.0).mul_(255).cpu().to(torch.uint8).numpy()
