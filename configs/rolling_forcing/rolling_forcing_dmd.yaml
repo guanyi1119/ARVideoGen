@@ -20,7 +20,7 @@ guidance_scale: 3.0
 denoising_loss_type: flow
 mixed_precision: true
 seed: 0
-sharding_strategy: hybrid_full
+sharding_strategy: full
 lr: 1.5e-06
 lr_critic: 4.0e-07
 beta1: 0.0
