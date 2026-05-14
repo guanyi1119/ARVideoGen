@@ -388,7 +388,6 @@ class Trainer:
                         self.writer.log_video("critictrain_latent", critictrain_latent, self.step, fps=16)
                         self.writer.log_video("critictrain_noisy_latent", critictrain_noisy_latent, self.step, fps=16)
                         self.writer.log_video("critictrain_pred_image", critictrain_pred_image, self.step, fps=16)
-                        self.model.vae = self.model.vae.to(device="cpu")
                         torch.cuda.empty_cache()
 
             if self.step % self.config.gc_interval == 0:
