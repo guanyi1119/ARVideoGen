@@ -11,7 +11,7 @@ ARVideoGen/
     loss/                  #   去噪损失函数
     config/                #   OmegaConf配置加载
     misc/                  #   种子、调试、LoRA、内存工具
-    wan_wrapper/           #   WanDiffusionWrapper（3个变体）
+    wan_wrapper/           #   WanDiffusionWrapper（5个变体）
     demo_utils/            #   Demo工具
   wan/                     # Wan2.1 基础模型代码
     modules/               #   注意力、T5、VAE、4种CausalModel
@@ -22,6 +22,10 @@ ARVideoGen/
     causvid/               #   CausVid
     longlive/              #   LongLive
     deep_forcing/          #   DeepForcing
+    rolling_forcing/       #   Rolling Forcing
+    anyflow/               #   AnyFlow（自包含far包，不依赖core/）
+      far/                 #     核心包（注册表模式）
+      assets/              #     评估数据和资源
   configs/                 # 各方法配置文件
   scripts/                 # 数据处理脚本
   tests/                   # 测试脚本
@@ -30,17 +34,17 @@ ARVideoGen/
   archive/                 # 原始项目归档
 ```
 
-## 四种方法概览
+## 方法概览
 
-| | Causal-Forcing | Self-Forcing | CausVid | LongLive | DeepForcing |
-|---|---|---|---|---|---|
-| **核心理念** | 自回归+teacher forcing训练 | 自回归+self-forcing训练（无teacher signal） | 双向扩散初始化→因果蒸馏 | 流式训练+延迟cache更新 | 自回归+DeepForcing机制（增强上下文建模） |
-| **DMD继承** | `SelfForcingModel(BaseModel)` | `SelfForcingModel(BaseModel)` | `nn.Module`（自包含） | `SelfForcingModel(BaseModel)` | `SelfForcingModel(BaseModel)` |
-| **WanWrapper** | `wan_wrapper.py` | `wan_wrapper.py` | `wan_wrapper_causvid.py` | `wan_wrapper_longlive.py` | `wan_wrapper_deepforcing.py` |
-| **CausalModel** | `causal_model.py` | `causal_model.py` | `causal_model_causvid.py` | `causal_model_longlive.py` / `causal_model_infinity.py` | `causal_model.py` + optional `causal_model_DS.py` |
-| **Config加载** | `load_config(path, default)` | `load_config(path, default)` | `load_config(path)` | `load_config(path, default)` | `load_config(path, default)` |
-| **训练脚本** | `train_causal_forcing.py` | `train_self_forcing.py` | `train_causvid.py` | `train_longlive.py` | `train_deep_forcing.py`（待添加） |
-| **推理脚本** | `inference_causal_forcing.py` | `inference_self_forcing.py` | `inference_causvid.py` | `inference_longlive.py` | `inference_deep_forcing.py` |
+| | Causal-Forcing | Self-Forcing | CausVid | LongLive | DeepForcing | Rolling Forcing | AnyFlow |
+|---|---|---|---|---|---|---|---|
+| **核心理念** | 自回归+teacher forcing训练 | 自回归+self-forcing训练（无teacher signal） | 双向扩散初始化→因果蒸馏 | 流式训练+延迟cache更新 | 自回归+DeepForcing机制（增强上下文建模） | 滚动窗口训练+随机推理策略 | Flow Map Distillation任意步数推理 |
+| **架构** | `SelfForcingModel(BaseModel)` | `SelfForcingModel(BaseModel)` | `nn.Module`（自包含） | `SelfForcingModel(BaseModel)` | `SelfForcingModel(BaseModel)` | `RollingForcingModel(BaseModel)` | 自包含`far`包（注册表模式） |
+| **WanWrapper** | `wan_wrapper.py` | `wan_wrapper.py` | `wan_wrapper_causvid.py` | `wan_wrapper_longlive.py` | `wan_wrapper_deepforcing.py` | `wan_wrapper_rollingforcing.py` | 不使用（diffusers原生） |
+| **CausalModel** | `causal_model.py` | `causal_model.py` | `causal_model_causvid.py` | `causal_model_longlive.py` / `causal_model_infinity.py` | `causal_model.py` + optional `causal_model_DS.py` | `causal_model_rolling_forcing.py` | 不使用（diffusers原生） |
+| **Config加载** | `load_config(path, default)` | `load_config(path, default)` | `load_config(path)` | `load_config(path, default)` | `load_config(path, default)` | `load_config(path, default)` | OmegaConf直接加载，无default合并 |
+| **训练脚本** | `train_causal_forcing.py` | `train_self_forcing.py` | `train_causvid.py` | `train_longlive.py` | `train_deep_forcing.py` | `train_rolling_forcing.py` | `train_anyflow.py` |
+| **推理脚本** | `inference_causal_forcing.py` | `inference_self_forcing.py` | `inference_causvid.py` | `inference_longlive.py` | `inference_deep_forcing.py` | `inference_rolling_forcing.py` | `inference_anyflow.py` |
 
 ---
 
@@ -244,7 +248,110 @@ torchrun --nproc_per_node=8 inference_longlive.py \
 
 ---
 
-## 5. DeepForcing
+## 6. AnyFlow
+
+### 核心思想
+
+基于 Flow Map Distillation 的视频生成方法，核心创新在于训练一个 flow map 模型，使其可以在任意数量的推理步骤下生成高质量视频。不同于传统扩散模型需要固定步数，AnyFlow 实现了"一步即可、多步更优"的灵活推理。支持 causal（FAR）和 bidirectional 两种模型架构，以及 T2V、I2V、V2V 三种任务。
+
+### 关键差异（与其他方法对比）
+
+- **自包含 `far` 包**：[DIFF-AnyFlow] 完全独立于项目的 `core/` 和 `wan/` 模块，使用自己的注册表模式（PIPELINE_REGISTRY, TRAINER_REGISTRY, MODEL_REGISTRY, DATASET_REGISTRY）
+- **`far` 包命名空间**：[DIFF-AnyFlow] 所有内部代码使用 `far.xxx` 导入，入口脚本通过 `sys.path.insert(0, 'methods/anyflow/')` 使其生效
+- **不使用 WanWrapper / CausalModel**：[DIFF-AnyFlow] 基于 diffusers 原生的 `WanTransformer3DModel`，不需要项目的 WanWrapper 或 CausalModel 变体
+- **FAR（Flow-based Autoregressive）架构**：[DIFF-AnyFlow] `FAR_Wan_Transformer3DModel` 扩展了标准 Transformer，添加 compressed patch embedding、chunk partition、flow map 时间嵌入等
+- **三种训练范式**：[DIFF-AnyFlow] FAR causal pretrain/onpolicy、Wan bidirectional pretrain/onpolicy、Wan teacher
+- **Flow Map Distillation**：[DIFF-AnyFlow] `flowmap_cfg` 配置（gate_value, deltatime_type, diffusion_ratio, consistency_ratio, epsilon）控制蒸馏行为
+- **On-policy 训练**：[DIFF-AnyFlow] 使用 DMD（Distribution Matching Distillation）进行 on-policy 微调，包含 generator 和 discriminator 优化
+- **配置结构不同**：[DIFF-AnyFlow] 配置使用 `datasets`/`models`/`train`/`val`/`logger` 顶层字段，与其他方法的 `denoising_step_list`/`num_frame_per_block`/`model_kwargs` 结构完全不同
+- **LoRA 支持**：[DIFF-AnyFlow] 训练配置内置 `lora_config`，支持指定 LoRA rank/alpha/target modules
+- **EMA 训练**：[DIFF-AnyFlow] 使用 `ShardEMA`（分片 EMA），支持 FSDP2
+- **多任务推理**：[DIFF-AnyFlow] causal 模型支持 T2V/TI2V/TV2V，bidirectional 模型支持 T2V
+- **VBench 评估**：[DIFF-AnyFlow] 内置 VBench 和 VBench-I2V 评估器
+- **`ANYFLOW_ROOT` 环境变量**：[DIFF-AnyFlow] 入口脚本设置此变量，`far/metrics/` 使用它解析 assets 路径
+
+### 配置示例
+
+```yaml
+# configs/anyflow/train/farwan_causal/pretrain/train_farwan1b_student_shift5_81f_480p_lr5e-5_6k_b32.yml
+name: train_farwan1b_student_shift5_81f_480p_lr5e-5_6k_b32
+mode: train
+manual_seed: 0
+mixed_precision: true
+
+datasets:
+  train:
+    type: T2VTarDataset
+    meta_path: methods/anyflow/assets/data/meta/vidprom_dummy/raw.json
+    num_frames: 81
+    dataloader_cfg:
+      batch_size_per_gpu: 2
+
+models:
+  transformer_cfg:
+    model_type: FAR_Wan_Transformer3DModel
+    far_config:
+      chunk_partition: [1,3,3,3,3,3,3,2]
+  flowmap_cfg:
+    gate_value: 0.25
+    deltatime_type: r
+    diffusion_ratio: 0.5
+
+train:
+  train_pipeline: FAR_Wan_AnyFlow_Pretrain_Trainer
+  optim_g:
+    type: AdamW
+    lr: 5e-5
+  ema_decay: 0.999
+  total_iter: 6000
+```
+
+### 使用方法
+
+```bash
+# FAR causal pretrain 训练
+torchrun --nproc_per_node=8 train_anyflow.py \
+  --config_path configs/anyflow/train/farwan_causal/pretrain/train_farwan1b_student_shift5_81f_480p_lr5e-5_6k_b32.yml
+
+# FAR causal onpolicy 训练
+torchrun --nproc_per_node=8 train_anyflow.py \
+  --config_path configs/anyflow/train/farwan_causal/onpolicy/train_farwan1b_onpolicy_81f_480p_lr2e-6_1k_b32.yml
+
+# Wan bidirectional pretrain 训练
+torchrun --nproc_per_node=8 train_anyflow.py \
+  --config_path configs/anyflow/train/wan_bidirectional/pretrain/train_wan1b_student_shift5_81f_480p_lr5e-5_6k_b32.yml
+
+# Wan teacher 训练
+torchrun --nproc_per_node=8 train_anyflow.py \
+  --config_path configs/anyflow/train/wan_teacher/train_wan1b_teacher_shift5_81f_480p_lr5e-5_6k_b32.yml
+
+# 单样本推理（causal）
+python inference_anyflow.py \
+  --model_path checkpoints/AnyFlow-FAR-Wan2.1-1.3B-Diffusers \
+  --task_type t2v --save_dir outputs/
+
+# 单样本推理（bidirectional）
+python inference_anyflow.py \
+  --model_path checkpoints/AnyFlow-Wan2.1-T2V-1.3B-Diffusers \
+  --task_type t2v --save_dir outputs/
+
+# 批量评估
+torchrun --nproc_per_node=8 inference_anyflow.py \
+  --config_path configs/anyflow/test/test_AnyFlow-FAR-Wan2.1-1.3B-Diffusers.yml
+```
+
+### 注意事项
+
+- AnyFlow 不依赖 `core/` 或 `wan/`，运行时通过入口脚本的 `sys.path` 注入加载 `far` 包
+- 不能直接 `import far`，必须先通过入口脚本设置 sys.path
+- 配置文件不与 `default_config.yaml` 合并，需要写全所有字段
+- 训练使用 `torch.distributed.checkpoint`（DCP）保存检查点，与 FSDP2 兼容
+- `experiments/pretrained_models/` 路径在配置中需要用户自行配置
+- 原始 AnyFlow 代码位于 `archive/AnyFlow/` 目录，作为参考
+
+---
+
+## 7. DeepForcing
 
 ### 核心思想
 
@@ -317,22 +424,25 @@ python inference_deep_forcing.py \
 | CausVid | `core.wan_wrapper.wan_wrapper_causvid` | `get_wan_wrapper_classes('causvid')` |
 | LongLive | `core.wan_wrapper.wan_wrapper_longlive` | `get_wan_wrapper_classes('longlive')` |
 | DeepForcing | `core.wan_wrapper.wan_wrapper_deepforcing` | `get_wan_wrapper_classes('deepforcing')` |
+| Rolling Forcing | `core.wan_wrapper.wan_wrapper_rollingforcing` | `get_wan_wrapper_classes('rollingforcing')` |
+| AnyFlow | 不使用（diffusers原生模型） | - |
 
 关键差异：
 
-| 参数 | Base (CF/SF) | CausVid | LongLive | DeepForcing |
-|------|-------------|---------|----------|----------|
-| `cache_start` | 有 | 无 | 有 | 有 |
-| `current_end` | 无 | 有 | 无 | 无 |
-| `sink_recache_after_switch` | 无 | 无 | 有 | 无 |
-| `classify_mode` | 有 | 无 | 有 | 有 |
-| `concat_time_embeddings` | 有 | 无 | 有 | 有 |
-| `clean_x` / `aug_t` | 有 | 无 | 有 | 有 |
-| `is_ds_only` | 无 | 无 | 无 | 有 |
-| `budget` | 无 | 无 | 无 | 有 |
-| `recent` | 无 | 无 | 无 | 有 |
-| 返回值 | `(flow_pred, pred_x0)` | `pred_x0` | `(flow_pred, pred_x0)` | `(flow_pred, pred_x0)` |
-| `decode_to_pixel_chunk()` | 无 | 无 | 有 | 无 |
+| 参数 | Base (CF/SF) | CausVid | LongLive | DeepForcing | Rolling Forcing | AnyFlow |
+|------|-------------|---------|----------|----------|----------------|---------|
+| `cache_start` | 有 | 无 | 有 | 有 | 有 | - |
+| `current_end` | 无 | 有 | 无 | 无 | 无 | - |
+| `sink_recache_after_switch` | 无 | 无 | 有 | 无 | 无 | - |
+| `classify_mode` | 有 | 无 | 有 | 有 | 有 | - |
+| `concat_time_embeddings` | 有 | 无 | 有 | 有 | 有 | - |
+| `clean_x` / `aug_t` | 有 | 无 | 有 | 有 | 有 | - |
+| `is_ds_only` | 无 | 无 | 无 | 有 | 无 | - |
+| `budget` | 无 | 无 | 无 | 有 | 无 | - |
+| `recent` | 无 | 无 | 无 | 有 | 无 | - |
+| `updating_cache` | 无 | 无 | 无 | 无 | 有 | - |
+| 返回值 | `(flow_pred, pred_x0)` | `pred_x0` | `(flow_pred, pred_x0)` | `(flow_pred, pred_x0)` | `(flow_pred, pred_x0)` | - |
+| `decode_to_pixel_chunk()` | 无 | 无 | 有 | 无 | 无 | - |
 
 ## CausalModel 选择指南
 
@@ -343,19 +453,22 @@ python inference_deep_forcing.py \
 | LongLive | `wan.modules.causal_model_longlive` | `get_causal_model_class('longlive')` |
 | LongLive (Infinity) | `wan.modules.causal_model_infinity` | `get_causal_model_class('infinity')` |
 | DeepForcing | `wan.modules.causal_model` 或 `causal_model_DS` | `get_causal_model_class('default')` + 配置参数 |
+| Rolling Forcing | `wan.modules.causal_model_rolling_forcing` | `get_causal_model_class('rolling_forcing')` |
+| AnyFlow | 不使用（diffusers原生Transformer） | - |
 
 关键差异：
 
-| 特性 | Default (CF/SF) | CausVid | LongLive | Infinity | DeepForcing |
-|------|----------------|---------|----------|----------|----------|
-| 局部注意力参数 | `local_attn_size`, `sink_size` | `window_size` | `local_attn_size`, `sink_size` | `local_attn_size`, `sink_size` | `local_attn_size`, `sink_size` |
-| cache 控制 | `cache_start` | `current_end` | `cache_start` + 延迟更新 | `cache_start` + 延迟更新 | `cache_start` |
-| Teacher Forcing | 有 | 无 | 有 | 未实现 | 无（待验证） |
-| 延迟 cache 更新 | 无 | 无 | `_apply_cache_updates()` | `_apply_cache_updates()` | 无 |
-| RoPE | `causal_rope_apply()` | `causal_rope_apply()` | `causal_rope_apply()` | `block_relativistic_rope()` | `causal_rope_apply()` |
-| Sink recache | 无 | 无 | `sink_recache_after_switch` | `sink_recache_after_switch` | 无 |
-| Prompt Context (PC) | 无 | 无 | 无 | 无 | `PC_capacity`, `PC_window` |
-| DS 模式支持 | 无 | 无 | 无 | 无 | `CausalWanModelDS` |
+| 特性 | Default (CF/SF) | CausVid | LongLive | Infinity | DeepForcing | Rolling Forcing | AnyFlow |
+|------|----------------|---------|----------|----------|----------|----------------|---------|
+| 局部注意力参数 | `local_attn_size`, `sink_size` | `window_size` | `local_attn_size`, `sink_size` | `local_attn_size`, `sink_size` | `local_attn_size`, `sink_size` | `local_attn_size`, `sink_size` | - |
+| cache 控制 | `cache_start` | `current_end` | `cache_start` + 延迟更新 | `cache_start` + 延迟更新 | `cache_start` | `cache_start` | - |
+| Teacher Forcing | 有 | 无 | 有 | 未实现 | 无（待验证） | 无 | - |
+| 延迟 cache 更新 | 无 | 无 | `_apply_cache_updates()` | `_apply_cache_updates()` | 无 | 无 | - |
+| RoPE | `causal_rope_apply()` | `causal_rope_apply()` | `causal_rope_apply()` | `block_relativistic_rope()` | `causal_rope_apply()` | `causal_rope_apply()` | - |
+| Sink recache | 无 | 无 | `sink_recache_after_switch` | `sink_recache_after_switch` | 无 | 无 | - |
+| Prompt Context (PC) | 无 | 无 | 无 | 无 | `PC_capacity`, `PC_window` | 无 | - |
+| DS 模式支持 | 无 | 无 | 无 | 无 | `CausalWanModelDS` | 无 | - |
+| `updating_cache` | 无 | 无 | 无 | 无 | 无 | 有 | - |
 
 ## BaseModel 继承体系
 
@@ -379,15 +492,20 @@ BaseModel (methods/base/base_longlive.py)
 
 ## 训练模式对比
 
-| 训练模式 | Causal-Forcing | Self-Forcing | CausVid | LongLive |
-|---------|---------------|-------------|---------|----------|
-| Diffusion (ODE) | `DiffusionTrainer` | `DiffusionTrainer` | `ODETrainer` | - |
-| DMD 蒸馏 | `ScoreDistillationTrainer` | `ScoreDistillationTrainer` | `DistillationTrainer` | `ScoreDistillationTrainer` |
-| GAN | (模型内 GAN 逻辑) | `GANTrainer` | - | - |
-| Consistency Distillation | `ConsistencyDistillationTrainer` | - | - | - |
-| Teacher Forcing | `TeacherForcingTrainingPipeline` | - | - | - |
-| Bidirectional | `BidirectionalTrainingPipeline` | - | - | - |
-| Streaming | - | - | - | `streaming_training.py` |
+| 训练模式 | Causal-Forcing | Self-Forcing | CausVid | LongLive | DeepForcing | Rolling Forcing | AnyFlow |
+|---------|---------------|-------------|---------|----------|----------|----------------|---------|
+| Diffusion (ODE) | `DiffusionTrainer` | `DiffusionTrainer` | `ODETrainer` | - | - | - | - |
+| DMD 蒸馏 | `ScoreDistillationTrainer` | `ScoreDistillationTrainer` | `DistillationTrainer` | `ScoreDistillationTrainer` | - | `ScoreDistillationTrainer` | - |
+| GAN | (模型内 GAN 逻辑) | `GANTrainer` | - | - | - | - | - |
+| Consistency Distillation | `ConsistencyDistillationTrainer` | - | - | - | - | - | - |
+| Teacher Forcing | `TeacherForcingTrainingPipeline` | - | - | - | - | - | - |
+| Bidirectional | `BidirectionalTrainingPipeline` | - | - | - | - | - | - |
+| Streaming | - | - | - | `streaming_training.py` | - | - | - |
+| FAR Pretrain | - | - | - | - | - | - | `FAR_Wan_AnyFlow_Pretrain_Trainer` |
+| FAR On-policy | - | - | - | - | - | - | `FAR_Wan_AnyFlow_OnPolicy_Trainer` |
+| Wan Pretrain | - | - | - | - | - | - | `Wan_AnyFlow_Pretrain_Trainer` |
+| Wan On-policy | - | - | - | - | - | - | `Wan_AnyFlow_OnPolicy_Trainer` |
+| Wan Teacher | - | - | - | - | - | - | `Wan_Teacher_Trainer` |
 
 ## 数据处理脚本
 
@@ -401,6 +519,8 @@ BaseModel (methods/base/base_longlive.py)
 | `scripts/compute_vae_latent.py` | CausVid | 计算 VAE latent 表示 |
 | `scripts/download_mixkit.py` | CausVid | 下载 MixKit 数据集 |
 | `scripts/process_mixkit.py` | CausVid | 处理 MixKit 数据集 |
+| `scripts/convert_anyflow_to_diffusers.py` | AnyFlow | 将 AnyFlow 模型转换为 Diffusers 格式 |
+| `scripts/extract_negative_embedding.py` | AnyFlow | 提取负提示词嵌入 |
 
 ---
 
@@ -424,6 +544,7 @@ methods/<new_method>/
 
 - **继承 `BaseModel`**：如果新方法与 Causal-Forcing/Self-Forcing/LongLive 类似（共享 `_run_generator`、`_consistency_backward_simulation`），从 `methods/base/` 中选择最接近的基类继承
 - **独立 `nn.Module`**：如果新方法的训练流程完全不同（如 CausVid），可以直接继承 `nn.Module` 自包含实现
+- **自包含包（AnyFlow 模式）**：如果新方法有完全独立的代码架构和依赖体系，可以在 `methods/<method>/` 下放置独立的 Python 包（如 `far/`），入口脚本通过 `sys.path` 注入使其导入生效
 
 ### 3. 选择 WanWrapper
 
@@ -473,3 +594,9 @@ inference_<new_method>.py   # 参考 inference_causal_forcing.py
 6. **`local_attn_size` 语义差异**：Self-Forcing/LongLive 中 `local_attn_size` 是帧数，CausVid 的 `window_size` 是 token 数。确保 config 中的值与方法匹配。
 
 7. **LongLive `is_causal` 标志**：LongLive 的 `args.causal` 可以为 False（使用双向注意力），其他方法始终为 True。训练和推理时确保一致。
+
+8. **AnyFlow 不依赖 core/ 和 wan/**：AnyFlow 使用自包含的 `far` 包，不使用项目的 WanWrapper、CausalModel、BaseModel 等共享组件。运行时需要入口脚本通过 `sys.path.insert(0, 'methods/anyflow/')` 加载 `far` 包。
+
+9. **AnyFlow 的 `far` 包命名空间**：所有内部导入使用 `far.xxx`，不能直接 `import far`，必须先设置 sys.path。原始代码中 `far/__init__.py` 不存在，`far` 作为隐式命名空间包工作。
+
+10. **AnyFlow 配置无 default_config.yaml 合并**：配置直接加载，不与 default_config.yaml 合并，需要写全所有字段（与 CausVid 类似但配置结构完全不同）。

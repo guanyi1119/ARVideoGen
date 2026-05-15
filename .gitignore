@@ -1,1 +1,6 @@
 __pycache__/
+
+archive/
+
+methods/anyflow/assets/evaluation/example
+methods/anyflow/assets/negative_embedding
