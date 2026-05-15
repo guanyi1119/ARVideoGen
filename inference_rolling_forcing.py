@@ -1,3 +1,4 @@
+import os
 import argparse
 import torch
 DEVICE_TYPE = os.environ.get('DEVICE_TYPE', 'cuda')
