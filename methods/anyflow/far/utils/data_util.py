@@ -16,7 +16,7 @@ def retry_load_error(max_attempts=3, delay=1):
                 except Exception as e:
                     if attempt == max_attempts - 1:
                         raise
-                    logger.warning(f"Load error (attempt {attempt+1}/{max_retries}): {e}")
+                    logger.warning(f"Load error (attempt {attempt+1}/{max_attempts}): {e}")
                     time.sleep(delay)
         return wrapper
     return decorator

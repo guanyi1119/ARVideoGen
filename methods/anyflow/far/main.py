@@ -480,7 +480,7 @@ class BaseTrainer:
         
         """Save the current training checkpoint."""
         train_states = self.get_train_state(only_model_state_dict=only_model_state_dict)
-        output_dir = self.cfg['path']['models']
+        output_dir = os.path.join(os.environ.get('OUTPUT_URL', '.'), self.cfg['path']['models'])
 
         dist_barrier()
         torch.cuda.empty_cache()
