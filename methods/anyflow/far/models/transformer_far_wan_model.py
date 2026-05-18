@@ -126,7 +126,15 @@ class WanSelfAttnProcessor2_0:
             key = apply_rotary_emb(key, rotary_emb['key'])
 
         if attention_mask is None:
-            hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)
+            if _IS_NPU:
+                seq_len = query.shape[2]
+                padded_length = int(math.ceil(seq_len / 128.0) * 128.0 - seq_len)
+                query = torch.cat([query, torch.zeros([query.shape[0], query.shape[1], padded_length, query.shape[3]], device=query.device, dtype=query.dtype)], dim=2)
+                key = torch.cat([key, torch.zeros([key.shape[0], key.shape[1], padded_length, key.shape[3]], device=key.device, dtype=key.dtype)], dim=2)
+                value = torch.cat([value, torch.zeros([value.shape[0], value.shape[1], padded_length, value.shape[3]], device=value.device, dtype=value.dtype)], dim=2)
+                hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)[:, :, :seq_len]
+            else:
+                hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)
         else:
             seq_len = query.shape[2]
             padded_length = int(math.ceil(seq_len / 128.0) * 128.0 - seq_len)
@@ -179,7 +187,19 @@ class WanCrossAttnProcessor2_0:
             query = apply_rotary_emb(query, rotary_emb['query'])
             key = apply_rotary_emb(key, rotary_emb['key'])
 
-        hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)
+        if _IS_NPU:
+            q_len = query.shape[2]
+            kv_len = key.shape[2]
+            q_padded = int(math.ceil(q_len / 128.0) * 128.0 - q_len)
+            kv_padded = int(math.ceil(kv_len / 128.0) * 128.0 - kv_len)
+            if q_padded > 0:
+                query = torch.cat([query, torch.zeros([query.shape[0], query.shape[1], q_padded, query.shape[3]], device=query.device, dtype=query.dtype)], dim=2)
+            if kv_padded > 0:
+                key = torch.cat([key, torch.zeros([key.shape[0], key.shape[1], kv_padded, key.shape[3]], device=key.device, dtype=key.dtype)], dim=2)
+                value = torch.cat([value, torch.zeros([value.shape[0], value.shape[1], kv_padded, value.shape[3]], device=value.device, dtype=value.dtype)], dim=2)
+            hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)[:, :, :q_len]
+        else:
+            hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)
 
         hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
