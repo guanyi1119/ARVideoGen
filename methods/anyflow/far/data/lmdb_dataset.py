@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 from PIL import Image
 import os
-from methods.anyflow.far.utils.registry import DATASET_REGISTRY
+from far.utils.registry import DATASET_REGISTRY
 
 
 @DATASET_REGISTRY.register()
@@ -79,5 +79,5 @@ class MultiODERegressionLMDBDataset(Dataset):
 
         return {
             "prompts": prompts,
-            "latents": torch.tensor(latents, dtype=torch.float32)[-1]
+            "latents": torch.tensor(latents, dtype=torch.float32)[-1].permute(1, 0, 2, 3)
         }

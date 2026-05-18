@@ -6,10 +6,13 @@ mixed_precision: true
 # dataset and data loader settings
 datasets:
   train:
-    type: T2VTarDataset
-    meta_path: methods/anyflow/assets/data/meta/vidprom_text2video_dummy_dataset/raw.json
-    num_frames: 81
-    data_dtype: .mp4
+    # type: T2VTarDataset
+    # meta_path: methods/anyflow/assets/data/meta/vidprom_text2video_dummy_dataset/raw.json
+    # num_frames: 81
+    # data_dtype: .mp4
+    type: MultiODERegressionLMDBDataset
+    data_path: /cache/CausalForcingData
+    folder_name_pattern: ODE6KCausal_chunkwise
     dataloader_cfg:
       batch_size_per_gpu: 1
       num_workers: 8
@@ -33,7 +36,7 @@ datasets:
 
 models:
   transformer_cfg:
-    model_name: experiments/pretrained_models/Wan2.1-T2V-14B-Diffusers
+    model_name: /cache/wan_models/Wan2.1-T2V-14B-Diffusers
     model_type: FAR_Wan_Transformer3DModel
     enable_gradient_checkpoint: true
     far_config:
@@ -49,7 +52,7 @@ models:
     bidirectional_modeling_prob: 0.1
   text_encoder_cfg:
     drop_text_ratio: 0.1
-    negative_embedding_path: methods/anyflow/assets/negative_embedding/wan_negemb_cn.pth
+    negative_embedding_path: /cache/negative_embedding/wan_negemb_cn.pth
     fuse_guidance_scale: 3.0
   vae_cfg:
     load: true
@@ -109,4 +112,4 @@ logger:
   print_freq: 1
   save_checkpoint_freq: 50
   save_eval_checkpoint_freq: 2000
-  use_wandb: false
+  use_tensorboard: true

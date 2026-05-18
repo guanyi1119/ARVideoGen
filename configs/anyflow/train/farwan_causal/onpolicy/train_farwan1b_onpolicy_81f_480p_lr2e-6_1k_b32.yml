@@ -6,10 +6,13 @@ mixed_precision: true
 # dataset and data loader settings
 datasets:
   train:
-    type: T2VTarDataset
-    meta_path: methods/anyflow/assets/data/meta/vidprom_text2video_dummy_dataset/raw.json
-    num_frames: 81
-    data_dtype: .mp4
+    # type: T2VTarDataset
+    # meta_path: methods/anyflow/assets/data/meta/vidprom_text2video_dummy_dataset/raw.json
+    # num_frames: 81
+    # data_dtype: .mp4
+    type: MultiODERegressionLMDBDataset
+    data_path: /cache/CausalForcingData
+    folder_name_pattern: ODE6KCausal_chunkwise
     dataloader_cfg:
       batch_size_per_gpu: 2
       num_workers: 0
@@ -53,7 +56,7 @@ datasets:
 
 models:
   transformer_cfg:
-    model_name: experiments/pretrained_models/Wan2.1-T2V-1.3B-Diffusers
+    model_name: /cache/wan_models/Wan2.1-T2V-1.3B-Diffusers
     model_type: FAR_Wan_Transformer3DModel
     enable_gradient_checkpoint: true
     pretrained_path: experiments/train_farwan1b_student_shift5_81f_480p_lr5e-5_6k_b32/models/step_6000.pt
@@ -70,7 +73,7 @@ models:
     param_names_to_optimize: ["lora_A", "lora_B", "far_patch_embedding"]
     bidirectional_modeling_prob: 0
   real_cfg:
-    model_name: experiments/pretrained_models/Wan2.1-T2V-1.3B-Diffusers
+    model_name: /cache/wan_models/Wan2.1-T2V-1.3B-Diffusers
     model_type: FAR_Wan_Transformer3DModel
     pretrained_path: experiments/train_wan1b_teacher_shift5_81f_480p_lr5e-5_6k_b32/models/step_6000.pt
     pretrained_weight: ema
@@ -79,7 +82,7 @@ models:
       lora_alpha: 256
       target_module_name: ["attn1.to_q", "attn1.to_k", "attn1.to_v", "attn1.to_out.0", "ffn.net.0.proj", "ffn.net.2"]
   discriminator_cfg:
-    model_name: experiments/pretrained_models/Wan2.1-T2V-1.3B-Diffusers
+    model_name: /cache/wan_models/Wan2.1-T2V-1.3B-Diffusers
     model_type: FAR_Wan_Transformer3DModel
     pretrained_path: experiments/train_wan1b_teacher_shift5_81f_480p_lr5e-5_6k_b32/models/step_6000.pt
     pretrained_weight: ema
@@ -91,7 +94,7 @@ models:
     param_names_to_optimize: ["lora_A", "lora_B"]
   text_encoder_cfg:
     drop_text_ratio: 0.1
-    negative_embedding_path: methods/anyflow/assets/negative_embedding/wan_negemb_cn.pth
+    negative_embedding_path: /cache/negative_embedding/wan_negemb_cn.pth
     fuse_guidance_scale: 3.0
   vae_cfg:
     load: true
@@ -169,4 +172,4 @@ logger:
   print_freq: 1
   save_checkpoint_freq: 50
   save_eval_checkpoint_freq: 400
-  use_wandb: false
+  use_tensorboard: true

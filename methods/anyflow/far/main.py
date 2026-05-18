@@ -29,10 +29,11 @@ from torch.distributed.checkpoint.format_utils import dcp_to_torch_save
 from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict, get_state_dict, set_state_dict
 from transformers import get_constant_schedule_with_warmup
 
+from core.misc.tensorboard_utils import TensorBoardLogger
 from far.data import build_dataloader
 from far.trainers import build_trainer
 from far.utils.dist_util import destroy_process_group, dist_barrier, dist_init, get_dist_rank, get_world_size, is_main_process
-from far.utils.logger_util import MessageLogger, dict2str, get_logger, set_path_logger, setup_wandb
+from far.utils.logger_util import MessageLogger, dict2str, get_logger, set_path_logger
 
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
@@ -55,11 +56,11 @@ class BaseTrainer:
             self.setup_model()
             self.build_eval_dataloader()
 
-            self.wandb_logger = None
+            self.tb_logger = None
             self.global_step = 'final'
 
         if self.cfg['mode'] == 'train':
-            self.setup_wandb()
+            self.setup_tensorboard()
 
             self.setup_ema_model()
             self.build_train_dataloader()
@@ -97,9 +98,9 @@ class BaseTrainer:
                 eval_info_dict = self.train_pipeline.eval_performance(self.cfg, global_step=self.global_step)
                 get_logger().info(f'Step-{self.global_step} evaluation results: {eval_info_dict}')
 
-                if self.wandb_logger:
-                    wandb_log_dict = {f'eval/{k}': v for k, v in eval_info_dict.items()}
-                    self.wandb_logger.log(wandb_log_dict, step=self.global_step, commit=True)
+                if self.tb_logger:
+                    tb_log_dict = {f'eval/{k}': v for k, v in eval_info_dict.items()}
+                    self.tb_logger.log(tb_log_dict, step=self.global_step)
 
         dist_barrier()
         torch.cuda.empty_cache()
@@ -115,9 +116,9 @@ class BaseTrainer:
                 eval_info_dict = self.train_pipeline.eval_i2v_performance(self.cfg, global_step=self.global_step)
                 get_logger().info(f'Step-{self.global_step} evaluation results: {eval_info_dict}')
 
-                if self.wandb_logger:
-                    wandb_log_dict = {f'eval/{k}': v for k, v in eval_info_dict.items()}
-                    self.wandb_logger.log(wandb_log_dict, step=self.global_step, commit=True)
+                if self.tb_logger:
+                    tb_log_dict = {f'eval/{k}': v for k, v in eval_info_dict.items()}
+                    self.tb_logger.log(tb_log_dict, step=self.global_step)
 
         dist_barrier()
         torch.cuda.empty_cache()
@@ -209,9 +210,9 @@ class BaseTrainer:
 
                 self.msg_logger(log_dict)
 
-                if is_main_process() and self.wandb_logger:
-                    wandb_log_dict = {f'train/{k}': v for k, v in log_dict.items()}
-                    self.wandb_logger.log(wandb_log_dict, step=self.global_step)
+                if is_main_process() and self.tb_logger:
+                    tb_log_dict = {f'train/{k}': v for k, v in log_dict.items()}
+                    self.tb_logger.log(tb_log_dict, step=self.global_step)
 
             # Save checkpoint periodically
             if self.global_step % self.cfg['logger']['save_checkpoint_freq'] == 0:
@@ -309,12 +310,15 @@ class BaseTrainer:
         self.train_dataloader.set_state(epoch, batch_iter)
         get_logger().info(f'Init dataloader at epoch: {epoch}, batch_iter {batch_iter}')
 
-    def setup_wandb(self):
-        """Setup Weights & Biases logging."""
-        if is_main_process() and self.cfg['logger'].get('use_wandb', False):
-            self.wandb_logger = setup_wandb(name=self.cfg['name'], save_dir=self.cfg['path']['log'])
+    def setup_tensorboard(self):
+        """Setup TensorBoard logging."""
+        if is_main_process() and self.cfg['logger'].get('use_tensorboard', True):
+            self.tb_logger = TensorBoardLogger(
+                log_dir=os.path.join(self.cfg['path']['log'], 'tensorboard'),
+                config=self.cfg
+            )
         else:
-            self.wandb_logger = None
+            self.tb_logger = None
 
     def setup_model(self):
         """Setup the model."""

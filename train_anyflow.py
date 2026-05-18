@@ -40,6 +40,7 @@ def main():
         OmegaConf.from_cli(extra_args)
     )
     cfg = OmegaConf.to_container(cfg, resolve=True)
+    cfg['config_path'] = args.config_path
 
     cfg = resolve_paths(cfg, _ANYFLOW_ROOT)
 

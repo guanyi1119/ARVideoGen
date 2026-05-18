@@ -18,6 +18,7 @@
 
 import copy
 import math
+import os
 from types import SimpleNamespace
 from typing import Any, Dict, Optional, Tuple, Union
 
@@ -35,13 +36,18 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.normalization import FP32LayerNorm
 from diffusers.utils import logging
 from einops import rearrange
-from torch.nn.attention.flex_attention import create_block_mask, flex_attention
+from torch.nn.attention.flex_attention import create_block_mask, flex_attention as _flex_attention
+from wan.modules.npu_flex_attention import FlexAttentionNPU
 
 from far.utils.registry import MODEL_REGISTRY
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
-flex_attention = torch.compile(flex_attention, dynamic=True)
+_IS_NPU = os.environ.get('DEVICE_TYPE', 'cuda') == 'npu'
+if _IS_NPU:
+    flex_attention = None  # NPU uses FlexAttentionNPU in WanSelfAttnProcessor2_0
+else:
+    flex_attention = torch.compile(_flex_attention, dynamic=True)
 
 
 def build_block_mask(mask_2d, device):
@@ -53,11 +59,14 @@ def build_block_mask(mask_2d, device):
     def mask_mod(b, h, q_idx, kv_idx):
         return mask_2d[q_idx, kv_idx]
 
-    return create_block_mask(mask_mod, B=None, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=device, _compile=False)
+    if _IS_NPU:
+        return FlexAttentionNPU(mask_mod=mask_mod)
+    else:
+        return create_block_mask(mask_mod, B=None, H=None, Q_LEN=Q_LEN, KV_LEN=KV_LEN, device=device, _compile=False)
 
 
 def apply_rotary_emb(hidden_states: torch.Tensor, freqs: torch.Tensor):
-    x_rotated = torch.view_as_complex(hidden_states.to(torch.float64).unflatten(3, (-1, 2)))
+    x_rotated = torch.view_as_complex(hidden_states.to(torch.float32).unflatten(3, (-1, 2)))
     x_out = torch.view_as_real(x_rotated * freqs).flatten(3, 4)
     return x_out.type_as(hidden_states)
 
@@ -125,7 +134,10 @@ class WanSelfAttnProcessor2_0:
             key = torch.cat([key, torch.zeros([key.shape[0], key.shape[1], padded_length, key.shape[3]], device=key.device, dtype=key.dtype)], dim=2)  # noqa: E501
             value = torch.cat([value, torch.zeros([value.shape[0], value.shape[1], padded_length, value.shape[3]], device=value.device, dtype=value.dtype)], dim=2)  # noqa: E501
 
-            hidden_states = flex_attention(query, key, value, block_mask=attention_mask)[:, :, :seq_len]
+            if _IS_NPU:
+                hidden_states = attention_mask(query=query, key=key, value=value)[:, :, :seq_len]
+            else:
+                hidden_states = flex_attention(query, key, value, block_mask=attention_mask)[:, :, :seq_len]
 
         hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
         hidden_states = hidden_states.type_as(query)
@@ -393,7 +405,7 @@ class WanRotaryPosEmbed(nn.Module):
         freqs = []
         for dim in [t_dim, h_dim, w_dim]:
             freq = get_1d_rotary_pos_embed(
-                dim, max_seq_len, theta, use_real=False, repeat_interleave_real=False, freqs_dtype=torch.float64
+                dim, max_seq_len, theta, use_real=False, repeat_interleave_real=False, freqs_dtype=torch.float32
             )
             freqs.append(freq)
         self.freqs = torch.cat(freqs, dim=1)
@@ -835,15 +847,18 @@ class FAR_Wan_Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
                 allowed = base & ~is_padding & ~is_clean_to_noise & noise_to_noise_mask & ~noise_to_clean_disallow
                 return allowed
 
-            return create_block_mask(
-                mask_mod,
-                B=None,
-                H=None,
-                Q_LEN=padded_seq_len,
-                KV_LEN=padded_seq_len,
-                device=device,
-                _compile=False,
-            )
+            if _IS_NPU:
+                return FlexAttentionNPU(mask_mod=mask_mod)
+            else:
+                return create_block_mask(
+                    mask_mod,
+                    B=None,
+                    H=None,
+                    Q_LEN=padded_seq_len,
+                    KV_LEN=padded_seq_len,
+                    device=device,
+                    _compile=False,
+                )
         else:
             context_chunk_partition, noise_chunk_partition = chunk_partition[:far_cfg['num_compressed_chunk']], chunk_partition[far_cfg['num_compressed_chunk']:]  # noqa: E501
 
@@ -865,15 +880,18 @@ class FAR_Wan_Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
                 base = base = frame_idx[q_idx] >= frame_idx[kv_idx]
                 return base & ~is_padding
 
-            return create_block_mask(
-                mask_mod,
-                B=None,
-                H=None,
-                Q_LEN=padded_seq_len,
-                KV_LEN=padded_seq_len,
-                device=device,
-                _compile=False,
-            )
+            if _IS_NPU:
+                return FlexAttentionNPU(mask_mod=mask_mod)
+            else:
+                return create_block_mask(
+                    mask_mod,
+                    B=None,
+                    H=None,
+                    Q_LEN=padded_seq_len,
+                    KV_LEN=padded_seq_len,
+                    device=device,
+                    _compile=False,
+                )
 
     def forward(self, *args, **kwargs):
         if kwargs.get('is_causal', True):
