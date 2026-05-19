@@ -224,7 +224,7 @@ def check_video(fp):
 def all_ranks_path_exists(save_path):
     local_exists = check_video(save_path)
     device = torch.npu.current_device() if _IS_NPU else torch.cuda.current_device()
-    res_tensor = torch.tensor(1.0 if local_exists else 0.0, device=device)
+    res_tensor = torch.tensor(1.0 if local_exists else 0.0, dtype=torch.float32, device=device)
     dist.all_reduce(res_tensor, op=dist.ReduceOp.SUM)
 
     world_size = dist.get_world_size()
@@ -232,7 +232,7 @@ def all_ranks_path_exists(save_path):
 
 
 def reduce_loss(loss):
-    rt = loss.detach().clone()
+    rt = loss.detach().clone().float()
     dist.all_reduce(rt, op=dist.ReduceOp.SUM)
     rt /= dist.get_world_size()
     return rt.item()

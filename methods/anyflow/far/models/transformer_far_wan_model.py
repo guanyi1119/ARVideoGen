@@ -127,6 +127,8 @@ class WanSelfAttnProcessor2_0:
 
         if attention_mask is None:
             if _IS_NPU:
+                print(f"[NPU Self-Attn Pre-pad] Q: storage_offset={query.storage_offset()}, storage_size={query.storage().size()}")
+                print(f"[NPU Self-Attn Pre-pad] K: storage_offset={key.storage_offset()}, storage_size={key.storage().size()}")
                 seq_len = query.shape[2]
                 padded_length = int(math.ceil(seq_len / 128.0) * 128.0 - seq_len)
                 query = torch.cat([query, torch.zeros([query.shape[0], query.shape[1], padded_length, query.shape[3]], device=query.device, dtype=query.dtype)], dim=2)
@@ -198,6 +200,8 @@ class WanCrossAttnProcessor2_0:
             key = apply_rotary_emb(key, rotary_emb['key'])
 
         if _IS_NPU:
+            print(f"[NPU Cross-Attn Pre-pad] Q: storage_offset={query.storage_offset()}, storage_size={query.storage().size()}")
+            print(f"[NPU Cross-Attn Pre-pad] K: storage_offset={key.storage_offset()}, storage_size={key.storage().size()}")
             q_len = query.shape[2]
             kv_len = key.shape[2]
             q_padded = int(math.ceil(q_len / 128.0) * 128.0 - q_len)

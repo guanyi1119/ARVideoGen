@@ -35,6 +35,7 @@ from far.trainers import build_trainer
 from far.utils.dist_util import destroy_process_group, dist_barrier, dist_init, get_dist_rank, get_world_size, is_main_process
 from far.utils.logger_util import MessageLogger, dict2str, get_logger, set_path_logger
 
+_IS_NPU = os.environ.get('DEVICE_TYPE', 'cuda') == 'npu'
 
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
@@ -388,6 +389,13 @@ class BaseTrainer:
         torch.set_rng_state(random_states_single_rank['torch_rng_state'])
         torch.cuda.set_rng_state(random_states_single_rank['torch_cuda_rng_state'])
 
+    def _get_fsdp1_full_state_dict(self, model):
+        """Get full state dict from FSDP1-wrapped model (rank 0 only)."""
+        from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+        cfg = FullStateDictConfig(rank0_only=True, offload_to_cpu=True)
+        with torch.distributed.fsdp.FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
+            return model.state_dict()
+
     def get_train_state(self, only_model_state_dict: bool = False):
         """Return the current training state, optionally including only the model state."""
         train_states = {}
@@ -401,20 +409,34 @@ class BaseTrainer:
             else:
                 train_states['ema'] = self.train_pipeline.ema.state_dict()
 
-        if only_model_state_dict:
-            train_states['model_state_dict_g'] = get_model_state_dict(self.train_pipeline.transformer, options=StateDictOptions(cpu_offload=True))
-            return train_states
+        if _IS_NPU:
+            if only_model_state_dict:
+                train_states['model_state_dict_g'] = self._get_fsdp1_full_state_dict(self.train_pipeline.transformer)
+                return train_states
 
-        train_states['model_state_dict_g'], train_states['optimizer_state_dict_g'] = get_state_dict(
-            self.train_pipeline.transformer, self.optimizer_g, options=StateDictOptions(cpu_offload=True)
-        )
-        train_states['lr_scheduler_g'] = self.lr_scheduler_g.state_dict()
+            train_states['model_state_dict_g'] = self._get_fsdp1_full_state_dict(self.train_pipeline.transformer)
+            train_states['optimizer_state_dict_g'] = self.optimizer_g.state_dict()
+            train_states['lr_scheduler_g'] = self.lr_scheduler_g.state_dict()
 
-        if hasattr(self, 'optimizer_d'):
-            train_states['model_state_dict_d'], train_states['optimizer_state_dict_d'] = get_state_dict(
-                self.train_pipeline.discriminator, self.optimizer_d, options=StateDictOptions(cpu_offload=True)
+            if hasattr(self, 'optimizer_d'):
+                train_states['model_state_dict_d'] = self._get_fsdp1_full_state_dict(self.train_pipeline.discriminator)
+                train_states['optimizer_state_dict_d'] = self.optimizer_d.state_dict()
+                train_states['lr_scheduler_d'] = self.lr_scheduler_d.state_dict()
+        else:
+            if only_model_state_dict:
+                train_states['model_state_dict_g'] = get_model_state_dict(self.train_pipeline.transformer, options=StateDictOptions(cpu_offload=True))
+                return train_states
+
+            train_states['model_state_dict_g'], train_states['optimizer_state_dict_g'] = get_state_dict(
+                self.train_pipeline.transformer, self.optimizer_g, options=StateDictOptions(cpu_offload=True)
             )
-            train_states['lr_scheduler_d'] = self.lr_scheduler_d.state_dict()
+            train_states['lr_scheduler_g'] = self.lr_scheduler_g.state_dict()
+
+            if hasattr(self, 'optimizer_d'):
+                train_states['model_state_dict_d'], train_states['optimizer_state_dict_d'] = get_state_dict(
+                    self.train_pipeline.discriminator, self.optimizer_d, options=StateDictOptions(cpu_offload=True)
+                )
+                train_states['lr_scheduler_d'] = self.lr_scheduler_d.state_dict()
 
         train_states['random_states'] = self.get_random_states()
 
@@ -428,31 +450,53 @@ class BaseTrainer:
             load_path = self.cfg['path']['models']
 
         checkpoint_path = os.path.join(load_path, 'checkpoint')
-        if os.path.exists(checkpoint_path):
+        checkpoint_pt_path = checkpoint_path + '.pt'
+        if os.path.exists(checkpoint_path) or os.path.exists(checkpoint_pt_path):
             get_logger().info(f'Resuming from checkpoint {checkpoint_path}')
 
-            # ----------------modify this part for different trainer---------------
-            train_states = self.get_train_state()
-            torch.distributed.checkpoint.load(train_states, checkpoint_id=checkpoint_path)
+            if _IS_NPU:
+                # FSDP1: load from torch.save format (.pt file)
+                if is_main_process():
+                    train_states = torch.load(checkpoint_pt_path, map_location='cpu', weights_only=False)
+                else:
+                    train_states = None
+                dist_barrier()
+            else:
+                # FSDP2: load from dcp format
+                train_states = self.get_train_state()
+                torch.distributed.checkpoint.load(train_states, checkpoint_id=checkpoint_path)
 
             self.global_step = train_states['global_step']
 
-            set_state_dict(
-                self.train_pipeline.transformer,
-                self.optimizer_g,
-                model_state_dict=train_states['model_state_dict_g'],
-                optim_state_dict=train_states['optimizer_state_dict_g'],
-                options=StateDictOptions(strict=True),
-            )
+            if _IS_NPU:
+                # FSDP1: use FSDP state_dict_type context for loading
+                from torch.distributed.fsdp import FullStateDictConfig, StateDictType
+                cfg = FullStateDictConfig(rank0_only=False)
+                with torch.distributed.fsdp.FSDP.state_dict_type(self.train_pipeline.transformer, StateDictType.FULL_STATE_DICT, cfg):
+                    self.train_pipeline.transformer.load_state_dict(train_states['model_state_dict_g'], strict=True)
+                self.optimizer_g.load_state_dict(train_states['optimizer_state_dict_g'])
 
-            if hasattr(self, 'optimizer_d'):
+                if hasattr(self, 'optimizer_d'):
+                    with torch.distributed.fsdp.FSDP.state_dict_type(self.train_pipeline.discriminator, StateDictType.FULL_STATE_DICT, cfg):
+                        self.train_pipeline.discriminator.load_state_dict(train_states['model_state_dict_d'], strict=True)
+                    self.optimizer_d.load_state_dict(train_states['optimizer_state_dict_d'])
+            else:
                 set_state_dict(
-                    self.train_pipeline.discriminator,
-                    self.optimizer_d,
-                    model_state_dict=train_states['model_state_dict_d'],
-                    optim_state_dict=train_states['optimizer_state_dict_d'],
+                    self.train_pipeline.transformer,
+                    self.optimizer_g,
+                    model_state_dict=train_states['model_state_dict_g'],
+                    optim_state_dict=train_states['optimizer_state_dict_g'],
                     options=StateDictOptions(strict=True),
                 )
+
+                if hasattr(self, 'optimizer_d'):
+                    set_state_dict(
+                        self.train_pipeline.discriminator,
+                        self.optimizer_d,
+                        model_state_dict=train_states['model_state_dict_d'],
+                        optim_state_dict=train_states['optimizer_state_dict_d'],
+                        options=StateDictOptions(strict=True),
+                    )
 
             get_logger().info('Loaded model and optimizer.')
 
@@ -477,44 +521,61 @@ class BaseTrainer:
             get_logger().info('Checkpoint does not exist. Starting a new training run.')
 
     def save_checkpoint(self, model_name, only_model_state_dict=False):
-        
+
         """Save the current training checkpoint."""
         train_states = self.get_train_state(only_model_state_dict=only_model_state_dict)
         output_dir = os.path.join(os.environ.get('OUTPUT_URL', '.'), self.cfg['path']['models'])
+        os.makedirs(output_dir, exist_ok=True)
 
         dist_barrier()
-        torch.cuda.empty_cache()
+        if not _IS_NPU:
+            torch.cuda.empty_cache()
         gc.collect()
         dist_barrier()
 
-        if model_name == 'checkpoint':
-            assert not only_model_state_dict, 'training ckpt should save with only_model_state_dict=False'
-            save_path_ = os.path.join(output_dir, 'checkpoint_')
-            save_path = os.path.join(output_dir, 'checkpoint')
-
+        if _IS_NPU:
+            # FSDP1: use torch.save on rank 0
             if is_main_process():
-                shutil.rmtree(save_path_, ignore_errors=True)
+                if model_name == 'checkpoint':
+                    assert not only_model_state_dict, 'training ckpt should save with only_model_state_dict=False'
+                    save_path = os.path.join(output_dir, 'checkpoint.pt')
+                    torch.save(train_states, save_path)
+                else:
+                    assert only_model_state_dict, 'evaluation ckpt should save with only_model_state_dict=True'
+                    save_path = os.path.join(output_dir, f'{model_name}.pt')
+                    torch.save(train_states, save_path)
+                get_logger().info(f'Saved state to {save_path}')
             dist_barrier()
-
-            torch.distributed.checkpoint.save(train_states, checkpoint_id=save_path_)
-            dist_barrier()
-
-            if is_main_process():
-                shutil.rmtree(save_path, ignore_errors=True)
-                shutil.move(save_path_, save_path)
-
-            dist_barrier()
-            get_logger().info(f'Saved state to {save_path}')
         else:
-            assert only_model_state_dict, 'evaluation ckpt should save with only_model_state_dict=True'
-            dist_barrier()
-            save_path = os.path.join(output_dir, f'{model_name}')
-            torch.distributed.checkpoint.save(train_states, checkpoint_id=save_path)
-            dist_barrier()
-            if is_main_process():
-                dcp_to_torch_save(save_path, save_path + '.pt')
-                shutil.rmtree(save_path, ignore_errors=True)
-            dist_barrier()
+            # FSDP2: use torch.distributed.checkpoint
+            if model_name == 'checkpoint':
+                assert not only_model_state_dict, 'training ckpt should save with only_model_state_dict=False'
+                save_path_ = os.path.join(output_dir, 'checkpoint_')
+                save_path = os.path.join(output_dir, 'checkpoint')
+
+                if is_main_process():
+                    shutil.rmtree(save_path_, ignore_errors=True)
+                dist_barrier()
+
+                torch.distributed.checkpoint.save(train_states, checkpoint_id=save_path_)
+                dist_barrier()
+
+                if is_main_process():
+                    shutil.rmtree(save_path, ignore_errors=True)
+                    shutil.move(save_path_, save_path)
+
+                dist_barrier()
+                get_logger().info(f'Saved state to {save_path}')
+            else:
+                assert only_model_state_dict, 'evaluation ckpt should save with only_model_state_dict=True'
+                dist_barrier()
+                save_path = os.path.join(output_dir, f'{model_name}')
+                torch.distributed.checkpoint.save(train_states, checkpoint_id=save_path)
+                dist_barrier()
+                if is_main_process():
+                    dcp_to_torch_save(save_path, save_path + '.pt')
+                    shutil.rmtree(save_path, ignore_errors=True)
+                dist_barrier()
 
     def __del__(self):
         destroy_process_group()
