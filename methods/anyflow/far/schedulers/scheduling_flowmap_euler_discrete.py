@@ -71,7 +71,7 @@ class FlowMapDiscreteScheduler(SchedulerMixin, ConfigMixin):
         timestep = timestep.to(device=sample.device, dtype=sample.dtype)
 
         timestep = timestep / self.config.num_train_timesteps
-        timestep = timestep.view(*timestep.shape, *([1] * (noise.ndim - timestep.ndim)))
+        timestep = timestep.view(*timestep.shape, *([1] * (noise.ndim - timestep.ndim))).contiguous()
         sample = timestep * noise + (1.0 - timestep) * sample
         return sample
 
@@ -100,7 +100,7 @@ class FlowMapDiscreteScheduler(SchedulerMixin, ConfigMixin):
     ):
         timestep = timestep / self.config.num_train_timesteps
         r_timestep = r_timestep / self.config.num_train_timesteps
-        timestep = timestep.view(*timestep.shape, *([1] * (model_output.ndim - timestep.ndim)))
-        r_timestep = r_timestep.view(*r_timestep.shape, *([1] * (model_output.ndim - r_timestep.ndim)))
+        timestep = timestep.view(*timestep.shape, *([1] * (model_output.ndim - timestep.ndim))).contiguous()
+        r_timestep = r_timestep.view(*r_timestep.shape, *([1] * (model_output.ndim - r_timestep.ndim))).contiguous()
         prev_sample = sample - (timestep - r_timestep) * model_output
         return prev_sample.to(model_output.dtype)

@@ -18,6 +18,7 @@
 
 import copy
 import html
+import os
 from typing import Any, Callable, Dict, List, Optional, Union
 
 import regex as re
@@ -149,7 +150,7 @@ class FARWanAnyFlowPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         # duplicate text embeddings for each generation per prompt, using mps friendly method
         _, seq_len, _ = prompt_embeds.shape
         prompt_embeds = prompt_embeds.repeat(1, num_videos_per_prompt, 1)
-        prompt_embeds = prompt_embeds.view(batch_size * num_videos_per_prompt, seq_len, -1)
+        prompt_embeds = prompt_embeds.view(batch_size * num_videos_per_prompt, seq_len, -1).contiguous()
 
         return prompt_embeds
 
@@ -341,8 +342,8 @@ class FARWanAnyFlowPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         return context_sequence
 
     def _normalize_latents(self, latents, latents_mean, latents_std):
-        latents_mean = latents_mean.view(1, -1, 1, 1, 1).to(device=latents.device)
-        latents_std = latents_std.view(1, -1, 1, 1, 1).to(device=latents.device)
+        latents_mean = latents_mean.view(1, -1, 1, 1, 1).contiguous().to(device=latents.device)
+        latents_std = latents_std.view(1, -1, 1, 1, 1).contiguous().to(device=latents.device)
         latents = ((latents.float() - latents_mean) * latents_std).to(latents)
         return latents
 
@@ -355,6 +356,7 @@ class FARWanAnyFlowPipeline(DiffusionPipeline, WanLoraLoaderMixin):
         latents_std = 1.0 / torch.tensor(self.vae.config.latents_std)
 
         mu, logvar = torch.chunk(moments, 2, dim=1)
+        mu, logvar = mu.contiguous(), logvar.contiguous()
         mu = self._normalize_latents(mu, latents_mean, latents_std)
 
         if sample:
@@ -417,6 +419,7 @@ class FARWanAnyFlowPipeline(DiffusionPipeline, WanLoraLoaderMixin):
                 )
                 if self.do_classifier_free_guidance:
                     noise_uncond, noise_pred = noise_pred.chunk(2)
+                    noise_uncond, noise_pred = noise_uncond.contiguous(), noise_pred.contiguous()
                     noise_pred = noise_uncond + guidance_scale * (noise_pred - noise_uncond)
 
                 latents = self.scheduler.step(noise_pred, latents, t, r)
@@ -680,10 +683,10 @@ class FARWanAnyFlowPipeline(DiffusionPipeline, WanLoraLoaderMixin):
             latents = latents.to(self.vae.dtype)
             latents_mean = (
                 torch.tensor(self.vae.config.latents_mean)
-                .view(1, self.vae.config.z_dim, 1, 1, 1)
+                .view(1, self.vae.config.z_dim, 1, 1, 1).contiguous()
                 .to(latents.device, latents.dtype)
             )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
+            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).contiguous().to(
                 latents.device, latents.dtype
             )
             latents = latents / latents_std + latents_mean

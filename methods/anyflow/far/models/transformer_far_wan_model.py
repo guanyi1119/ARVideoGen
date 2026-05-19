@@ -66,8 +66,8 @@ def build_block_mask(mask_2d, device):
 
 
 def apply_rotary_emb(hidden_states: torch.Tensor, freqs: torch.Tensor):
-    x_rotated = torch.view_as_complex(hidden_states.to(torch.float32).unflatten(3, (-1, 2)))
-    x_out = torch.view_as_real(x_rotated * freqs).flatten(3, 4)
+    x_rotated = torch.view_as_complex(hidden_states.to(torch.float32).unflatten(3, (-1, 2)).contiguous())
+    x_out = torch.view_as_real(x_rotated * freqs).flatten(3, 4).contiguous()
     return x_out.type_as(hidden_states)
 
 
@@ -99,9 +99,9 @@ class WanSelfAttnProcessor2_0:
         if attn.norm_k is not None:
             key = attn.norm_k(key)
 
-        query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
-        key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
-        value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+        query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2).contiguous()
+        key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2).contiguous()
+        value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2).contiguous()
 
         if kv_cache is not None:
             if kv_cache_flag['is_cache_step']:
@@ -132,7 +132,7 @@ class WanSelfAttnProcessor2_0:
                 query = torch.cat([query, torch.zeros([query.shape[0], query.shape[1], padded_length, query.shape[3]], device=query.device, dtype=query.dtype)], dim=2)
                 key = torch.cat([key, torch.zeros([key.shape[0], key.shape[1], padded_length, key.shape[3]], device=key.device, dtype=key.dtype)], dim=2)
                 value = torch.cat([value, torch.zeros([value.shape[0], value.shape[1], padded_length, value.shape[3]], device=value.device, dtype=value.dtype)], dim=2)
-                hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)[:, :, :seq_len]
+                hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)[:, :, :seq_len].contiguous()
             else:
                 hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)
         else:
@@ -143,11 +143,11 @@ class WanSelfAttnProcessor2_0:
             value = torch.cat([value, torch.zeros([value.shape[0], value.shape[1], padded_length, value.shape[3]], device=value.device, dtype=value.dtype)], dim=2)  # noqa: E501
 
             if _IS_NPU:
-                hidden_states = attention_mask(query=query, key=key, value=value)[:, :, :seq_len]
+                hidden_states = attention_mask(query=query, key=key, value=value)[:, :, :seq_len].contiguous()
             else:
-                hidden_states = flex_attention(query, key, value, block_mask=attention_mask)[:, :, :seq_len]
+                hidden_states = flex_attention(query, key, value, block_mask=attention_mask)[:, :, :seq_len].contiguous()
 
-        hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
+        hidden_states = hidden_states.transpose(1, 2).contiguous().flatten(2, 3).contiguous()
         hidden_states = hidden_states.type_as(query)
 
         hidden_states = attn.to_out[0](hidden_states)
@@ -179,9 +179,9 @@ class WanCrossAttnProcessor2_0:
         if attn.norm_k is not None:
             key = attn.norm_k(key)
 
-        query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2)
-        key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2)
-        value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2)
+        query = query.unflatten(2, (attn.heads, -1)).transpose(1, 2).contiguous()
+        key = key.unflatten(2, (attn.heads, -1)).transpose(1, 2).contiguous()
+        value = value.unflatten(2, (attn.heads, -1)).transpose(1, 2).contiguous()
 
         if rotary_emb is not None:
             query = apply_rotary_emb(query, rotary_emb['query'])
@@ -197,11 +197,11 @@ class WanCrossAttnProcessor2_0:
             if kv_padded > 0:
                 key = torch.cat([key, torch.zeros([key.shape[0], key.shape[1], kv_padded, key.shape[3]], device=key.device, dtype=key.dtype)], dim=2)
                 value = torch.cat([value, torch.zeros([value.shape[0], value.shape[1], kv_padded, value.shape[3]], device=value.device, dtype=value.dtype)], dim=2)
-            hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)[:, :, :q_len]
+            hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)[:, :, :q_len].contiguous()
         else:
             hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)
 
-        hidden_states = hidden_states.transpose(1, 2).flatten(2, 3)
+        hidden_states = hidden_states.transpose(1, 2).contiguous().flatten(2, 3).contiguous()
         hidden_states = hidden_states.type_as(query)
 
         hidden_states = attn.to_out[0](hidden_states)
@@ -596,7 +596,7 @@ class WanTransformerBlock(nn.Module):
     ) -> torch.Tensor:
 
         shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = (self.scale_shift_table + temb.float()).chunk(6, dim=2)
-        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = shift_msa.squeeze(2), scale_msa.squeeze(2), gate_msa.squeeze(2), c_shift_msa.squeeze(2), c_scale_msa.squeeze(2), c_gate_msa.squeeze(2)  # noqa: E501
+        shift_msa, scale_msa, gate_msa, c_shift_msa, c_scale_msa, c_gate_msa = shift_msa.squeeze(2).contiguous(), scale_msa.squeeze(2).contiguous(), gate_msa.squeeze(2).contiguous(), c_shift_msa.squeeze(2).contiguous(), c_scale_msa.squeeze(2).contiguous(), c_gate_msa.squeeze(2).contiguous()  # noqa: E501
 
         # 1. Self-attention
         norm_hidden_states = (self.norm1(hidden_states.float()) * (1 + scale_msa) + shift_msa).type_as(hidden_states)
@@ -770,9 +770,9 @@ class FAR_Wan_Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
         batch_size, num_patches, channels = latents.shape
         height, width = height // patch_size, width // patch_size
 
-        latents = latents.view(batch_size * num_frames, height, width, patch_size, patch_size, channels // (patch_size * patch_size))
+        latents = latents.view(batch_size * num_frames, height, width, patch_size, patch_size, channels // (patch_size * patch_size)).contiguous()
 
-        latents = latents.permute(0, 5, 1, 3, 2, 4)
+        latents = latents.permute(0, 5, 1, 3, 2, 4).contiguous()
         latents = latents.reshape(batch_size, num_frames, channels // (patch_size * patch_size), height * patch_size, width * patch_size)
         return latents
 
@@ -780,20 +780,20 @@ class FAR_Wan_Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
 
         full_hidden_states, compressed_hidden_states = hidden_states[:, :, far_cfg['num_compressed_frames']:], hidden_states[:, :, :far_cfg['num_compressed_frames']]  # noqa: E501
 
-        patchified_full_hidden_states = self.patch_embedding(full_hidden_states).flatten(start_dim=2, end_dim=4).transpose(1, 2)
+        patchified_full_hidden_states = self.patch_embedding(full_hidden_states).flatten(start_dim=2, end_dim=4).transpose(1, 2).contiguous()
         if clean_hidden_states is not None:
-            clean_hidden_states = self.patch_embedding(clean_hidden_states).flatten(start_dim=2, end_dim=4).transpose(1, 2)
+            clean_hidden_states = self.patch_embedding(clean_hidden_states).flatten(start_dim=2, end_dim=4).transpose(1, 2).contiguous()
             patchified_full_hidden_states = torch.cat([patchified_full_hidden_states, clean_hidden_states], dim=1)
 
         if far_cfg['num_compressed_frames'] > 0:
-            patchified_compressed_hidden_states = self.far_patch_embedding(compressed_hidden_states).flatten(start_dim=2, end_dim=4).transpose(1, 2)
+            patchified_compressed_hidden_states = self.far_patch_embedding(compressed_hidden_states).flatten(start_dim=2, end_dim=4).transpose(1, 2).contiguous()
             hidden_states = torch.cat([patchified_compressed_hidden_states, patchified_full_hidden_states], dim=1)
         else:
             hidden_states = patchified_full_hidden_states
         return hidden_states
 
     def forward_far_patchify_inference(self, hidden_states):
-        hidden_states = self.patch_embedding(hidden_states).flatten(start_dim=2, end_dim=4).transpose(1, 2)
+        hidden_states = self.patch_embedding(hidden_states).flatten(start_dim=2, end_dim=4).transpose(1, 2).contiguous()
         return hidden_states
 
     def _build_causal_mask(self, far_cfg, clean_hidden_states, device, dtype):
@@ -976,7 +976,7 @@ class FAR_Wan_Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
             timestep, r_timestep, encoder_hidden_states, encoder_hidden_states_image, far_cfg=far_cfg  # noqa: E501
         )
-        timestep_proj = timestep_proj.unflatten(2, (6, -1))
+        timestep_proj = timestep_proj.unflatten(2, (6, -1)).contiguous()
 
         if encoder_hidden_states_image is not None:
             encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
@@ -993,7 +993,7 @@ class FAR_Wan_Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
 
         # 5. Output norm, projection & unpatchify
         shift, scale = (self.scale_shift_table + temb.unsqueeze(2)).chunk(2, dim=2)
-        shift, scale = shift.squeeze(2), scale.squeeze(2)
+        shift, scale = shift.squeeze(2).contiguous(), scale.squeeze(2).contiguous()
 
         # Move the shift and scale tensors to the same device as hidden_states.
         # When using multi-GPU inference via accelerate these will be on the
@@ -1070,7 +1070,7 @@ class FAR_Wan_Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
             timestep, r_timestep, encoder_hidden_states, encoder_hidden_states_image, far_cfg=far_cfg, clean_timestep=clean_timestep
         )
-        timestep_proj = timestep_proj.unflatten(2, (6, -1))
+        timestep_proj = timestep_proj.unflatten(2, (6, -1)).contiguous()
 
         if encoder_hidden_states_image is not None:
             encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
@@ -1139,7 +1139,7 @@ class FAR_Wan_Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
             timestep, r_timestep, encoder_hidden_states, encoder_hidden_states_image, far_cfg=far_cfg, clean_timestep=clean_timestep
         )
-        timestep_proj = timestep_proj.unflatten(2, (6, -1))
+        timestep_proj = timestep_proj.unflatten(2, (6, -1)).contiguous()
 
         if encoder_hidden_states_image is not None:
             encoder_hidden_states = torch.concat([encoder_hidden_states_image, encoder_hidden_states], dim=1)
@@ -1156,7 +1156,7 @@ class FAR_Wan_Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
 
         # 5. Output norm, projection & unpatchify
         shift, scale = (self.scale_shift_table + temb.unsqueeze(2)).chunk(2, dim=2)
-        shift, scale = shift.squeeze(2), scale.squeeze(2)
+        shift, scale = shift.squeeze(2).contiguous(), scale.squeeze(2).contiguous()
 
         # Move the shift and scale tensors to the same device as hidden_states.
         # When using multi-GPU inference via accelerate these will be on the
@@ -1204,12 +1204,12 @@ class FAR_Wan_Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
         rotary_emb = self.rope(far_cfg=far_cfg, device=hidden_states.device, is_causal=is_causal)
 
         hidden_states = self.patch_embedding(hidden_states)
-        hidden_states = hidden_states.flatten(2).transpose(1, 2)
+        hidden_states = hidden_states.flatten(2).transpose(1, 2).contiguous()
 
         temb, timestep_proj, encoder_hidden_states, encoder_hidden_states_image = self.condition_embedder(
             timestep, r_timestep, encoder_hidden_states, encoder_hidden_states_image, is_causal=is_causal, far_cfg=far_cfg
         )
-        timestep_proj = timestep_proj.unflatten(2, (6, -1))
+        timestep_proj = timestep_proj.unflatten(2, (6, -1)).contiguous()
 
         attention_mask = None
 
@@ -1230,8 +1230,8 @@ class FAR_Wan_Transformer3DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
         if temb.ndim == 3:
             # batch_size, seq_len, inner_dim (wan 2.2 ti2v)
             shift, scale = (self.scale_shift_table.unsqueeze(0) + temb.unsqueeze(2)).chunk(2, dim=2)
-            shift = shift.squeeze(2)
-            scale = scale.squeeze(2)
+            shift = shift.squeeze(2).contiguous()
+            scale = scale.squeeze(2).contiguous()
         else:
             # batch_size, inner_dim
             shift, scale = (self.scale_shift_table + temb.unsqueeze(1)).chunk(2, dim=1)

@@ -147,8 +147,8 @@ class Wan_AnyFlow_Pretrain_Trainer(nn.Module, ConfigMixin):
             get_logger().info(f'enable EMA training with decay {ema_decay}, warmup_steps: {ema_warmup_step}')
 
     def _normalize_latents(self, latents, latents_mean, latents_std):
-        latents_mean = latents_mean.view(1, -1, 1, 1, 1).to(device=latents.device)
-        latents_std = latents_std.view(1, -1, 1, 1, 1).to(device=latents.device)
+        latents_mean = latents_mean.view(1, -1, 1, 1, 1).contiguous().to(device=latents.device)
+        latents_std = latents_std.view(1, -1, 1, 1, 1).contiguous().to(device=latents.device)
         latents = ((latents.float() - latents_mean) * latents_std).to(latents)
         return latents
 
@@ -161,6 +161,7 @@ class Wan_AnyFlow_Pretrain_Trainer(nn.Module, ConfigMixin):
         latents_std = 1.0 / torch.tensor(self.vae.config.latents_std)
 
         mu, logvar = torch.chunk(moments, 2, dim=1)
+        mu, logvar = mu.contiguous(), logvar.contiguous()
         mu = self._normalize_latents(mu, latents_mean, latents_std)
 
         if sample:
@@ -305,7 +306,7 @@ class Wan_AnyFlow_Pretrain_Trainer(nn.Module, ConfigMixin):
 
         dF_dt = self.compute_central_difference(noisy_latents, latents, noise, t, r, prompt_embeds, guidance)
 
-        target = (noise - latents) - (t - r).view(batch_size, num_frames, 1, 1, 1) * dF_dt
+        target = (noise - latents) - (t - r).view(batch_size, num_frames, 1, 1, 1).contiguous() * dF_dt
 
         loss = torch.mean(((noise_pred.float() - target.float()) ** 2).reshape(batch_size, -1), dim=-1)
         weight = self.scheduler.get_train_weight(t).to(latents.device)
@@ -394,7 +395,7 @@ class Wan_AnyFlow_Pretrain_Trainer(nn.Module, ConfigMixin):
                         'width': cfg['val']['sample_cfg']['width'],
                         'num_frames': cfg['val']['sample_cfg']['num_frames'],
                         'num_inference_steps': num_inference_steps,
-                        'generator': torch.Generator('cuda').manual_seed(seed),
+                        'generator': torch.Generator('npu' if os.environ.get('DEVICE_TYPE', 'cuda') == 'npu' else 'cuda').manual_seed(seed),
                     }
 
                     video = val_pipeline(**input_params).frames[0]
@@ -443,7 +444,7 @@ class Wan_AnyFlow_Pretrain_Trainer(nn.Module, ConfigMixin):
                 'width': cfg['val']['sample_cfg']['width'],
                 'num_frames': cfg['val']['sample_cfg']['num_frames'],
                 'num_inference_steps': cfg['val']['sample_cfg']['num_vbench_inference_steps'],
-                'generator': torch.Generator(device='cuda').manual_seed(manual_seed)
+                'generator': torch.Generator(device='npu' if os.environ.get('DEVICE_TYPE', 'cuda') == 'npu' else 'cuda').manual_seed(manual_seed)
             }
 
             video = val_pipeline(**input_params).frames[0]
@@ -501,7 +502,7 @@ class Wan_AnyFlow_Pretrain_Trainer(nn.Module, ConfigMixin):
                 'width': cfg['val']['sample_cfg']['width'],
                 'num_frames': cfg['val']['sample_cfg']['num_frames'],
                 'num_inference_steps': cfg['val']['sample_cfg']['num_vbench_inference_steps'],
-                'generator': torch.Generator(device='cuda').manual_seed(manual_seed)
+                'generator': torch.Generator(device='npu' if os.environ.get('DEVICE_TYPE', 'cuda') == 'npu' else 'cuda').manual_seed(manual_seed)
             }
 
             video = val_pipeline(**input_params).frames[0]
