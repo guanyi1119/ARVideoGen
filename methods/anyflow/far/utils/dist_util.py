@@ -24,6 +24,8 @@ from torch.distributed.checkpoint.state_dict import StateDictOptions, set_model_
 from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, OffloadPolicy, fully_shard
 
+_IS_NPU = os.environ.get('DEVICE_TYPE', 'cuda') == 'npu'
+
 
 def is_main_process():
     return not dist.is_initialized() or dist.get_rank() == 0
@@ -45,9 +47,13 @@ def dist_init() -> None:
         else:  # IPv4
             init_method = f'tcp://{host}:{port}'
 
-        dist.init_process_group(rank=rank, world_size=world_size, backend='nccl', init_method=init_method, timeout=timedelta(minutes=30))
+        backend = 'hccl' if _IS_NPU else 'nccl'
+        dist.init_process_group(rank=rank, world_size=world_size, backend=backend, init_method=init_method, timeout=timedelta(minutes=30))
 
-        torch.cuda.set_device(local_rank)
+        if _IS_NPU:
+            torch.npu.set_device(local_rank)
+        else:
+            torch.cuda.set_device(local_rank)
         assert torch.distributed.is_initialized()
     except Exception:
         os.environ['RANK'] = '0'
@@ -84,15 +90,16 @@ def fsdp2_wrap(
     world_size = int(os.environ['WORLD_SIZE'])
     gpus_per_node = int(os.environ.get('LOCAL_WORLD_SIZE', 1))
     num_nodes = world_size // gpus_per_node
+    device_type = 'npu' if _IS_NPU else 'cuda'
 
     if sharding_strategy == 'hybrid_full' or sharding_strategy == 'hybrid_zero2':
         device_mesh = init_device_mesh(
-            'cuda',
+            device_type,
             (num_nodes, gpus_per_node),
             mesh_dim_names=('replication', 'sharding')
         )
     else:
-        device_mesh = init_device_mesh('cuda', (world_size,))
+        device_mesh = init_device_mesh(device_type, (world_size,))
 
     if transformer_block_clsname is not None:
         for m in module.modules():
@@ -143,7 +150,8 @@ def check_video(fp):
 
 def all_ranks_path_exists(save_path):
     local_exists = check_video(save_path)
-    res_tensor = torch.tensor(1.0 if local_exists else 0.0).cuda()
+    device = torch.npu.current_device() if _IS_NPU else torch.cuda.current_device()
+    res_tensor = torch.tensor(1.0 if local_exists else 0.0, device=device)
     dist.all_reduce(res_tensor, op=dist.ReduceOp.SUM)
 
     world_size = dist.get_world_size()
