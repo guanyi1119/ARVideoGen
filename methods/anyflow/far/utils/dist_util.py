@@ -25,6 +25,13 @@ from torch.distributed.device_mesh import init_device_mesh
 from torch.distributed.fsdp import CPUOffloadPolicy, MixedPrecisionPolicy, OffloadPolicy, fully_shard
 
 _IS_NPU = os.environ.get('DEVICE_TYPE', 'cuda') == 'npu'
+if _IS_NPU:
+    """NPU-compatible FSDP1 wrapper with float16 param dtype and npu device."""
+    from functools import partial
+    from torch.distributed.fsdp import FullyShardedDataParallel as FSDP, MixedPrecision, ShardingStrategy
+    from torch.distributed.fsdp.api import CPUOffload
+    from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy, transformer_auto_wrap_policy
+
 
 
 def is_main_process():
@@ -62,6 +69,62 @@ def dist_init() -> None:
         print('warning: dist not init')
 
 
+def _fsdp1_wrap_npu(
+    module: nn.Module,
+    sharding_strategy: str = 'hybrid_full',
+    mixed_precision: bool = True,
+    cpu_offload: bool = False,
+    transformer_block_clsname: str = None,
+):
+    if mixed_precision:
+        mixed_precision_policy = MixedPrecision(
+            param_dtype=torch.float16,
+            reduce_dtype=torch.float32,
+            buffer_dtype=torch.float32,
+            cast_forward_inputs=False,
+        )
+    else:
+        mixed_precision_policy = None
+
+    if transformer_block_clsname is not None:
+        # Resolve class name to actual class for FSDP1 auto_wrap
+        _cls = None
+        for m in module.modules():
+            if type(m).__name__ == transformer_block_clsname:
+                _cls = type(m)
+                break
+        auto_wrap_policy = partial(
+            transformer_auto_wrap_policy,
+            transformer_layer_cls={_cls} if _cls else set()
+        )
+    else:
+        auto_wrap_policy = partial(
+            size_based_auto_wrap_policy,
+            min_num_params=int(5e7)
+        )
+
+    strategy_map = {
+        "full": ShardingStrategy.FULL_SHARD,
+        "hybrid_full": ShardingStrategy.HYBRID_SHARD,
+        "hybrid_zero2": ShardingStrategy._HYBRID_SHARD_ZERO2,
+        "no_shard": ShardingStrategy.NO_SHARD,
+    }
+    fsdp_strategy = strategy_map.get(sharding_strategy, ShardingStrategy.HYBRID_SHARD)
+
+    module = FSDP(
+        module,
+        auto_wrap_policy=auto_wrap_policy,
+        sharding_strategy=fsdp_strategy,
+        mixed_precision=mixed_precision_policy,
+        device_id=torch.npu.current_device(),
+        limit_all_gathers=True,
+        use_orig_params=True,
+        cpu_offload=CPUOffload(offload_params=cpu_offload),
+        sync_module_states=True,
+    )
+    return module
+
+
 def fsdp2_wrap(
     module: nn.Module,
     sharding_strategy: str = 'hybrid_full',
@@ -70,6 +133,17 @@ def fsdp2_wrap(
     transformer_block_clsname: str = None,
     sync_module_state: bool = True
 ):
+    if _IS_NPU:
+        print("Using NPU-compatible FSDP1 wrapper")
+        return _fsdp1_wrap_npu(
+            module,
+            sharding_strategy=sharding_strategy,
+            mixed_precision=mixed_precision,
+            cpu_offload=cpu_offload,
+            transformer_block_clsname=transformer_block_clsname,
+        )
+    
+    print("Using native FSDP2 wrapper")
     if sync_module_state:
         full_state_dict = module.state_dict() if dist.get_rank() == 0 else {}
 
@@ -90,16 +164,15 @@ def fsdp2_wrap(
     world_size = int(os.environ['WORLD_SIZE'])
     gpus_per_node = int(os.environ.get('LOCAL_WORLD_SIZE', 1))
     num_nodes = world_size // gpus_per_node
-    device_type = 'npu' if _IS_NPU else 'cuda'
 
     if sharding_strategy == 'hybrid_full' or sharding_strategy == 'hybrid_zero2':
         device_mesh = init_device_mesh(
-            device_type,
+            'cuda',
             (num_nodes, gpus_per_node),
             mesh_dim_names=('replication', 'sharding')
         )
     else:
-        device_mesh = init_device_mesh(device_type, (world_size,))
+        device_mesh = init_device_mesh('cuda', (world_size,))
 
     if transformer_block_clsname is not None:
         for m in module.modules():
