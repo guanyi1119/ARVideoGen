@@ -90,13 +90,13 @@ def set_path_logger(cfg):
         cfg['path'] = {}
 
     if cfg['mode'] == 'train':
-        experiments_root = osp.join('experiments', cfg['name'])
+        experiments_root = osp.join('train_outputs', cfg['name'])
         cfg['path']['experiments_root'] = experiments_root
         cfg['path']['models'] = osp.join(experiments_root, 'models')
         cfg['path']['log'] = experiments_root
         cfg['path']['visualization'] = osp.join(experiments_root, 'visualization')
     else:
-        results_root = osp.join('results', cfg['name'])
+        results_root = osp.join('inference_outputs', cfg['name'])
         cfg['path']['results_root'] = results_root
         cfg['path']['log'] = results_root
         cfg['path']['visualization'] = osp.join(results_root, 'visualization')
