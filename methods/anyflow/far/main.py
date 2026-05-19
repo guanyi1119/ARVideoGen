@@ -393,7 +393,7 @@ class BaseTrainer:
         """Get full state dict from FSDP1-wrapped model (rank 0 only)."""
         from torch.distributed.fsdp import FullStateDictConfig, StateDictType
         cfg = FullStateDictConfig(rank0_only=True, offload_to_cpu=True)
-        with torch.distributed.fsdp.FSDP.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
+        with torch.distributed.fsdp.FullyShardedDataParallel.state_dict_type(model, StateDictType.FULL_STATE_DICT, cfg):
             return model.state_dict()
 
     def get_train_state(self, only_model_state_dict: bool = False):
@@ -472,12 +472,12 @@ class BaseTrainer:
                 # FSDP1: use FSDP state_dict_type context for loading
                 from torch.distributed.fsdp import FullStateDictConfig, StateDictType
                 cfg = FullStateDictConfig(rank0_only=False)
-                with torch.distributed.fsdp.FSDP.state_dict_type(self.train_pipeline.transformer, StateDictType.FULL_STATE_DICT, cfg):
+                with torch.distributed.fsdp.FullyShardedDataParallel.state_dict_type(self.train_pipeline.transformer, StateDictType.FULL_STATE_DICT, cfg):
                     self.train_pipeline.transformer.load_state_dict(train_states['model_state_dict_g'], strict=True)
                 self.optimizer_g.load_state_dict(train_states['optimizer_state_dict_g'])
 
                 if hasattr(self, 'optimizer_d'):
-                    with torch.distributed.fsdp.FSDP.state_dict_type(self.train_pipeline.discriminator, StateDictType.FULL_STATE_DICT, cfg):
+                    with torch.distributed.fsdp.FullyShardedDataParallel.state_dict_type(self.train_pipeline.discriminator, StateDictType.FULL_STATE_DICT, cfg):
                         self.train_pipeline.discriminator.load_state_dict(train_states['model_state_dict_d'], strict=True)
                     self.optimizer_d.load_state_dict(train_states['optimizer_state_dict_d'])
             else:
