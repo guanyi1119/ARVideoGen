@@ -220,11 +220,14 @@ class MessageLogger():
                 message += f'{k}: {v:.3e} '
             elif 'video' in k:
                 message += f'{k}: {v} '
+            elif 'throughput' in k:
+                message += f'{k}: {v:.2f} samples/s/npu '
             else:
                 message += f'{k}: {v:.4f} '
 
         message += _format_cuda_memory()
         get_logger().info(message)
+        print(message)
 
 
 def setup_wandb(name, save_dir):

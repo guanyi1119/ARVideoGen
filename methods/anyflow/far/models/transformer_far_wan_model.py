@@ -219,8 +219,11 @@ class WanCrossAttnProcessor2_0:
             value = value.clone()
             q_len = query.shape[2]
             kv_len = key.shape[2]
-            q_padded = int(math.ceil(q_len / 128.0) * 128.0 - q_len)
-            kv_padded = int(math.ceil(kv_len / 128.0) * 128.0 - kv_len)
+            # Pad Q and KV to the same aligned length — aclnnFlashAttentionScore
+            # under FSDP requires Q and KV to have equal sequence length.
+            target_len = int(math.ceil(max(q_len, kv_len) / 128.0) * 128.0)
+            q_padded = target_len - q_len
+            kv_padded = target_len - kv_len
             if q_padded > 0:
                 query = torch.cat([query, torch.zeros([query.shape[0], query.shape[1], q_padded, query.shape[3]], device=query.device, dtype=query.dtype)], dim=2)
             if kv_padded > 0:

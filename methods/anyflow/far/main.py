@@ -136,6 +136,8 @@ class BaseTrainer:
 
         self.init_train_dataloader()
 
+        self.start_step = 0
+        self.start_time = time.time()
         while self.global_step <= self.cfg['train']['total_iter']:
 
             # Evaluation
@@ -208,6 +210,18 @@ class BaseTrainer:
 
                 if self.cfg['train'].get('use_same_optimizer'):
                     log_dict.update(d_loss_dict)
+
+                end_time = time.time()
+                end_step = self.step + 1
+                # 计算吞吐量
+                step_diff = end_step - self.start_step
+                time_diff = end_time - self.start_time
+                seconds_per_iter = time_diff / step_diff
+                batch_size = self.train_dataloader.cfg.batch_size_per_gpu
+                throughput = batch_size / seconds_per_iter
+                log_dict.update({'DI_throughput': throughput})
+                self.start_time = time.time()
+                self.start_step = end_step
 
                 self.msg_logger(log_dict)
 
