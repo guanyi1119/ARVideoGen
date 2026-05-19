@@ -45,6 +45,10 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 _IS_NPU = os.environ.get('DEVICE_TYPE', 'cuda') == 'npu'
 if _IS_NPU:
+    try:
+        import torch_npu
+    except ImportError:
+        torch_npu = None
     flex_attention = None  # NPU uses FlexAttentionNPU in WanSelfAttnProcessor2_0
 else:
     flex_attention = torch.compile(_flex_attention, dynamic=True)
@@ -127,9 +131,6 @@ class WanSelfAttnProcessor2_0:
 
         if attention_mask is None:
             if _IS_NPU:
-                # Clone to decouple from FSDP float32 storage — aclnnFlashAttentionScore
-                # may validate shape against the underlying float32 storage, causing
-                # a mismatch with the bfloat16 logical tensor shape.
                 query = query.clone()
                 key = key.clone()
                 value = value.clone()
@@ -139,9 +140,21 @@ class WanSelfAttnProcessor2_0:
                 key = torch.cat([key, torch.zeros([key.shape[0], key.shape[1], padded_length, key.shape[3]], device=key.device, dtype=key.dtype)], dim=2)
                 value = torch.cat([value, torch.zeros([value.shape[0], value.shape[1], padded_length, value.shape[3]], device=value.device, dtype=value.dtype)], dim=2)
                 try:
-                    hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)[:, :, :seq_len].contiguous()
+                    B, H, S, D = query.shape
+                    result = torch_npu.npu_fusion_attention(
+                        query, key, value,
+                        head_num=H,
+                        input_layout="BNSD",
+                        atten_mask=None,
+                        scale=1.0 / (D ** 0.5),
+                        keep_prob=1.0,
+                        pre_tockens=2147483647,
+                        next_tockens=2147483647,
+                        sparse_mode=0,
+                    )
+                    hidden_states = result[0][:, :, :seq_len].contiguous()
                 except RuntimeError:
-                    print(f"[NPU Self-Attn] Fallback to manual attention (SDPA failed)")
+                    print(f"[NPU Self-Attn] Fallback to manual attention (npu_fusion_attention failed)")
                     scale = 1.0 / (query.shape[-1] ** 0.5)
                     attn_weights = torch.matmul(query * scale, key.transpose(-2, -1))
                     attn_weights = F.softmax(attn_weights.float(), dim=-1).type_as(query)
@@ -201,7 +214,6 @@ class WanCrossAttnProcessor2_0:
             key = apply_rotary_emb(key, rotary_emb['key'])
 
         if _IS_NPU:
-            # Clone to decouple from FSDP float32 storage
             query = query.clone()
             key = key.clone()
             value = value.clone()
@@ -215,9 +227,22 @@ class WanCrossAttnProcessor2_0:
                 key = torch.cat([key, torch.zeros([key.shape[0], key.shape[1], kv_padded, key.shape[3]], device=key.device, dtype=key.dtype)], dim=2)
                 value = torch.cat([value, torch.zeros([value.shape[0], value.shape[1], kv_padded, value.shape[3]], device=value.device, dtype=value.dtype)], dim=2)
             try:
-                hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)[:, :, :q_len].contiguous()
+                H = query.shape[1]
+                D = query.shape[-1]
+                result = torch_npu.npu_fusion_attention(
+                    query, key, value,
+                    head_num=H,
+                    input_layout="BNSD",
+                    atten_mask=None,
+                    scale=1.0 / (D ** 0.5),
+                    keep_prob=1.0,
+                    pre_tockens=2147483647,
+                    next_tockens=2147483647,
+                    sparse_mode=0,
+                )
+                hidden_states = result[0][:, :, :q_len].contiguous()
             except RuntimeError:
-                print(f"[NPU Cross-Attn] Fallback to manual attention (SDPA failed)")
+                print(f"[NPU Cross-Attn] Fallback to manual attention (npu_fusion_attention failed)")
                 scale = 1.0 / (query.shape[-1] ** 0.5)
                 attn_weights = torch.matmul(query * scale, key.transpose(-2, -1))
                 attn_weights = F.softmax(attn_weights.float(), dim=-1).type_as(query)
