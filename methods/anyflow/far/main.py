@@ -212,7 +212,7 @@ class BaseTrainer:
                     log_dict.update(d_loss_dict)
 
                 end_time = time.time()
-                end_step = self.step + 1
+                end_step = self.global_step + 1
                 # 计算吞吐量
                 step_diff = end_step - self.start_step
                 time_diff = end_time - self.start_time

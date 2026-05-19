@@ -93,8 +93,8 @@ train:
 val:
   val_pipeline: FARWanAnyFlowPipeline
   skip_first_eval: true
-  sample_freq: 1000
-  eval_freq: 1000
+  sample_freq: 500
+  eval_freq: 500
   sample_cfg:
     height: 480
     width: 832
@@ -110,6 +110,6 @@ val:
 # logging settings
 logger:
   print_freq: 1
-  save_checkpoint_freq: 50
-  save_eval_checkpoint_freq: 2000
+  save_checkpoint_freq: 500
+  save_eval_checkpoint_freq: 500
   use_tensorboard: true

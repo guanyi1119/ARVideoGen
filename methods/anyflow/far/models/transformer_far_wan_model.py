@@ -44,12 +44,13 @@ from far.utils.registry import MODEL_REGISTRY
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
 _IS_NPU = os.environ.get('DEVICE_TYPE', 'cuda') == 'npu'
+_USE_MANUAL_ATTN = os.environ.get('USE_MANUAL_ATTN', '0') == '1'
 if _IS_NPU:
     try:
         import torch_npu
     except ImportError:
         torch_npu = None
-    flex_attention = None  # NPU uses FlexAttentionNPU in WanSelfAttnProcessor2_0
+    flex_attention = None
 else:
     flex_attention = torch.compile(_flex_attention, dynamic=True)
 
@@ -131,16 +132,19 @@ class WanSelfAttnProcessor2_0:
 
         if attention_mask is None:
             if _IS_NPU:
-                query = query.clone()
-                key = key.clone()
-                value = value.clone()
                 seq_len = query.shape[2]
                 padded_length = int(math.ceil(seq_len / 128.0) * 128.0 - seq_len)
-                query = torch.cat([query, torch.zeros([query.shape[0], query.shape[1], padded_length, query.shape[3]], device=query.device, dtype=query.dtype)], dim=2)
-                key = torch.cat([key, torch.zeros([key.shape[0], key.shape[1], padded_length, key.shape[3]], device=key.device, dtype=key.dtype)], dim=2)
-                value = torch.cat([value, torch.zeros([value.shape[0], value.shape[1], padded_length, value.shape[3]], device=value.device, dtype=value.dtype)], dim=2)
-                try:
-                    B, H, S, D = query.shape
+                if _USE_MANUAL_ATTN:
+                    scale = 1.0 / (query.shape[-1] ** 0.5)
+                    attn_weights = torch.matmul(query * scale, key.transpose(-2, -1))
+                    attn_weights = F.softmax(attn_weights.float(), dim=-1).type_as(query)
+                    hidden_states = torch.matmul(attn_weights, value)
+                else:
+                    query = torch.cat([query, torch.zeros([query.shape[0], query.shape[1], padded_length, query.shape[3]], device=query.device, dtype=query.dtype)], dim=2)
+                    key = torch.cat([key, torch.zeros([key.shape[0], key.shape[1], padded_length, key.shape[3]], device=key.device, dtype=key.dtype)], dim=2)
+                    value = torch.cat([value, torch.zeros([value.shape[0], value.shape[1], padded_length, value.shape[3]], device=value.device, dtype=value.dtype)], dim=2)
+                    H = query.shape[1]
+                    D = query.shape[-1]
                     result = torch_npu.npu_fusion_attention(
                         query, key, value,
                         head_num=H,
@@ -153,12 +157,6 @@ class WanSelfAttnProcessor2_0:
                         sparse_mode=0,
                     )
                     hidden_states = result[0][:, :, :seq_len].contiguous()
-                except RuntimeError:
-                    print(f"[NPU Self-Attn] Fallback to manual attention (npu_fusion_attention failed)")
-                    scale = 1.0 / (query.shape[-1] ** 0.5)
-                    attn_weights = torch.matmul(query * scale, key.transpose(-2, -1))
-                    attn_weights = F.softmax(attn_weights.float(), dim=-1).type_as(query)
-                    hidden_states = torch.matmul(attn_weights, value)[:, :, :seq_len].contiguous()
             else:
                 hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)
         else:
@@ -214,22 +212,24 @@ class WanCrossAttnProcessor2_0:
             key = apply_rotary_emb(key, rotary_emb['key'])
 
         if _IS_NPU:
-            query = query.clone()
-            key = key.clone()
-            value = value.clone()
             q_len = query.shape[2]
             kv_len = key.shape[2]
-            # Pad Q and KV to the same aligned length — aclnnFlashAttentionScore
-            # under FSDP requires Q and KV to have equal sequence length.
-            target_len = int(math.ceil(max(q_len, kv_len) / 128.0) * 128.0)
-            q_padded = target_len - q_len
-            kv_padded = target_len - kv_len
-            if q_padded > 0:
-                query = torch.cat([query, torch.zeros([query.shape[0], query.shape[1], q_padded, query.shape[3]], device=query.device, dtype=query.dtype)], dim=2)
-            if kv_padded > 0:
-                key = torch.cat([key, torch.zeros([key.shape[0], key.shape[1], kv_padded, key.shape[3]], device=key.device, dtype=key.dtype)], dim=2)
-                value = torch.cat([value, torch.zeros([value.shape[0], value.shape[1], kv_padded, value.shape[3]], device=value.device, dtype=value.dtype)], dim=2)
-            try:
+            if _USE_MANUAL_ATTN:
+                scale = 1.0 / (query.shape[-1] ** 0.5)
+                attn_weights = torch.matmul(query * scale, key.transpose(-2, -1))
+                attn_weights = F.softmax(attn_weights.float(), dim=-1).type_as(query)
+                hidden_states = torch.matmul(attn_weights, value)
+            else:
+                # Pad Q and KV to the same aligned length — aclnnFlashAttentionScore
+                # under FSDP requires Q and KV to have equal sequence length.
+                target_len = int(math.ceil(max(q_len, kv_len) / 128.0) * 128.0)
+                q_padded = target_len - q_len
+                kv_padded = target_len - kv_len
+                if q_padded > 0:
+                    query = torch.cat([query, torch.zeros([query.shape[0], query.shape[1], q_padded, query.shape[3]], device=query.device, dtype=query.dtype)], dim=2)
+                if kv_padded > 0:
+                    key = torch.cat([key, torch.zeros([key.shape[0], key.shape[1], kv_padded, key.shape[3]], device=key.device, dtype=key.dtype)], dim=2)
+                    value = torch.cat([value, torch.zeros([value.shape[0], value.shape[1], kv_padded, value.shape[3]], device=value.device, dtype=value.dtype)], dim=2)
                 H = query.shape[1]
                 D = query.shape[-1]
                 result = torch_npu.npu_fusion_attention(
@@ -244,12 +244,6 @@ class WanCrossAttnProcessor2_0:
                     sparse_mode=0,
                 )
                 hidden_states = result[0][:, :, :q_len].contiguous()
-            except RuntimeError:
-                print(f"[NPU Cross-Attn] Fallback to manual attention (npu_fusion_attention failed)")
-                scale = 1.0 / (query.shape[-1] ** 0.5)
-                attn_weights = torch.matmul(query * scale, key.transpose(-2, -1))
-                attn_weights = F.softmax(attn_weights.float(), dim=-1).type_as(query)
-                hidden_states = torch.matmul(attn_weights, value)[:, :, :q_len].contiguous()
         else:
             hidden_states = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, dropout_p=0.0, is_causal=False)
 
