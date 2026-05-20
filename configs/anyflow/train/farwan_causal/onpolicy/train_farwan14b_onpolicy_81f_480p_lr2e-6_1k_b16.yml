@@ -59,7 +59,7 @@ models:
     model_name: /cache/wan_models/Wan2.1-T2V-14B-Diffusers
     model_type: FAR_Wan_Transformer3DModel
     enable_gradient_checkpoint: true
-    pretrained_path: experiments/train_farwan14b_student_shift5_81f_480p_lr5e-5_4k_b16/models/step_4000.pt
+    pretrained_path: /cache/anyflow_pretrain_model_14b.pt
     pretrained_weight: ema
     far_config:
       full_chunk_limit: 3
@@ -75,7 +75,7 @@ models:
   real_cfg:
     model_name: /cache/wan_models/Wan2.1-T2V-14B-Diffusers
     model_type: FAR_Wan_Transformer3DModel
-    pretrained_path: experiments/train_wan14b_teacher_shift5_81f_480p_lr5e-5_4k_b16/models/step_4000.pt
+    pretrained_path: /cache/anyflow_pretrain_model_14b.pt
     pretrained_weight: ema
     lora_config:
       lora_rank: 256
@@ -84,7 +84,7 @@ models:
   discriminator_cfg:
     model_name: /cache/wan_models/Wan2.1-T2V-14B-Diffusers
     model_type: FAR_Wan_Transformer3DModel
-    pretrained_path: experiments/train_wan14b_teacher_shift5_81f_480p_lr5e-5_4k_b16/models/step_4000.pt
+    pretrained_path: /cache/anyflow_pretrain_model_14b.pt
     pretrained_weight: ema
     enable_gradient_checkpoint: true
     lora_config:

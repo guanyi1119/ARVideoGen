@@ -32,7 +32,7 @@ class VBenchT2VDataset(Dataset, ConfigMixin):
     @register_to_config
     def __init__(
         self,
-        json_path: str = 'assets/data/meta/vbench/VBench_aug_full_info.json',
+        json_path: str = 'methods/anyflow/assets/data/meta/vbench/VBench_aug_full_info.json',
         num_samples_per_prompt: Optional[int] = 5,
     ):
         super().__init__()

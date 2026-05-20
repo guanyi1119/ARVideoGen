@@ -33,7 +33,7 @@ class VBenchI2VDataset(Dataset, ConfigMixin):
     @register_to_config
     def __init__(
         self,
-        json_path: str = 'assets/data/meta/vbench/vbench2_i2v_aug_full_info.json',
+        json_path: str = 'methods/anyflow/assets/data/meta/vbench/vbench2_i2v_aug_full_info.json',
         image_dir: str = 'datasets/vbench_i2v/crop/7-4',
         num_samples_per_prompt: Optional[int] = 5,
     ):
