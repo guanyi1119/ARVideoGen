@@ -1,7 +1,7 @@
 export MODELS_DIR="/cache/wan_models"
 export DEVICE_TYPE="npu"
 export PYTHONPATH=$PYTHONPATH:"/use/local/Ascend/ascend-toolkit/latest/python/site-packages":"./"
-export USE_MANUAL_ATTN="1"
+export USE_MANUAL_ATTN="0"
 
 export HCCL_INTER_HCCS_DISABLE=TRUE
 export HCCL_BUFFSIZE=200

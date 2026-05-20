@@ -46,6 +46,10 @@ logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 _IS_NPU = os.environ.get('DEVICE_TYPE', 'cuda') == 'npu'
 _USE_MANUAL_ATTN = os.environ.get('USE_MANUAL_ATTN', '0') == '1'
 if _IS_NPU:
+    if _USE_MANUAL_ATTN:
+        print("Use manual attention")
+    else:
+        print("Use NPU fused attention")
     try:
         import torch_npu
     except ImportError:
@@ -132,14 +136,14 @@ class WanSelfAttnProcessor2_0:
 
         if attention_mask is None:
             if _IS_NPU:
-                seq_len = query.shape[2]
-                padded_length = int(math.ceil(seq_len / 128.0) * 128.0 - seq_len)
                 if _USE_MANUAL_ATTN:
                     scale = 1.0 / (query.shape[-1] ** 0.5)
                     attn_weights = torch.matmul(query * scale, key.transpose(-2, -1))
                     attn_weights = F.softmax(attn_weights.float(), dim=-1).type_as(query)
                     hidden_states = torch.matmul(attn_weights, value)
                 else:
+                    seq_len = query.shape[2]
+                    padded_length = int(math.ceil(seq_len / 128.0) * 128.0 - seq_len)
                     query = torch.cat([query, torch.zeros([query.shape[0], query.shape[1], padded_length, query.shape[3]], device=query.device, dtype=query.dtype)], dim=2)
                     key = torch.cat([key, torch.zeros([key.shape[0], key.shape[1], padded_length, key.shape[3]], device=key.device, dtype=key.dtype)], dim=2)
                     value = torch.cat([value, torch.zeros([value.shape[0], value.shape[1], padded_length, value.shape[3]], device=value.device, dtype=value.dtype)], dim=2)
@@ -212,19 +216,16 @@ class WanCrossAttnProcessor2_0:
             key = apply_rotary_emb(key, rotary_emb['key'])
 
         if _IS_NPU:
-            q_len = query.shape[2]
-            kv_len = key.shape[2]
             if _USE_MANUAL_ATTN:
                 scale = 1.0 / (query.shape[-1] ** 0.5)
                 attn_weights = torch.matmul(query * scale, key.transpose(-2, -1))
                 attn_weights = F.softmax(attn_weights.float(), dim=-1).type_as(query)
                 hidden_states = torch.matmul(attn_weights, value)
             else:
-                # Pad Q and KV to the same aligned length — aclnnFlashAttentionScore
-                # under FSDP requires Q and KV to have equal sequence length.
-                target_len = int(math.ceil(max(q_len, kv_len) / 128.0) * 128.0)
-                q_padded = target_len - q_len
-                kv_padded = target_len - kv_len
+                q_len = query.shape[2]
+                kv_len = key.shape[2]
+                q_padded = int(math.ceil(q_len / 128.0) * 128.0 - q_len)
+                kv_padded = int(math.ceil(kv_len / 128.0) * 128.0 - kv_len)
                 if q_padded > 0:
                     query = torch.cat([query, torch.zeros([query.shape[0], query.shape[1], q_padded, query.shape[3]], device=query.device, dtype=query.dtype)], dim=2)
                 if kv_padded > 0:

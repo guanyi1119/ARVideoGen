@@ -14,7 +14,7 @@ datasets:
     data_path: /cache/CausalForcingData
     folder_name_pattern: ODE6KCausal_chunkwise
     dataloader_cfg:
-      batch_size_per_gpu: 2
+      batch_size_per_gpu: 1
       num_workers: 8
       shuffle_chunk_size: 1000
       drop_last: true
