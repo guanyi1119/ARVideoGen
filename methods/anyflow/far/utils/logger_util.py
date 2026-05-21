@@ -221,11 +221,12 @@ class MessageLogger():
             elif 'video' in k:
                 message += f'{k}: {v} '
             elif 'throughput' in k:
-                message += f'{k}: {v:.2f} samples/s/npu '
+                continue
             else:
                 message += f'{k}: {v:.4f} '
 
         message += _format_cuda_memory()
+        message += f'DI_throughput: {log_vars.get("DI_throughput", 0):.2f} samples/s/npu'
         get_logger().info(message)
         print(message)
 
