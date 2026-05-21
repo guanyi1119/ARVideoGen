@@ -20,8 +20,9 @@ datasets:
       drop_last: true
 
   val:
-    type: VBenchT2VDataset
-    num_samples_per_prompt: 5
+    type: VBenchT2VTXTDataset
+    txt_path: prompts/self_forcing_all_dimension_extended.txt
+    num_samples_per_prompt: 1
     dataloader_cfg:
       batch_size_per_gpu: 1
 
