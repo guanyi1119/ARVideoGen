@@ -26,6 +26,9 @@ from far.utils.registry import DATASET_REGISTRY
 
 @DATASET_REGISTRY.register()
 class VBenchT2VTXTDataset(Dataset, ConfigMixin):
+    
+    config_name = 'vbench_t2v_txt_dataset_config.json'
+    
     @register_to_config
     def __init__(
         self,
