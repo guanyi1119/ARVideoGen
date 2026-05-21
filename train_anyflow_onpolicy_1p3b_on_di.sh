@@ -34,6 +34,8 @@ python -c "import moxing as mox; mox.file.copy('obs://yw-ads-model-training-gy1/
 mkdir /cache/negative_embedding
 python -c "import moxing as mox; mox.file.copy('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/data/AnyFlowData/wan_negemb_cn.pth', '/cache/negative_embedding/wan_negemb_cn.pth')"
 
+python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/data/AnyFlowData/eval_example', '/cache/eval_example')"
+
 MASTER_ADDR=$(echo $VC_WORKER_HOSTS | cut -d',' -f1)
 
 torchrun --nproc_per_node=8 --rdzv_conf="timeout=7200" --nnodes=$VC_WORKER_NUM --node_rank=$VC_TASK_INDEX --master_addr $MASTER_ADDR --master_port 12345 train_anyflow.py \
