@@ -128,6 +128,7 @@ def evaluate_with_config(config_path):
     )
     cfg = OmegaConf.to_container(cfg, resolve=True)
     cfg = resolve_paths(cfg, _ANYFLOW_ROOT)
+    cfg['config_path'] = config_path
     BaseTrainer(cfg).evaluate()
 
 
