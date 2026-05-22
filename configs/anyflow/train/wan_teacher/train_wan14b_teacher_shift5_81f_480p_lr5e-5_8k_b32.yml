@@ -6,10 +6,14 @@ mixed_precision: true
 # dataset and data loader settings
 datasets:
   train:
-    type: T2VTarDataset
-    meta_path: methods/anyflow/assets/data/meta/vidprom_text2video_dummy_dataset/raw.json
-    num_frames: 81
-    data_dtype: .mp4
+    # type: T2VTarDataset
+    # meta_path: methods/anyflow/assets/data/meta/vidprom_text2video_dummy_dataset/raw.json
+    # num_frames: 81
+    # data_dtype: .mp4
+    type: MultiODERegressionLMDBDataset
+    data_path: /cache/CausalForcingData
+    folder_name_pattern: ODE6KCausal_chunkwise
+
     dataloader_cfg:
       batch_size_per_gpu: 1
       num_workers: 8
@@ -33,7 +37,7 @@ datasets:
 
 models:
   transformer_cfg:
-    model_name: experiments/pretrained_models/Wan2.1-T2V-14B-Diffusers
+    model_name: /cache/wan_models/Wan2.1-T2V-14B-Diffusers
     model_type: FAR_Wan_Transformer3DModel
     enable_gradient_checkpoint: true
     lora_config:
@@ -44,7 +48,7 @@ models:
     i2v_prob: 0
   text_encoder_cfg:
     drop_text_ratio: 0.1
-    negative_embedding_path: methods/anyflow/assets/negative_embedding/wan_negemb_cn.pth
+    negative_embedding_path: /cache/negative_embedding/wan_negemb_cn.pth
   vae_cfg:
     load: true
   scheduler_cfg:
@@ -70,15 +74,15 @@ train:
   lr_scheduler: constant_with_warmup
 
   warmup_iter: 1000
-  total_iter: 4000
+  total_iter: 8000
   max_grad_norm: 1.0
 
 # validation settings
 val:
   val_pipeline: WanAnyFlowPipeline
   skip_first_eval: true
-  sample_freq: 1000
-  eval_freq: 1000
+  sample_freq: 500
+  eval_freq: 500
   sample_cfg:
     height: 480
     width: 832
@@ -88,12 +92,12 @@ val:
     num_vbench_inference_steps: 50
     num_frames: 81
     negative_prompt: "色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走"
-  eval_cfg:
-    vbench: ~
+  # eval_cfg:
+  #   vbench: ~
 
 # logging settings
 logger:
   print_freq: 1
-  save_checkpoint_freq: 50
-  save_eval_checkpoint_freq: 2000
+  save_checkpoint_freq: 500
+  save_eval_checkpoint_freq: 500
   use_wandb: false
