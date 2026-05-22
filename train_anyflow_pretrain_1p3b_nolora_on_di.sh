@@ -36,4 +36,4 @@ python -c "import moxing as mox; mox.file.copy('obs://yw-pixelgeek-training-data
 MASTER_ADDR=$(echo $VC_WORKER_HOSTS | cut -d',' -f1)
 
 torchrun --nproc_per_node=8 --rdzv_conf="timeout=7200" --nnodes=$VC_WORKER_NUM --node_rank=$VC_TASK_INDEX --master_addr $MASTER_ADDR --master_port 12345 train_anyflow.py \
-    --config_path configs\anyflow\train\farwan_causal\pretrain\train_farwan1b_student_shift5_81f_480p_lr5e-5_30k_b32_f32_nolora.yml
+    --config_path configs/anyflow/train/farwan_causal/pretrain/train_farwan1b_student_shift5_81f_480p_lr5e-5_30k_b32_f32_nolora.yml
