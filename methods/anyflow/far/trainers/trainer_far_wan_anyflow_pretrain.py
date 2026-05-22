@@ -389,7 +389,10 @@ class FAR_Wan_AnyFlow_Pretrain_Trainer(nn.Module, ConfigMixin):
         with torch.no_grad():
             global_loss = torch.cat(dist.nn.all_gather(loss), dim=0)
             global_diffusion_mask = torch.cat(dist.nn.all_gather(is_diffusion), dim=0)
-            scale_weight = global_loss[global_diffusion_mask].mean() / (loss[~is_diffusion] + 1e-5)
+            if global_diffusion_mask.any() and (~is_diffusion).any():
+                scale_weight = global_loss[global_diffusion_mask].mean() / (loss[~is_diffusion] + 1e-5)
+            else:
+                scale_weight = torch.ones_like(loss[~is_diffusion])
         loss[~is_diffusion] = loss[~is_diffusion] * scale_weight
 
         return loss.mean()
@@ -402,9 +405,9 @@ class FAR_Wan_AnyFlow_Pretrain_Trainer(nn.Module, ConfigMixin):
             latents = self.encode_latents(batch['pixel_values'].to(device=self.config.device, dtype=self.config.dtype), sample=False)
 
         if 'prompt_embeds' in batch:
-            prompt_embeds = batch['prompt_embeds'].to(device=self.config.device)
+            prompt_embeds = batch['prompt_embeds'].to(device=self.config.device, dtype=self.config.dtype)
         else:
-            prompt_embeds = self.encode_text_embedding(batch['prompts'], device=self.config.device)
+            prompt_embeds = self.encode_text_embedding(batch['prompts'], device=self.config.device).to(dtype=self.config.dtype)
 
         return self.pixel_loss(latents, prompt_embeds, iters)
 
