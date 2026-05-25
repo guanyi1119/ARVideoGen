@@ -13,6 +13,12 @@ Usage:
         --data_path <lmdb_dir> \
         --output_dir <output_dir>
 
+    # Randomly sample 10% of dataset
+    python scripts/decode_vae_latent.py \
+        --data_path <lmdb_dir> \
+        --output_dir <output_dir> \
+        --sample_ratio 0.1
+
     # Specify folder pattern and FPS
     python scripts/decode_vae_latent.py \
         --data_path <lmdb_dir> \
