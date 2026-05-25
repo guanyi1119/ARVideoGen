@@ -60,7 +60,7 @@ models:
     model_name: /cache/wan_models/Wan2.1-T2V-1.3B-Diffusers
     model_type: FAR_Wan_Transformer3DModel
     enable_gradient_checkpoint: true
-    pretrained_path: /cache/anyflow_pretrain_model_1p3b.pt
+    pretrained_path: /cache/anyflow_pretrain_model.pt
     pretrained_weight: ema
     far_config:
       full_chunk_limit: 3
@@ -74,9 +74,9 @@ models:
     param_names_to_optimize: ["lora_A", "lora_B", "far_patch_embedding"]
     bidirectional_modeling_prob: 0
   real_cfg:
-    model_name: /cache/wan_models/Wan2.1-T2V-1.3B-Diffusers
+    model_name: /cache/wan_models/Wan2.1-T2V-14B-Diffusers
     model_type: FAR_Wan_Transformer3DModel
-    pretrained_path: /cache/anyflow_pretrain_model_1p3b.pt
+    pretrained_path: /cache/anyflow_teacher_model.pt
     pretrained_weight: ema
     lora_config:
       lora_rank: 256

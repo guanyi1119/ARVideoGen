@@ -29,7 +29,8 @@ python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-trai
 python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/data/CausalForcingData/ODE6KCausal_chunkwise_14', '/cache/CausalForcingData/ODE6KCausal_chunkwise_14')"
 
 python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/models/wan_models/Wan2.1-T2V-1.3B-Diffusers', '/cache/wan_models/Wan2.1-T2V-1.3B-Diffusers')"
-python -c "import moxing as mox; mox.file.copy('obs://yw-ads-model-training-gy1/model-dev/pixelgeek/video-gen-ar/2026/05/20/ae7ea6e0d00d4007925876e2ebe4b4d8/output/train_outputs/train_farwan1b_student_shift5_81f_480p_lr5e-5_6k_b32/models/step_6000.pt', '/cache/anyflow_pretrain_model_1p3b.pt')"
+# AnyFlow pretrain model should put here: /cache/anyflow_pretrain_model.pt
+# AnyFlow teacher model should put here: /cache/anyflow_teacher_model.pt
 
 mkdir /cache/negative_embedding
 python -c "import moxing as mox; mox.file.copy('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/data/AnyFlowData/wan_negemb_cn.pth', '/cache/negative_embedding/wan_negemb_cn.pth')"

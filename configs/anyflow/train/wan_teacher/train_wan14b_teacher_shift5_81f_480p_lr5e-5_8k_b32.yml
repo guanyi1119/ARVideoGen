@@ -100,4 +100,4 @@ logger:
   print_freq: 1
   save_checkpoint_freq: 500
   save_eval_checkpoint_freq: 500
-  use_wandb: false
+  use_tensorboard: true
