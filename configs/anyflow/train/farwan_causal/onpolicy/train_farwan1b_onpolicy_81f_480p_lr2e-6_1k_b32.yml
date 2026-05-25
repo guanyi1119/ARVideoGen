@@ -85,7 +85,7 @@ models:
   discriminator_cfg:
     model_name: /cache/wan_models/Wan2.1-T2V-1.3B-Diffusers
     model_type: FAR_Wan_Transformer3DModel
-    pretrained_path: /cache/anyflow_pretrain_model_1p3b.pt
+    pretrained_path: /cache/anyflow_pretrain_model.pt
     pretrained_weight: ema
     enable_gradient_checkpoint: true
     lora_config:
