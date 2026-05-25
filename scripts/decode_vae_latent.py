@@ -64,6 +64,10 @@ def main():
                         help='Directory to save decoded videos')
     parser.add_argument('--indices', type=str, default=None,
                         help='Comma-separated sample indices to decode (e.g. "0,1,5"). Default: all')
+    parser.add_argument('--sample_ratio', type=float, default=None,
+                        help='Randomly sample this ratio of dataset (0~1). E.g. 0.1 = 10%%)')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='Random seed for --sample_ratio')
     parser.add_argument('--max_pair', type=int, default=int(1e8),
                         help='Max number of pairs loaded by dataset')
     parser.add_argument('--fps', type=int, default=16,
@@ -83,6 +87,10 @@ def main():
 
     if args.indices is not None:
         indices = [int(i) for i in args.indices.split(',')]
+    elif args.sample_ratio is not None:
+        rng = np.random.default_rng(args.seed)
+        n = max(1, int(len(dataset) * args.sample_ratio))
+        indices = sorted(rng.choice(len(dataset), size=n, replace=False).tolist())
     else:
         indices = list(range(len(dataset)))
 
@@ -93,7 +101,7 @@ def main():
         latents = sample['latents']   # (C, T, H, W)
         prompt = sample['prompts']
 
-        latents = latents.unsqueeze(0).to(device=args.device, dtype=torch.float32)
+        latents = latents.unsqueeze(0).transpose(1, 2).to(device=args.device, dtype=torch.float32)
 
         with torch.no_grad():
             pixels = vae.decode_to_pixel(latents)  # (1, C, T, H, W)
