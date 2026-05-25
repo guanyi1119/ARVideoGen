@@ -30,6 +30,9 @@ sys.path.insert(0, os.path.join(project_root, 'methods', 'anyflow'))
 
 import argparse
 import torch
+DEVICE_TYPE = os.environ.get('DEVICE_TYPE', 'cuda')
+if DEVICE_TYPE == "npu":
+    from torch_npu.contrib import transfer_to_npu
 import numpy as np
 from tqdm import tqdm
 
