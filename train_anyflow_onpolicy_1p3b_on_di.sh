@@ -29,6 +29,7 @@ python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-trai
 python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/data/CausalForcingData/ODE6KCausal_chunkwise_14', '/cache/CausalForcingData/ODE6KCausal_chunkwise_14')"
 
 python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/models/wan_models/Wan2.1-T2V-1.3B-Diffusers', '/cache/wan_models/Wan2.1-T2V-1.3B-Diffusers')"
+python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/models/wan_models/Wan2.1-T2V-14B-Diffusers', '/cache/wan_models/Wan2.1-T2V-14B-Diffusers')"
 # AnyFlow pretrain model should put here: /cache/anyflow_pretrain_model.pt
 # AnyFlow teacher model should put here: /cache/anyflow_teacher_model.pt
 
