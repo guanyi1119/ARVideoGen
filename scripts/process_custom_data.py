@@ -34,6 +34,7 @@ sys.path.insert(0, os.path.join(project_root, 'methods', 'anyflow'))
 
 import argparse
 import json
+import tempfile
 from io import BytesIO
 from pathlib import Path
 import numpy as np
@@ -41,6 +42,7 @@ from tqdm import tqdm
 
 import torch
 import torch.distributed as dist
+import imageio
 import imageio.v3 as iio
 from skimage.transform import resize
 
@@ -85,6 +87,11 @@ def read_jsonl(jsonl_path):
 
 def get_video_reader(video_path, use_moxing):
     """Get a video reader that works with local or remote (moxing) paths."""
+    # Prepend VIDEO_DIR environment variable if exists
+    video_dir = os.environ.get('VIDEO_DIR', '')
+    if video_dir:
+        video_path = os.path.join(video_dir, video_path)
+
     if use_moxing and mox is not None and (video_path.startswith('obs://') or video_path.startswith('s3://')):
         # Read directly into memory via mox.file.File
         with mox.file.File(video_path, 'rb') as f:
@@ -94,6 +101,35 @@ def get_video_reader(video_path, use_moxing):
     else:
         # Local read
         return iio.imread(video_path, plugin='pyav')
+
+
+def save_resized_video(video_np, save_path, fps=16):
+    """Save resized video (T, H, W, 3) as mp4, supports moxing remote paths."""
+    # Check if remote path
+    is_remote = save_path.startswith('obs://') or save_path.startswith('s3://')
+
+    if is_remote and mox is not None:
+        # Write to local temp file first, then copy to remote
+        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
+            tmp_path = tmp.name
+        try:
+            # Write to temp
+            writer = imageio.get_writer(tmp_path, fps=fps, codec='libx264', output_params=['-pix_fmt', 'yuv420p'])
+            for frame in video_np:
+                writer.append_data(frame)
+            writer.close()
+            # Copy to remote
+            os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+            mox.file.copy(tmp_path, save_path)
+        finally:
+            os.unlink(tmp_path)
+    else:
+        # Local write
+        os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+        writer = imageio.get_writer(save_path, fps=fps, codec='libx264', output_params=['-pix_fmt', 'yuv420p'])
+        for frame in video_np:
+            writer.append_data(frame)
+        writer.close()
 
 
 def resize_video(video_np, target_frames=81, target_height=480, target_width=848, fps=16):
@@ -165,6 +201,7 @@ def main():
     parser = argparse.ArgumentParser(description="Process custom video data to VAE latent LMDB")
     parser.add_argument("--jsonl_path", type=str, required=True, help="Path to JSONL file")
     parser.add_argument("--lmdb_path", type=str, required=True, help="Path to output LMDB")
+    parser.add_argument("--save_video_dir", type=str, default=None, help="Directory to save resized videos (optional)")
     parser.add_argument("--use_moxing", action="store_true", help="Enable moxing for remote file access")
     parser.add_argument("--target_frames", type=int, default=81, help="Target number of frames (default: 81)")
     parser.add_argument("--target_height", type=int, default=480, help="Target height (default: 480)")
@@ -172,6 +209,13 @@ def main():
     parser.add_argument("--device", type=str, default="cuda", help="Device for VAE (default: cuda)")
     parser.add_argument("--deduplicate_prompts", action="store_true", help="Deduplicate prompts (same as create_lmdb_iterative.py)")
     args = parser.parse_args()
+
+    # Prepend OUTPUT_URL environment variable if exists
+    output_url = os.environ.get('OUTPUT_URL', '')
+    if output_url:
+        args.lmdb_path = os.path.join(output_url, args.lmdb_path)
+        if args.save_video_dir:
+            args.save_video_dir = os.path.join(output_url, args.save_video_dir)
 
     # Import moxing if needed
     if args.use_moxing:
@@ -244,6 +288,14 @@ def main():
                 target_width=args.target_width,
                 fps=16
             )
+
+            # Save resized video if save_video_dir is set
+            if args.save_video_dir:
+                # Use safe filename from original video path
+                video_basename = os.path.basename(video_fn)
+                video_name, _ = os.path.splitext(video_basename)
+                save_path = os.path.join(args.save_video_dir, f"{video_name}_{start_idx + idx:08d}.mp4")
+                save_resized_video(resized_np, save_path, fps=16)
 
             # Encode
             latent = encode_video(vae, resized_np, device)
