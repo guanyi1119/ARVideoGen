@@ -41,6 +41,10 @@ import numpy as np
 from tqdm import tqdm
 
 import torch
+# NPU support
+DEVICE_TYPE = os.environ.get('DEVICE_TYPE', 'cuda')
+if DEVICE_TYPE == "npu":
+    from torch_npu.contrib import transfer_to_npu
 import torch.distributed as dist
 import imageio
 import imageio.v3 as iio
@@ -50,10 +54,6 @@ from core.wan_wrapper.wan_wrapper import WanVAEWrapper
 from core.data.lmdb_utils import store_arrays_to_lmdb
 from core.distributed.distributed import launch_distributed_job
 
-# NPU support
-DEVICE_TYPE = os.environ.get('DEVICE_TYPE', 'cuda')
-if DEVICE_TYPE == "npu":
-    from torch_npu.contrib import transfer_to_npu
 
 # Optional moxing import
 mox = None
@@ -205,7 +205,7 @@ def main():
     parser.add_argument("--use_moxing", action="store_true", help="Enable moxing for remote file access")
     parser.add_argument("--target_frames", type=int, default=81, help="Target number of frames (default: 81)")
     parser.add_argument("--target_height", type=int, default=480, help="Target height (default: 480)")
-    parser.add_argument("--target_width", type=int, default=848, help="Target width (default: 848)")
+    parser.add_argument("--target_width", type=int, default=832, help="Target width (default: 832)")
     parser.add_argument("--device", type=str, default="cuda", help="Device for VAE (default: cuda)")
     parser.add_argument("--deduplicate_prompts", action="store_true", help="Deduplicate prompts (same as create_lmdb_iterative.py)")
     args = parser.parse_args()
