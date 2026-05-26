@@ -32,11 +32,13 @@ project_root = os.path.abspath(os.path.join(script_dir, '..'))
 sys.path.insert(0, project_root)
 sys.path.insert(0, os.path.join(project_root, 'methods', 'anyflow'))
 
+import time
 import argparse
 import json
 import tempfile
 from io import BytesIO
 from pathlib import Path
+from datetime import datetime
 import numpy as np
 from tqdm import tqdm
 
@@ -273,6 +275,8 @@ def main():
     vae = WanVAEWrapper().to(device=device, dtype=torch.bfloat16).eval()
 
     # Process local videos
+    start_step = 0
+    start_time = time.time()
     local_latents = []
     local_prompts = []
     for idx, (video_fn, prompt) in enumerate(tqdm(local_data, desc=f"Rank {rank} processing", disable=not is_main)):
@@ -303,6 +307,24 @@ def main():
             # Accumulate - same as process_data_dict: float16, squeeze batch dim
             local_latents.append(latent.numpy().astype(np.float16).squeeze(0))  # (T, C, H, W) float16
             local_prompts.append(prompt)
+
+            end_time = time.time()
+            end_step = idx + 1
+
+            # 计算吞吐量
+            step_diff = end_step - start_step
+            time_diff = end_time - start_time
+            seconds_per_iter = time_diff / step_diff
+            throughput = 1 / seconds_per_iter
+
+            # 打印训练日志，吞吐加在最后
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(
+                f"{timestamp}: [step {idx}] " \
+                f"DI_throughput: {throughput:.2f} samples/s/npu"
+            )
+            start_time = time.time()
+            start_step = end_step
 
         except Exception as e:
             print(f"Rank {rank}: failed to process {video_fn}: {e}")
