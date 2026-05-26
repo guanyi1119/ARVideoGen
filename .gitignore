@@ -1,5 +1,8 @@
 __pycache__/
 
+.vscode/
+.claude/
+
 archive/
 
 methods/anyflow/assets/evaluation/example
