@@ -270,14 +270,16 @@ class Trainer:
             step_diff = end_step - self.start_step
             time_diff = end_time - self.start_time
             seconds_per_iter = time_diff / step_diff
-            throughput = batch_size / seconds_per_iter
+            seq_len = 1560
+            num_heads = 12
+            throughput = seq_len * num_heads * batch_size / seconds_per_iter
 
             # 打印训练日志，吞吐加在最后
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             print(
                 f"{timestamp}: [step {self.step}] " \
                 f"generator_loss: {wandb_loss_dict['generator_loss']:.4f} " \
-                f"DI_throughput: {throughput:.2f} samples/s/npu"
+                f"DI_throughput: {throughput:.2f} tokens/s/npu"
             )
             self.start_time = time.time()
             self.start_step = end_step
