@@ -105,10 +105,10 @@ def get_video_reader(video_path, use_moxing):
         return iio.imread(video_path, plugin='pyav')
 
 
-def save_resized_video(video_np, save_path, fps=16):
+def save_resized_video(video_np, save_path, fps=16, use_moxing=False):
     """Save resized video (T, H, W, 3) as mp4, supports moxing remote paths."""
     # Check if remote path
-    is_remote = save_path.startswith('obs://') or save_path.startswith('s3://')
+    is_remote = use_moxing and (save_path.startswith('obs://') or save_path.startswith('s3://'))
 
     if is_remote and mox is not None:
         # Write to local temp file first, then copy to remote
@@ -121,7 +121,10 @@ def save_resized_video(video_np, save_path, fps=16):
                 writer.append_data(frame)
             writer.close()
             # Copy to remote
-            os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
+            try:
+                mox.file.make_dirs(os.path.dirname(save_path))
+            except Exception:
+                pass  # Directory might already exist
             mox.file.copy(tmp_path, save_path)
         finally:
             os.unlink(tmp_path)
@@ -208,7 +211,11 @@ def save_latent_and_prompt(latent_np, prompt, output_path, use_moxing):
         bio = BytesIO()
         np.savez(bio, latent=latent_np, prompt=prompt)
         bio.seek(0)
-        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+        # Create remote directory
+        try:
+            mox.file.make_dirs(os.path.dirname(output_path))
+        except Exception:
+            pass  # Directory might already exist
         with mox.file.File(output_path, 'wb') as f:
             f.write(bio.read())
     else:
@@ -318,7 +325,7 @@ def main():
                 video_basename = os.path.basename(video_fn)
                 video_name, _ = os.path.splitext(video_basename)
                 save_path = os.path.join(args.save_video_dir, f"{video_name}_{start_idx + idx:08d}.mp4")
-                save_resized_video(resized_np, save_path, fps=16)
+                save_resized_video(resized_np, save_path, 16, args.use_moxing)
 
             # Encode
             latent = encode_video(vae, resized_np, device)
