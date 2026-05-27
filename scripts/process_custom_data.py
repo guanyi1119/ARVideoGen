@@ -1,28 +1,29 @@
 """
-Process custom video data: read JSONL, resize, extract VAE latents, write to LMDB.
+Process custom video data: read JSONL, resize, extract VAE latents, save to directory.
 
 Features:
 1. Read from JSONL (video_fn, long_prompt)
 2. Resize to 81 frames, 480x848
 3. Extract VAE latents using WanVAEWrapper
-4. Write to LMDB
-5. Supports moxing for remote video reading without bulk download
+4. Save latents and prompts to directory (one .npz per video)
+5. Supports moxing for remote paths (obs://)
+6. Optional: save resized videos
 
 Usage:
     # Single GPU (local files)
     python scripts/process_custom_data.py \
         --jsonl_path data.jsonl \
-        --lmdb_path output.lmdb
+        --output_dir processed_data
 
     # Multi-GPU with torchrun
     torchrun --nproc_per_node=8 scripts/process_custom_data.py \
         --jsonl_path data.jsonl \
-        --lmdb_path output.lmdb
+        --output_dir processed_data
 
     # With moxing for remote videos (obs://)
     python scripts/process_custom_data.py \
         --jsonl_path data.jsonl \
-        --lmdb_path output.lmdb \
+        --output_dir obs://bucket/processed_data \
         --use_moxing
 """
 import sys
@@ -53,7 +54,6 @@ import imageio.v3 as iio
 from skimage.transform import resize
 
 from core.wan_wrapper.wan_wrapper import WanVAEWrapper
-from core.data.lmdb_utils import store_arrays_to_lmdb
 from core.distributed.distributed import launch_distributed_job
 
 
@@ -199,10 +199,28 @@ def encode_video(vae, video_np, device):
     return encoded_latents.cpu().detach()  # keep batch dim (1, T, C, H, W), same as .pt files
 
 
+def save_latent_and_prompt(latent_np, prompt, output_path, use_moxing):
+    """Save latent and prompt to .npz file, supports moxing remote paths."""
+    is_remote = use_moxing and (output_path.startswith('obs://') or output_path.startswith('s3://'))
+
+    if is_remote and mox is not None:
+        # Save to BytesIO first, then write to remote
+        bio = BytesIO()
+        np.savez(bio, latent=latent_np, prompt=prompt)
+        bio.seek(0)
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+        with mox.file.File(output_path, 'wb') as f:
+            f.write(bio.read())
+    else:
+        # Local save
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+        np.savez(output_path, latent=latent_np, prompt=prompt)
+
+
 def main():
-    parser = argparse.ArgumentParser(description="Process custom video data to VAE latent LMDB")
+    parser = argparse.ArgumentParser(description="Process custom video data and save latents to directory")
     parser.add_argument("--jsonl_path", type=str, required=True, help="Path to JSONL file")
-    parser.add_argument("--lmdb_path", type=str, required=True, help="Path to output LMDB")
+    parser.add_argument("--output_dir", type=str, required=True, help="Directory to save processed latents")
     parser.add_argument("--save_video_dir", type=str, default=None, help="Directory to save resized videos (optional)")
     parser.add_argument("--use_moxing", action="store_true", help="Enable moxing for remote file access")
     parser.add_argument("--target_frames", type=int, default=81, help="Target number of frames (default: 81)")
@@ -215,7 +233,7 @@ def main():
     # Prepend OUTPUT_URL environment variable if exists
     output_url = os.environ.get('OUTPUT_URL', '')
     if output_url:
-        args.lmdb_path = os.path.join(output_url, args.lmdb_path)
+        args.output_dir = os.path.join(output_url, args.output_dir)
         if args.save_video_dir:
             args.save_video_dir = os.path.join(output_url, args.save_video_dir)
 
@@ -233,7 +251,7 @@ def main():
 
     if is_main:
         print(f"Processing data from: {args.jsonl_path}")
-        print(f"Output LMDB to: {args.lmdb_path}")
+        print(f"Saving latents to: {args.output_dir}")
         print(f"Target size: {args.target_frames} frames, {args.target_height}x{args.target_width}")
 
     # Read all data on main rank
@@ -242,7 +260,7 @@ def main():
         all_data = read_jsonl(args.jsonl_path)
         print(f"Total videos in JSONL: {len(all_data)}")
 
-        # Deduplicate prompts if needed (same as create_lmdb_iterative.py)
+        # Deduplicate prompts if needed
         if args.deduplicate_prompts:
             seen_prompts = set()
             deduplicated = []
@@ -274,151 +292,72 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     vae = WanVAEWrapper().to(device=device, dtype=torch.bfloat16).eval()
 
-    # Create temporary directory for this rank
-    temp_dir = tempfile.mkdtemp(prefix=f"process_custom_data_rank{rank}_")
-    local_temp_files = []
+    # Process local videos
+    start_step = 0
+    start_time = time.time()
+    seq_len = 1560
+    num_heads = 12
     local_success_count = 0
 
-    try:
-        # Process local videos and save to temporary files
-        start_step = 0
-        start_time = time.time()
-        seq_len = 1560
-        num_heads = 12
-        for idx, (video_fn, prompt) in enumerate(tqdm(local_data, desc=f"Rank {rank} processing", disable=not is_main)):
-            try:
-                # Read video
-                video_np = get_video_reader(video_fn, args.use_moxing)
-
-                # Resize
-                resized_np = resize_video(
-                    video_np,
-                    target_frames=args.target_frames,
-                    target_height=args.target_height,
-                    target_width=args.target_width,
-                    fps=16
-                )
-
-                # Save resized video if save_video_dir is set
-                if args.save_video_dir:
-                    # Use safe filename from original video path
-                    video_basename = os.path.basename(video_fn)
-                    video_name, _ = os.path.splitext(video_basename)
-                    save_path = os.path.join(args.save_video_dir, f"{video_name}_{start_idx + idx:08d}.mp4")
-                    save_resized_video(resized_np, save_path, fps=16)
-
-                # Encode
-                latent = encode_video(vae, resized_np, device)
-
-                # Save to temporary file - same format as accumulate: float16, squeeze batch dim
-                latent_np = latent.numpy().astype(np.float16).squeeze(0)  # (T, C, H, W) float16
-                temp_file = os.path.join(temp_dir, f"latent_{start_idx + idx:08d}.npz")
-                np.savez(temp_file, latent=latent_np, prompt=prompt)
-                local_temp_files.append(temp_file)
-                local_success_count += 1
-
-                end_time = time.time()
-                end_step = idx + 1
-
-                # 计算吞吐量
-                step_diff = end_step - start_step
-                time_diff = end_time - start_time
-                seconds_per_iter = time_diff / step_diff if step_diff > 0 else 0
-                throughput = 1 * seq_len * num_heads / seconds_per_iter if seconds_per_iter > 0 else 0
-
-                # 打印训练日志，吞吐加在最后
-                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                print(
-                    f"{timestamp}: [step {idx}] " \
-                    f"DI_throughput: {throughput:.2f} tokens/s/npu"
-                )
-                start_time = time.time()
-                start_step = end_step
-
-            except Exception as e:
-                print(f"Rank {rank}: failed to process {video_fn}: {e}")
-                continue
-
-        # Gather temporary file lists on main rank
-        if dist.is_initialized():
-            gathered_temp_files = [None for _ in range(world_size)]
-            dist.gather_object(local_temp_files, gathered_temp_files if is_main else None, dst=0)
-        else:
-            gathered_temp_files = [local_temp_files]
-
-        # Write LMDB on main rank by reading temporary files
-        if is_main:
-            # Flatten temp file list
-            all_temp_files = []
-            for file_list in gathered_temp_files:
-                all_temp_files.extend(file_list)
-
-            if not all_temp_files:
-                print("No videos processed successfully!")
-                return
-
-            # Create LMDB first
-            os.makedirs(os.path.dirname(args.lmdb_path) or '.', exist_ok=True)
-            # Estimate map size: 1TB as safety
-            map_size = 1024 ** 4
-
-            import lmdb
-            env = lmdb.open(args.lmdb_path, map_size=map_size)
-
-            # Read and write one by one
-            all_latents_for_shape = []
-            all_prompts_for_shape = []
-            counter = 0
-
-            for temp_file in tqdm(all_temp_files, desc="Writing LMDB"):
-                data = np.load(temp_file, allow_pickle=True)
-                latent = data['latent']
-                prompt = str(data['prompt'])
-
-                # Keep first one for shape info
-                if counter == 0:
-                    all_latents_for_shape.append(latent)
-                    all_prompts_for_shape.append(prompt)
-
-                # Write single entry using store_arrays_to_lmdb with start_index
-                data_dict = {
-                    'latents': np.expand_dims(latent, axis=0),  # (1, T, C, H, W)
-                    'prompts': np.array([prompt], dtype=object)
-                }
-                store_arrays_to_lmdb(env, data_dict, start_index=counter)
-                counter += 1
-
-            # Write shape information
-            with env.begin(write=True) as txn:
-                # Use first entry to determine shape, set count to counter
-                latents_sample = np.stack(all_latents_for_shape, axis=0)
-                prompts_sample = np.array(all_prompts_for_shape, dtype=object)
-
-                for key, val in [('latents', latents_sample), ('prompts', prompts_sample)]:
-                    array_shape = np.array(val.shape)
-                    array_shape[0] = counter  # total count
-                    shape_key = f"{key}_shape".encode()
-                    shape_str = " ".join(map(str, array_shape))
-                    txn.put(shape_key, shape_str.encode())
-                    print(f"Wrote {key}: shape {array_shape}")
-
-            env.close()
-            print(f"Done! Successfully wrote {counter} videos to LMDB: {args.lmdb_path}")
-
-    finally:
-        # Clean up temporary files
+    for idx, (video_fn, prompt) in enumerate(tqdm(local_data, desc=f"Rank {rank} processing", disable=not is_main)):
         try:
-            for temp_file in local_temp_files:
-                if os.path.exists(temp_file):
-                    os.unlink(temp_file)
-            if os.path.exists(temp_dir):
-                os.rmdir(temp_dir)
-        except Exception as e:
-            print(f"Rank {rank}: warning - failed to clean up temp files: {e}")
+            # Read video
+            video_np = get_video_reader(video_fn, args.use_moxing)
 
-    # Barrier for clean exit
+            # Resize
+            resized_np = resize_video(
+                video_np,
+                target_frames=args.target_frames,
+                target_height=args.target_height,
+                target_width=args.target_width,
+                fps=16
+            )
+
+            # Save resized video if save_video_dir is set
+            if args.save_video_dir:
+                video_basename = os.path.basename(video_fn)
+                video_name, _ = os.path.splitext(video_basename)
+                save_path = os.path.join(args.save_video_dir, f"{video_name}_{start_idx + idx:08d}.mp4")
+                save_resized_video(resized_np, save_path, fps=16)
+
+            # Encode
+            latent = encode_video(vae, resized_np, device)
+
+            # Save to output directory
+            latent_np = latent.numpy().astype(np.float16).squeeze(0)  # (T, C, H, W) float16
+            output_path = os.path.join(args.output_dir, f"latent_{start_idx + idx:08d}.npz")
+            save_latent_and_prompt(latent_np, prompt, output_path, args.use_moxing)
+
+            local_success_count += 1
+
+            end_time = time.time()
+            end_step = idx + 1
+
+            # Calculate throughput
+            step_diff = end_step - start_step
+            time_diff = end_time - start_time
+            seconds_per_iter = time_diff / step_diff if step_diff > 0 else 0
+            throughput = 1 * seq_len * num_heads / seconds_per_iter if seconds_per_iter > 0 else 0
+
+            # Print log
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(
+                f"{timestamp}: [step {idx}] " \
+                f"DI_throughput: {throughput:.2f} tokens/s/npu"
+            )
+            start_time = time.time()
+            start_step = end_step
+
+        except Exception as e:
+            print(f"Rank {rank}: failed to process {video_fn}: {e}")
+            continue
+
+    # Wait for all ranks to finish
     if dist.is_initialized():
         dist.barrier()
+
+    if is_main:
+        print(f"Done! Successfully processed videos. Latents saved to: {args.output_dir}")
 
 
 if __name__ == "__main__":
