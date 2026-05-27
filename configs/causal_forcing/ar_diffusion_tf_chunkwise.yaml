@@ -44,6 +44,6 @@ num_frame_per_block: 3
 load_raw_video: false
 model_kwargs:
   timestep_shift: 5.0
-data_path: /cache/mixkit_latents_lmdb 
+data_path: /cache/clean_latents_lmdb 
 teacher_forcing: true # TF/DF
 gc_interval: 1

@@ -11,7 +11,8 @@ export HCCL_DATA_PARALLEL_OPTIMIZE=TRUE
 export TASK_QUEUE_ENABLE=1
 
 # python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/data/CausalForcingData/clean_data', '/cache/clean_data')"
-python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/data/mixkit/mixkit_latents_lmdb', '/cache/mixkit_latents_lmdb')"
+# python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/data/mixkit/mixkit_latents_lmdb', '/cache/mixkit_latents_lmdb')"
+python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/data/custom_30m_to_6k/lmdb', '/cache/clean_latents_lmdb')"
 python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/models/wan_models/Wan2.1-T2V-1.3B', '/cache/wan_models/Wan2.1-T2V-1.3B')"
 
 MASTER_ADDR=$(echo $VC_WORKER_HOSTS | cut -d',' -f1)

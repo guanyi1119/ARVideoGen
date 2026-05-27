@@ -31,6 +31,12 @@ from pathlib import Path
 import numpy as np
 from tqdm import tqdm
 
+import torch
+# NPU support
+DEVICE_TYPE = os.environ.get('DEVICE_TYPE', 'cuda')
+if DEVICE_TYPE == "npu":
+    from torch_npu.contrib import transfer_to_npu
+
 from core.data.lmdb_utils import store_arrays_to_lmdb
 
 
