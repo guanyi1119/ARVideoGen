@@ -274,121 +274,147 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     vae = WanVAEWrapper().to(device=device, dtype=torch.bfloat16).eval()
 
-    # Process local videos
-    start_step = 0
-    start_time = time.time()
-    local_latents = []
-    local_prompts = []
-    for idx, (video_fn, prompt) in enumerate(tqdm(local_data, desc=f"Rank {rank} processing", disable=not is_main)):
+    # Create temporary directory for this rank
+    temp_dir = tempfile.mkdtemp(prefix=f"process_custom_data_rank{rank}_")
+    local_temp_files = []
+    local_success_count = 0
+
+    try:
+        # Process local videos and save to temporary files
+        start_step = 0
+        start_time = time.time()
+        seq_len = 1560
+        num_heads = 12
+        for idx, (video_fn, prompt) in enumerate(tqdm(local_data, desc=f"Rank {rank} processing", disable=not is_main)):
+            try:
+                # Read video
+                video_np = get_video_reader(video_fn, args.use_moxing)
+
+                # Resize
+                resized_np = resize_video(
+                    video_np,
+                    target_frames=args.target_frames,
+                    target_height=args.target_height,
+                    target_width=args.target_width,
+                    fps=16
+                )
+
+                # Save resized video if save_video_dir is set
+                if args.save_video_dir:
+                    # Use safe filename from original video path
+                    video_basename = os.path.basename(video_fn)
+                    video_name, _ = os.path.splitext(video_basename)
+                    save_path = os.path.join(args.save_video_dir, f"{video_name}_{start_idx + idx:08d}.mp4")
+                    save_resized_video(resized_np, save_path, fps=16)
+
+                # Encode
+                latent = encode_video(vae, resized_np, device)
+
+                # Save to temporary file - same format as accumulate: float16, squeeze batch dim
+                latent_np = latent.numpy().astype(np.float16).squeeze(0)  # (T, C, H, W) float16
+                temp_file = os.path.join(temp_dir, f"latent_{start_idx + idx:08d}.npz")
+                np.savez(temp_file, latent=latent_np, prompt=prompt)
+                local_temp_files.append(temp_file)
+                local_success_count += 1
+
+                end_time = time.time()
+                end_step = idx + 1
+
+                # 计算吞吐量
+                step_diff = end_step - start_step
+                time_diff = end_time - start_time
+                seconds_per_iter = time_diff / step_diff if step_diff > 0 else 0
+                throughput = 1 * seq_len * num_heads / seconds_per_iter if seconds_per_iter > 0 else 0
+
+                # 打印训练日志，吞吐加在最后
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                print(
+                    f"{timestamp}: [step {idx}] " \
+                    f"DI_throughput: {throughput:.2f} tokens/s/npu"
+                )
+                start_time = time.time()
+                start_step = end_step
+
+            except Exception as e:
+                print(f"Rank {rank}: failed to process {video_fn}: {e}")
+                continue
+
+        # Gather temporary file lists on main rank
+        if dist.is_initialized():
+            gathered_temp_files = [None for _ in range(world_size)]
+            dist.gather_object(local_temp_files, gathered_temp_files if is_main else None, dst=0)
+        else:
+            gathered_temp_files = [local_temp_files]
+
+        # Write LMDB on main rank by reading temporary files
+        if is_main:
+            # Flatten temp file list
+            all_temp_files = []
+            for file_list in gathered_temp_files:
+                all_temp_files.extend(file_list)
+
+            if not all_temp_files:
+                print("No videos processed successfully!")
+                return
+
+            # Create LMDB first
+            os.makedirs(os.path.dirname(args.lmdb_path) or '.', exist_ok=True)
+            # Estimate map size: 1TB as safety
+            map_size = 1024 ** 4
+
+            import lmdb
+            env = lmdb.open(args.lmdb_path, map_size=map_size)
+
+            # Read and write one by one
+            all_latents_for_shape = []
+            all_prompts_for_shape = []
+            counter = 0
+
+            for temp_file in tqdm(all_temp_files, desc="Writing LMDB"):
+                data = np.load(temp_file, allow_pickle=True)
+                latent = data['latent']
+                prompt = str(data['prompt'])
+
+                # Keep first one for shape info
+                if counter == 0:
+                    all_latents_for_shape.append(latent)
+                    all_prompts_for_shape.append(prompt)
+
+                # Write single entry using store_arrays_to_lmdb with start_index
+                data_dict = {
+                    'latents': np.expand_dims(latent, axis=0),  # (1, T, C, H, W)
+                    'prompts': np.array([prompt], dtype=object)
+                }
+                store_arrays_to_lmdb(env, data_dict, start_index=counter)
+                counter += 1
+
+            # Write shape information
+            with env.begin(write=True) as txn:
+                # Use first entry to determine shape, set count to counter
+                latents_sample = np.stack(all_latents_for_shape, axis=0)
+                prompts_sample = np.array(all_prompts_for_shape, dtype=object)
+
+                for key, val in [('latents', latents_sample), ('prompts', prompts_sample)]:
+                    array_shape = np.array(val.shape)
+                    array_shape[0] = counter  # total count
+                    shape_key = f"{key}_shape".encode()
+                    shape_str = " ".join(map(str, array_shape))
+                    txn.put(shape_key, shape_str.encode())
+                    print(f"Wrote {key}: shape {array_shape}")
+
+            env.close()
+            print(f"Done! Successfully wrote {counter} videos to LMDB: {args.lmdb_path}")
+
+    finally:
+        # Clean up temporary files
         try:
-            # Read video
-            video_np = get_video_reader(video_fn, args.use_moxing)
-
-            # Resize
-            resized_np = resize_video(
-                video_np,
-                target_frames=args.target_frames,
-                target_height=args.target_height,
-                target_width=args.target_width,
-                fps=16
-            )
-
-            # Save resized video if save_video_dir is set
-            if args.save_video_dir:
-                # Use safe filename from original video path
-                video_basename = os.path.basename(video_fn)
-                video_name, _ = os.path.splitext(video_basename)
-                save_path = os.path.join(args.save_video_dir, f"{video_name}_{start_idx + idx:08d}.mp4")
-                save_resized_video(resized_np, save_path, fps=16)
-
-            # Encode
-            latent = encode_video(vae, resized_np, device)
-
-            # Accumulate - same as process_data_dict: float16, squeeze batch dim
-            local_latents.append(latent.numpy().astype(np.float16).squeeze(0))  # (T, C, H, W) float16
-            local_prompts.append(prompt)
-
-            end_time = time.time()
-            end_step = idx + 1
-
-            # 计算吞吐量
-            step_diff = end_step - start_step
-            time_diff = end_time - start_time
-            seconds_per_iter = time_diff / step_diff
-            throughput = 1 / seconds_per_iter
-
-            # 打印训练日志，吞吐加在最后
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(
-                f"{timestamp}: [step {idx}] " \
-                f"DI_throughput: {throughput:.2f} samples/s/npu"
-            )
-            start_time = time.time()
-            start_step = end_step
-
+            for temp_file in local_temp_files:
+                if os.path.exists(temp_file):
+                    os.unlink(temp_file)
+            if os.path.exists(temp_dir):
+                os.rmdir(temp_dir)
         except Exception as e:
-            print(f"Rank {rank}: failed to process {video_fn}: {e}")
-            continue
-
-    # Gather all results on main rank
-    if dist.is_initialized():
-        # Gather latents
-        gathered_latents = [None for _ in range(world_size)]
-        dist.gather_object(local_latents, gathered_latents if is_main else None, dst=0)
-
-        # Gather prompts
-        gathered_prompts = [None for _ in range(world_size)]
-        dist.gather_object(local_prompts, gathered_prompts if is_main else None, dst=0)
-    else:
-        gathered_latents = [local_latents]
-        gathered_prompts = [local_prompts]
-
-    # Write LMDB on main rank
-    if is_main:
-        # Flatten
-        all_latents = []
-        all_prompts = []
-        for lat_list in gathered_latents:
-            all_latents.extend(lat_list)
-        for pr_list in gathered_prompts:
-            all_prompts.extend(pr_list)
-
-        if not all_latents:
-            print("No videos processed successfully!")
-            return
-
-        # Stack latents (N, C, T, H, W)
-        latents_np = np.stack(all_latents, axis=0)
-        prompts_np = np.array(all_prompts, dtype=object)
-
-        data_dict = {
-            'latents': latents_np,
-            'prompts': prompts_np
-        }
-
-        # Create LMDB
-        os.makedirs(os.path.dirname(args.lmdb_path) or '.', exist_ok=True)
-        # Set LMDB map size large enough
-        total_size = latents_np.nbytes * 3  # factor of 3 safety
-        map_size = max(total_size, 1024 ** 4)  # at least 1TB
-
-        import lmdb
-        env = lmdb.open(args.lmdb_path, map_size=map_size)
-
-        # Write data
-        store_arrays_to_lmdb(env, data_dict, start_index=0)
-
-        # Write shape information
-        with env.begin(write=True) as txn:
-            for key, val in data_dict.items():
-                array_shape = np.array(val.shape)
-                shape_key = f"{key}_shape".encode()
-                shape_str = " ".join(map(str, array_shape))
-                txn.put(shape_key, shape_str.encode())
-                print(f"Wrote {key}: shape {array_shape}")
-
-        env.close()
-        print(f"Done! Successfully wrote {len(all_latents)} videos to LMDB: {args.lmdb_path}")
+            print(f"Rank {rank}: warning - failed to clean up temp files: {e}")
 
     # Barrier for clean exit
     if dist.is_initialized():
