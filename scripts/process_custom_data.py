@@ -240,8 +240,10 @@ def main():
     # Prepend OUTPUT_URL environment variable if exists
     output_url = os.environ.get('OUTPUT_URL', '')
     if output_url:
-        args.output_dir = os.path.join(output_url, args.output_dir)
-        if args.save_video_dir:
+        # Only prepend if path doesn't already start with obs:// or s3://
+        if not (args.output_dir.startswith('obs://') or args.output_dir.startswith('s3://')):
+            args.output_dir = os.path.join(output_url, args.output_dir)
+        if args.save_video_dir and not (args.save_video_dir.startswith('obs://') or args.save_video_dir.startswith('s3://')):
             args.save_video_dir = os.path.join(output_url, args.save_video_dir)
 
     # Import moxing if needed
