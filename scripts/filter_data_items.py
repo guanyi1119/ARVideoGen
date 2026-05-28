@@ -45,7 +45,6 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
 
-import imageio.v3 as iio
 from tqdm import tqdm
 
 # Optional moxing import
@@ -69,26 +68,25 @@ def video_exists(video_path, use_moxing):
 
 def read_video_info(video_path, use_moxing):
     """
-    Read video metadata (num_frames, fps) without decoding all pixel data.
+    Read video metadata (num_frames, fps) without decoding pixel data.
+    Uses PyAV directly for reliable metadata access.
     Returns (num_frames, fps) or None if reading fails.
     """
+    import av
     try:
         if use_moxing and mox is not None and (video_path.startswith('obs://') or video_path.startswith('s3://')):
             with mox.file.File(video_path, 'rb') as f:
                 video_bytes = f.read()
-            video_buffer = BytesIO(video_bytes)
-            reader = iio.imopen(video_buffer, 'r', plugin='pyav')
+            container = av.open(BytesIO(video_bytes))
         else:
-            reader = iio.imopen(video_path, 'r', plugin='pyav')
+            container = av.open(video_path)
 
-        with reader:
-            container = reader._video
+        with container:
             stream = container.streams.video[0]
             num_frames = stream.frames
             fps = float(stream.average_rate)
             return num_frames, fps
-    except Exception as e:
-        print(f"  Warning: failed to read video info from {video_path}: {e}")
+    except Exception:
         return None
 
 
