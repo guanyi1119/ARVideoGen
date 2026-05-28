@@ -110,22 +110,31 @@ def save_data(data, output_path, use_moxing, local_temp_dir=None):
     if is_remote and mox is not None:
         # Save to local temp first, then copy to remote
         if local_temp_dir:
+            # Save directly to local_temp_dir with same filename
             os.makedirs(local_temp_dir, exist_ok=True)
-            fd, tmp_path = tempfile.mkstemp(suffix='.pt', dir=local_temp_dir)
-            os.close(fd)
-        else:
-            fd, tmp_path = tempfile.mkstemp(suffix='.pt')
-            os.close(fd)
-        try:
-            torch.save(data, tmp_path)
+            filename = os.path.basename(output_path)
+            local_path = os.path.join(local_temp_dir, filename)
+            torch.save(data, local_path)
             # Copy to remote
             try:
                 mox.file.make_dirs(os.path.dirname(output_path))
             except Exception:
                 pass  # Directory might already exist
-            mox.file.copy(tmp_path, output_path)
-        finally:
-            os.unlink(tmp_path)
+            mox.file.copy(local_path, output_path)
+        else:
+            # Use random temp file and delete after
+            fd, tmp_path = tempfile.mkstemp(suffix='.pt')
+            os.close(fd)
+            try:
+                torch.save(data, tmp_path)
+                # Copy to remote
+                try:
+                    mox.file.make_dirs(os.path.dirname(output_path))
+                except Exception:
+                    pass  # Directory might already exist
+                mox.file.copy(tmp_path, output_path)
+            finally:
+                os.unlink(tmp_path)
     else:
         # Local save
         torch.save(data, output_path)
