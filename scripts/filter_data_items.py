@@ -7,6 +7,7 @@ Features:
 3. Check video frame count and fps fall within acceptable ranges
 4. Write passing lines to a new JSONL file
 5. Multi-threaded video reading for faster filtering
+6. Optional sharding: flush to a new file every N passed items
 
 Usage:
     # Local files
@@ -31,6 +32,13 @@ Usage:
         --fps_min 24 \
         --fps_max 28 \
         --num_workers 8
+
+    # Shard output: flush every 1000 passed items into separate files
+    python scripts/filter_data_items.py \
+        --input_jsonl data.jsonl \
+        --output_jsonl filtered.jsonl \
+        --video_root /path/to/videos \
+        --max_per_file 1000
 """
 import sys
 import os
@@ -40,6 +48,7 @@ sys.path.insert(0, project_root)
 
 import argparse
 import json
+import tempfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
@@ -158,6 +167,36 @@ def filter_one(line, args):
     return line, REASON_PASS
 
 
+def write_jsonl_lines(lines, output_path, is_remote):
+    """Write a list of JSONL strings to a file, supports moxing remote paths."""
+    if is_remote and mox is not None:
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False, encoding='utf-8') as tmp:
+            tmp_path = tmp.name
+            for line in lines:
+                tmp.write(line + '\n')
+        try:
+            try:
+                mox.file.make_dirs(os.path.dirname(output_path))
+            except Exception:
+                pass
+            mox.file.copy(tmp_path, output_path)
+        finally:
+            os.unlink(tmp_path)
+    else:
+        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
+        with open(output_path, 'w', encoding='utf-8') as f:
+            for line in lines:
+                f.write(line + '\n')
+
+
+def get_shard_path(base_path, shard_idx, total_shards):
+    """Get output path for a shard. If only 1 shard, use base_path directly."""
+    if total_shards == 1:
+        return base_path
+    root, ext = os.path.splitext(base_path)
+    return f"{root}_shard_{shard_idx}{ext}"
+
+
 def main():
     parser = argparse.ArgumentParser(description="Filter JSONL data items by video properties")
     parser.add_argument("--input_jsonl", type=str, required=True, help="Input JSONL file path")
@@ -169,6 +208,7 @@ def main():
     parser.add_argument("--fps_max", type=float, default=28.0, help="Maximum acceptable fps (default: 28)")
     parser.add_argument("--aspect_tolerance", type=float, default=0.02, help="Relative tolerance for 16:9 check (default: 0.02)")
     parser.add_argument("--max_duration", type=float, default=0, help="Maximum video duration in seconds (0 = no limit, default: 0)")
+    parser.add_argument("--max_per_file", type=int, default=0, help="Max passed items per output file; flush to a new shard when reached (0 = single file, default: 0)")
     parser.add_argument("--num_workers", type=int, default=1, help="Number of worker threads for parallel video reading (default: 1)")
     parser.add_argument("--use_moxing", action="store_true", help="Enable moxing for remote file access")
     args = parser.parse_args()
@@ -196,13 +236,30 @@ def main():
 
     # Ensure output directory exists
     is_output_remote = args.use_moxing and (args.output_jsonl.startswith('obs://') or args.output_jsonl.startswith('s3://'))
-    if not is_output_remote:
-        os.makedirs(os.path.dirname(args.output_jsonl) or '.', exist_ok=True)
 
     # Filter with thread pool
     num_workers = max(1, args.num_workers)
-    passed = []
+    max_per_file = max(0, args.max_per_file)
+
+    # Accumulate passed items; flush to file when batch reaches max_per_file
+    batch = []
+    shard_idx = 0
+    total_passed = 0
+    shard_counts = []
     stats = Counter()
+
+    def flush_batch():
+        """Write current batch to a shard file and reset."""
+        nonlocal batch, shard_idx, total_passed
+        if not batch:
+            return
+        shard_path = get_shard_path(args.output_jsonl, shard_idx, -1 if max_per_file > 0 else 1)
+        write_jsonl_lines(batch, shard_path, is_output_remote)
+        print(f"  Flushed shard {shard_idx}: {len(batch)} items -> {shard_path}")
+        shard_counts.append(len(batch))
+        total_passed += len(batch)
+        batch = []
+        shard_idx += 1
 
     if num_workers == 1:
         # Sequential path (no threading overhead)
@@ -211,50 +268,38 @@ def main():
             line_out, reason = filter_one(line, args)
             stats[reason] += 1
             if reason == REASON_PASS:
-                passed.append(line_out)
-            pbar.set_postfix(passed=len(passed))
+                batch.append(line_out)
+                if max_per_file > 0 and len(batch) >= max_per_file:
+                    flush_batch()
+            pbar.set_postfix(passed=total_passed + len(batch))
     else:
         # Parallel path
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = {executor.submit(filter_one, line, args): i for i, line in enumerate(lines)}
-            # Collect results in submission order for deterministic output
             results = [None] * len(lines)
             pbar = tqdm(total=len(lines), desc=f"Filtering ({num_workers} workers)")
             for future in as_completed(futures):
                 idx = futures[future]
                 results[idx] = future.result()
-                stats_tmp = sum(1 for r in results if r is not None and r[1] == REASON_PASS)
                 pbar.update(1)
-                pbar.set_postfix(passed=stats_tmp)
+                # Approximate count for display (some results may not be counted yet)
+                passed_so_far = sum(1 for r in results if r is not None and r[1] == REASON_PASS)
+                pbar.set_postfix(passed=passed_so_far)
             pbar.close()
 
             for line_out, reason in results:
                 stats[reason] += 1
                 if reason == REASON_PASS:
-                    passed.append(line_out)
+                    batch.append(line_out)
+                    if max_per_file > 0 and len(batch) >= max_per_file:
+                        flush_batch()
 
-    # Write output JSONL
-    if is_output_remote:
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.jsonl', delete=False, encoding='utf-8') as tmp:
-            tmp_path = tmp.name
-            for line in passed:
-                tmp.write(line + '\n')
-        try:
-            try:
-                mox.file.make_dirs(os.path.dirname(args.output_jsonl))
-            except Exception:
-                pass
-            mox.file.copy(tmp_path, args.output_jsonl)
-        finally:
-            os.unlink(tmp_path)
-    else:
-        with open(args.output_jsonl, 'w', encoding='utf-8') as f:
-            for line in passed:
-                f.write(line + '\n')
+    # Flush remaining items
+    flush_batch()
 
     # Print summary
     total = len(lines)
+    num_shards = len(shard_counts)
     print(f"\nFiltering summary:")
     print(f"  Total input items:    {total}")
     print(f"  Missing width/height: {stats[REASON_NO_WIDTH_HEIGHT]}")
@@ -266,8 +311,11 @@ def main():
     if args.max_duration > 0:
         print(f"  Duration > {args.max_duration}s:       {stats[REASON_DURATION_TOO_LONG]}")
     print(f"  Video read error:     {stats[REASON_READ_ERROR]}")
-    print(f"  Passed:               {len(passed)}")
-    print(f"\nOutput written to: {args.output_jsonl}")
+    print(f"  Passed:               {total_passed}")
+    if num_shards > 1:
+        print(f"  Shards:               {num_shards} ({shard_counts})")
+    else:
+        print(f"  Output:               {args.output_jsonl}")
 
 
 if __name__ == "__main__":
