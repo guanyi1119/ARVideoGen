@@ -5,6 +5,7 @@ Features:
 1. Read all .npz files from directory (supports moxing/obs://)
 2. Write latents and prompts to LMDB
 3. Compatible with MultiODERegressionLMDBDataset
+4. Optional sharding into multiple LMDB files
 
 Usage:
     # Local files
@@ -17,6 +18,12 @@ Usage:
         --input_dir obs://bucket/processed_data \
         --lmdb_path obs://bucket/output.lmdb \
         --use_moxing
+
+    # Shard into multiple LMDB files
+    python scripts/create_lmdb_custom_data.py \
+        --input_dir processed_data \
+        --lmdb_path output.lmdb \
+        --num_shards 4
 """
 import sys
 import os
@@ -25,6 +32,7 @@ project_root = os.path.abspath(os.path.join(script_dir, '..'))
 sys.path.insert(0, project_root)
 
 import argparse
+import shutil
 import tempfile
 from io import BytesIO
 from pathlib import Path
@@ -93,6 +101,7 @@ def main():
     parser.add_argument("--input_dir", type=str, required=True, help="Directory with .npz latent files")
     parser.add_argument("--lmdb_path", type=str, required=True, help="Path to output LMDB")
     parser.add_argument("--use_moxing", action="store_true", help="Enable moxing for remote file access")
+    parser.add_argument("--num_shards", type=int, default=1, help="Number of LMDB shards to split data into (default: 1, no sharding)")
     args = parser.parse_args()
 
     # Import moxing if needed
@@ -112,94 +121,123 @@ def main():
 
     print(f"Found {len(npz_files)} latent files")
 
+    num_shards = max(1, args.num_shards)
+    if num_shards > 1:
+        print(f"Sharding into {num_shards} LMDB files")
+
     # Check if LMDB path is remote
     is_lmdb_remote = args.use_moxing and (args.lmdb_path.startswith('obs://') or args.lmdb_path.startswith('s3://'))
 
-    # Determine actual LMDB path (local temp if remote)
-    if is_lmdb_remote:
-        # Create local temp LMDB first
-        temp_dir = tempfile.mkdtemp(prefix="create_lmdb_")
-        local_lmdb_path = os.path.join(temp_dir, "lmdb_temp")
-        print(f"Creating local temp LMDB first: {local_lmdb_path}")
-    else:
-        local_lmdb_path = args.lmdb_path
-
-    # Create LMDB
-    os.makedirs(os.path.dirname(local_lmdb_path) or '.', exist_ok=True)
-
-    # Set map size: 1TB as safety
+    # Build per-shard state
     import lmdb
     map_size = 1024 ** 4
-    env = lmdb.open(local_lmdb_path, map_size=map_size)
+    shards = []
 
-    # Keep first sample for shape info
-    first_latent = None
-    first_prompt = None
-    counter = 0
+    for shard_idx in range(num_shards):
+        if num_shards == 1:
+            shard_lmdb_path = args.lmdb_path
+        else:
+            shard_lmdb_path = f"{args.lmdb_path}_shard_{shard_idx}"
 
-    # Process each file
-    for file_path in tqdm(npz_files, desc="Writing LMDB"):
+        if is_lmdb_remote:
+            temp_dir = tempfile.mkdtemp(prefix=f"create_lmdb_shard{shard_idx}_")
+            local_lmdb_path = os.path.join(temp_dir, "lmdb_temp")
+        else:
+            local_lmdb_path = shard_lmdb_path
+            temp_dir = None
+
+        os.makedirs(os.path.dirname(local_lmdb_path) or '.', exist_ok=True)
+        env = lmdb.open(local_lmdb_path, map_size=map_size)
+
+        shards.append({
+            'lmdb_path': shard_lmdb_path,
+            'local_lmdb_path': local_lmdb_path,
+            'env': env,
+            'counter': 0,
+            'first_latent': None,
+            'first_prompt': None,
+            'temp_dir': temp_dir,
+        })
+
+    # Process each file, round-robin into shards
+    for file_idx, file_path in enumerate(tqdm(npz_files, desc="Writing LMDB")):
+        shard_idx = file_idx % num_shards
+        shard = shards[shard_idx]
         try:
             latent, prompt = load_latent_and_prompt(file_path, args.use_moxing)
 
-            # Keep first sample
-            if counter == 0:
-                first_latent = latent
-                first_prompt = prompt
+            # Keep first sample for shape info
+            if shard['counter'] == 0:
+                shard['first_latent'] = latent
+                shard['first_prompt'] = prompt
 
             # Write single entry
             data_dict = {
                 'latents': np.expand_dims(latent, axis=0),  # (1, T, C, H, W)
                 'prompts': np.array([prompt], dtype=object)
             }
-            store_arrays_to_lmdb(env, data_dict, start_index=counter)
-            counter += 1
+            store_arrays_to_lmdb(shard['env'], data_dict, start_index=shard['counter'])
+            shard['counter'] += 1
 
         except Exception as e:
             print(f"Failed to process {file_path}: {e}")
             continue
 
-    if counter == 0:
-        print("No files processed successfully!")
-        env.close()
-        return
+    # Finalize each shard
+    total_written = 0
+    for shard_idx, shard in enumerate(shards):
+        counter = shard['counter']
+        total_written += counter
 
-    # Write shape information
-    print("Writing shape info...")
-    with env.begin(write=True) as txn:
-        # Use first entry to determine shape, set count to counter
-        latents_sample = np.expand_dims(first_latent, axis=0)
-        prompts_sample = np.array([first_prompt], dtype=object)
+        if counter == 0:
+            shard['env'].close()
+            if shard['temp_dir'] is not None:
+                shutil.rmtree(shard['temp_dir'])
+            if num_shards > 1:
+                print(f"Shard {shard_idx}: no files processed, skipped")
+            continue
 
-        for key, val in [('latents', latents_sample), ('prompts', prompts_sample)]:
-            array_shape = np.array(val.shape)
-            array_shape[0] = counter  # total count
-            shape_key = f"{key}_shape".encode()
-            shape_str = " ".join(map(str, array_shape))
-            txn.put(shape_key, shape_str.encode())
-            print(f"Wrote {key}: shape {array_shape}")
+        # Write shape information
+        if num_shards > 1:
+            print(f"Writing shape info for shard {shard_idx}...")
+        else:
+            print("Writing shape info...")
+        with shard['env'].begin(write=True) as txn:
+            latents_sample = np.expand_dims(shard['first_latent'], axis=0)
+            prompts_sample = np.array([shard['first_prompt']], dtype=object)
 
-    env.close()
+            for key, val in [('latents', latents_sample), ('prompts', prompts_sample)]:
+                array_shape = np.array(val.shape)
+                array_shape[0] = counter  # total count in this shard
+                shape_key = f"{key}_shape".encode()
+                shape_str = " ".join(map(str, array_shape))
+                txn.put(shape_key, shape_str.encode())
+                print(f"  {key}: shape {array_shape}")
 
-    # If LMDB path is remote, copy local temp LMDB to remote
-    if is_lmdb_remote:
-        print(f"Copying local LMDB to remote: {args.lmdb_path}")
-        # Make sure remote directory exists
-        try:
-            mox.file.make_dirs(os.path.dirname(args.lmdb_path))
-        except Exception:
-            pass
-        # Copy all files in LMDB directory
-        local_lmdb_dir = Path(local_lmdb_path)
-        for f in local_lmdb_dir.iterdir():
-            if f.is_file():
-                remote_path = os.path.join(args.lmdb_path, f.name)
-                mox.file.copy(str(f), remote_path)
-        # Clean up local temp files
-        import shutil
-        shutil.rmtree(temp_dir)
+        shard['env'].close()
 
-    print(f"Done! Successfully wrote {counter} videos to LMDB: {args.lmdb_path}")
+        # If LMDB path is remote, copy local temp LMDB to remote
+        if is_lmdb_remote:
+            remote_shard_path = shard['lmdb_path']
+            print(f"Copying local LMDB to remote: {remote_shard_path}")
+            try:
+                mox.file.make_dirs(os.path.dirname(remote_shard_path))
+            except Exception:
+                pass
+            local_lmdb_dir = Path(shard['local_lmdb_path'])
+            for f in local_lmdb_dir.iterdir():
+                if f.is_file():
+                    remote_path = os.path.join(remote_shard_path, f.name)
+                    mox.file.copy(str(f), remote_path)
+            if shard['temp_dir'] is not None:
+                shutil.rmtree(shard['temp_dir'])
+
+    # Summary
+    if num_shards > 1:
+        per_shard = [s['counter'] for s in shards]
+        print(f"Done! Wrote {total_written} videos across {num_shards} shards: {per_shard}")
+    else:
+        print(f"Done! Successfully wrote {total_written} videos to LMDB: {args.lmdb_path}")
 
 
 if __name__ == "__main__":

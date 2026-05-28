@@ -57,6 +57,9 @@ from core.wan_wrapper.wan_wrapper import WanVAEWrapper
 from core.distributed.distributed import launch_distributed_job
 
 
+VIDEO_FN_KEY = 'video_fn'
+PROMPT_KEY = 'Qwen3VL_32B_General_Caption_Level_2'
+
 # Optional moxing import
 mox = None
 def try_import_moxing():
@@ -69,7 +72,7 @@ def try_import_moxing():
 
 
 def read_jsonl(jsonl_path):
-    """Read JSONL file and return list of (video_fn, long_prompt)."""
+    """Read JSONL file and return list of (VIDEO_FN_KEY, PROMPT_KEY)."""
     data = []
     open_fn = open
     if mox is not None and (jsonl_path.startswith('obs://') or jsonl_path.startswith('s3://')):
@@ -80,8 +83,8 @@ def read_jsonl(jsonl_path):
             if not line:
                 continue
             item = json.loads(line)
-            video_fn = item.get('video_fn', '')
-            prompt = item.get('long_prompt', '')
+            video_fn = item.get(VIDEO_FN_KEY, '')
+            prompt = item.get(PROMPT_KEY, '')
             if video_fn and prompt:
                 data.append((video_fn, prompt))
     return data
