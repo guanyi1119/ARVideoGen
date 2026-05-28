@@ -1,6 +1,7 @@
 import argparse
 import math
 import os
+import tempfile
 
 import torch
 DEVICE_TYPE = os.environ.get('DEVICE_TYPE', 'cuda')
@@ -17,6 +18,16 @@ from methods.causal_forcing.ode_generation import (
     CausalODETrajectoryGenerator,
     merge_cfg_prompt_embeds,
 )
+
+# Optional moxing import
+mox = None
+def try_import_moxing():
+    global mox
+    try:
+        import moxing as mox
+        return True
+    except ImportError:
+        return False
 
 
 DEFAULT_NEGATIVE_PROMPT = (
@@ -92,6 +103,34 @@ def prepare_clean_latent(
     return clean_latent.contiguous()
 
 
+def save_data(data, output_path, use_moxing, local_temp_dir=None):
+    """Save data to .pt file, supports moxing remote paths."""
+    is_remote = use_moxing and (output_path.startswith('obs://') or output_path.startswith('s3://'))
+
+    if is_remote and mox is not None:
+        # Save to local temp first, then copy to remote
+        if local_temp_dir:
+            os.makedirs(local_temp_dir, exist_ok=True)
+            fd, tmp_path = tempfile.mkstemp(suffix='.pt', dir=local_temp_dir)
+            os.close(fd)
+        else:
+            fd, tmp_path = tempfile.mkstemp(suffix='.pt')
+            os.close(fd)
+        try:
+            torch.save(data, tmp_path)
+            # Copy to remote
+            try:
+                mox.file.make_dirs(os.path.dirname(output_path))
+            except Exception:
+                pass  # Directory might already exist
+            mox.file.copy(tmp_path, output_path)
+        finally:
+            os.unlink(tmp_path)
+    else:
+        # Local save
+        torch.save(data, output_path)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--local_rank", type=int, default=-1)
@@ -106,6 +145,8 @@ def main():
         default="full",
         choices=["full", "blockwise_kv"],
     )
+    parser.add_argument("--use_moxing", action="store_true", help="Enable moxing for remote file access")
+    parser.add_argument("--local_temp_dir", type=str, default=None, help="Local temp directory for remote save")
 
     args = parser.parse_args()
 
@@ -118,9 +159,15 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
 
+    # Import moxing if needed
+    if args.use_moxing:
+        if not try_import_moxing():
+            print("Warning: moxing not available, falling back to local file access only")
+            args.use_moxing = False
+
     model, encoder, scheduler, unconditional_dict = init_model(
         device=device,
-        num_frame_per_block=args.num_frame_per_block,
+        num_frame_per_block=args.num_frames_per_chunk,
         scheduler_shift=DEFAULT_SCHEDULER_SHIFT,
         num_inference_steps=DEFAULT_NUM_INFERENCE_STEPS,
         negative_prompt=DEFAULT_NEGATIVE_PROMPT,
@@ -137,12 +184,20 @@ def main():
     )
 
     if global_rank == 0:
-        os.makedirs(args.output_folder, exist_ok=True)
+        # Create output directory
+        is_remote = args.use_moxing and (args.output_folder.startswith('obs://') or args.output_folder.startswith('s3://'))
+        if is_remote and mox is not None:
+            try:
+                mox.file.make_dirs(args.output_folder)
+            except Exception:
+                pass
+        else:
+            os.makedirs(args.output_folder, exist_ok=True)
 
     trajectory_generator = CausalODETrajectoryGenerator(
         model=model,
         scheduler=scheduler,
-        num_frame_per_block=args.num_frame_per_block,
+        num_frame_per_block=args.num_frames_per_chunk,
         num_inference_steps=DEFAULT_NUM_INFERENCE_STEPS,
         guidance_scale=args.guidance_scale,
     )
@@ -179,9 +234,11 @@ def main():
             initial_noise=initial_noise,
         )
 
-        torch.save(
+        save_data(
             {prompt: stored_data.cpu().detach()},
             output_path,
+            args.use_moxing,
+            args.local_temp_dir,
         )
 
     dist.barrier()
