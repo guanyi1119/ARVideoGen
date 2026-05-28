@@ -51,6 +51,19 @@ import json
 import tempfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import signal
+import threading
+
+
+class DaemonThreadPoolExecutor(ThreadPoolExecutor):
+    """ThreadPoolExecutor that creates daemon threads for clean Ctrl+C shutdown."""
+
+    def _adjust_thread_count(self):
+        # Temporarily set daemon flag on threads created by the pool
+        super()._adjust_thread_count()
+        for t in threading.enumerate():
+            if t.name.startswith('ThreadPoolExecutor-') and not t.daemon:
+                t.daemon = True
 from io import BytesIO
 from pathlib import Path
 
@@ -274,19 +287,26 @@ def main():
             pbar.set_postfix(passed=total_passed + len(batch))
     else:
         # Parallel path: flush incrementally as results arrive
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            futures = {executor.submit(filter_one, line, args): i for i, line in enumerate(lines)}
-            pbar = tqdm(total=len(lines), desc=f"Filtering ({num_workers} workers)")
-            for future in as_completed(futures):
-                line_out, reason = future.result()
-                stats[reason] += 1
-                if reason == REASON_PASS:
-                    batch.append(line_out)
-                    if max_per_file > 0 and len(batch) >= max_per_file:
-                        flush_batch()
-                pbar.update(1)
-                pbar.set_postfix(passed=total_passed + len(batch))
+        try:
+            with DaemonThreadPoolExecutor(max_workers=num_workers) as executor:
+                futures = {executor.submit(filter_one, line, args): i for i, line in enumerate(lines)}
+                pbar = tqdm(total=len(lines), desc=f"Filtering ({num_workers} workers)")
+                for future in as_completed(futures):
+                    line_out, reason = future.result()
+                    stats[reason] += 1
+                    if reason == REASON_PASS:
+                        batch.append(line_out)
+                        if max_per_file > 0 and len(batch) >= max_per_file:
+                            flush_batch()
+                    pbar.update(1)
+                    pbar.set_postfix(passed=total_passed + len(batch))
+                pbar.close()
+        except KeyboardInterrupt:
             pbar.close()
+            print("\nInterrupted! Flushing collected data...")
+            flush_batch()
+            print(f"Saved {total_passed} items before interrupt.")
+            os._exit(1)
 
     # Flush remaining items
     flush_batch()
