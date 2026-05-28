@@ -3,6 +3,9 @@ import math
 import os
 
 import torch
+DEVICE_TYPE = os.environ.get('DEVICE_TYPE', 'cuda')
+if DEVICE_TYPE == "npu":
+    from torch_npu.contrib import transfer_to_npu
 import torch.distributed as dist
 from tqdm import tqdm
 
