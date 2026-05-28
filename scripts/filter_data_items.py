@@ -6,6 +6,7 @@ Features:
 2. Check video file existence under a configurable root directory (supports moxing)
 3. Check video frame count and fps fall within acceptable ranges
 4. Write passing lines to a new JSONL file
+5. Multi-threaded video reading for faster filtering
 
 Usage:
     # Local files
@@ -21,14 +22,15 @@ Usage:
         --video_root obs://bucket/videos \
         --use_moxing
 
-    # Custom thresholds
+    # Custom thresholds + multi-threaded
     python scripts/filter_data_items.py \
         --input_jsonl data.jsonl \
         --output_jsonl filtered.jsonl \
         --video_root /path/to/videos \
         --min_frames 81 \
         --fps_min 24 \
-        --fps_max 28
+        --fps_max 28 \
+        --num_workers 8
 """
 import sys
 import os
@@ -38,6 +40,8 @@ sys.path.insert(0, project_root)
 
 import argparse
 import json
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
 from pathlib import Path
 
@@ -73,17 +77,14 @@ def read_video_info(video_path, use_moxing):
             with mox.file.File(video_path, 'rb') as f:
                 video_bytes = f.read()
             video_buffer = BytesIO(video_bytes)
-            # Read only metadata via pyav backend
             reader = iio.imopen(video_buffer, 'r', plugin='pyav')
         else:
             reader = iio.imopen(video_path, 'r', plugin='pyav')
 
         with reader:
-            # pyav provides properties on the internal container
             container = reader._video
             stream = container.streams.video[0]
             num_frames = stream.frames
-            # fps may be a Fraction
             fps = float(stream.average_rate)
             return num_frames, fps
     except Exception as e:
@@ -100,6 +101,65 @@ def is_16by9(width, height, tolerance=0.02):
     return abs(ratio - target) / target <= tolerance
 
 
+# Reason constants for filter results
+REASON_PASS = 'pass'
+REASON_NO_WIDTH_HEIGHT = 'no_width_height'
+REASON_HEIGHT_TOO_SMALL = 'height_too_small'
+REASON_NOT_16BY9 = 'not_16by9'
+REASON_FILE_NOT_FOUND = 'file_not_found'
+REASON_TOO_FEW_FRAMES = 'too_few_frames'
+REASON_FPS_OUT_OF_RANGE = 'fps_out_of_range'
+REASON_DURATION_TOO_LONG = 'duration_too_long'
+REASON_READ_ERROR = 'read_error'
+
+
+def filter_one(line, args):
+    """
+    Filter a single JSONL line. Returns (line, reason).
+    reason is REASON_PASS if the item passes, otherwise a failure reason string.
+    """
+    item = json.loads(line)
+    width = item.get('width')
+    height = item.get('height')
+    video_fn = item.get('video_fn', '')
+
+    if width is None or height is None:
+        return line, REASON_NO_WIDTH_HEIGHT
+
+    if height < args.min_height:
+        return line, REASON_HEIGHT_TOO_SMALL
+
+    if not is_16by9(width, height, args.aspect_tolerance):
+        return line, REASON_NOT_16BY9
+
+    if args.video_root:
+        full_video_path = os.path.join(args.video_root, video_fn)
+    else:
+        full_video_path = video_fn
+
+    if not video_exists(full_video_path, args.use_moxing):
+        return line, REASON_FILE_NOT_FOUND
+
+    info = read_video_info(full_video_path, args.use_moxing)
+    if info is None:
+        return line, REASON_READ_ERROR
+
+    num_frames, fps = info
+
+    if num_frames < args.min_frames:
+        return line, REASON_TOO_FEW_FRAMES
+
+    if fps < args.fps_min or fps > args.fps_max:
+        return line, REASON_FPS_OUT_OF_RANGE
+
+    if args.max_duration > 0:
+        duration = num_frames / fps
+        if duration > args.max_duration:
+            return line, REASON_DURATION_TOO_LONG
+
+    return line, REASON_PASS
+
+
 def main():
     parser = argparse.ArgumentParser(description="Filter JSONL data items by video properties")
     parser.add_argument("--input_jsonl", type=str, required=True, help="Input JSONL file path")
@@ -111,6 +171,7 @@ def main():
     parser.add_argument("--fps_max", type=float, default=28.0, help="Maximum acceptable fps (default: 28)")
     parser.add_argument("--aspect_tolerance", type=float, default=0.02, help="Relative tolerance for 16:9 check (default: 0.02)")
     parser.add_argument("--max_duration", type=float, default=0, help="Maximum video duration in seconds (0 = no limit, default: 0)")
+    parser.add_argument("--num_workers", type=int, default=1, help="Number of worker threads for parallel video reading (default: 1)")
     parser.add_argument("--use_moxing", action="store_true", help="Enable moxing for remote file access")
     args = parser.parse_args()
 
@@ -140,78 +201,39 @@ def main():
     if not is_output_remote:
         os.makedirs(os.path.dirname(args.output_jsonl) or '.', exist_ok=True)
 
-    # Filter
+    # Filter with thread pool
+    num_workers = max(1, args.num_workers)
     passed = []
-    stats = {
-        'total': len(lines),
-        'no_width_height': 0,
-        'not_16by9': 0,
-        'height_too_small': 0,
-        'file_not_found': 0,
-        'too_few_frames': 0,
-        'fps_out_of_range': 0,
-        'duration_too_long': 0,
-        'read_error': 0,
-    }
+    stats = Counter()
 
-    for line in tqdm(lines, desc="Filtering"):
-        item = json.loads(line)
-        width = item.get('width')
-        height = item.get('height')
-        video_fn = item.get('video_fn', '')
+    if num_workers == 1:
+        # Sequential path (no threading overhead)
+        pbar = tqdm(lines, desc="Filtering")
+        for line in pbar:
+            line_out, reason = filter_one(line, args)
+            stats[reason] += 1
+            if reason == REASON_PASS:
+                passed.append(line_out)
+            pbar.set_postfix(passed=len(passed))
+    else:
+        # Parallel path
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            futures = {executor.submit(filter_one, line, args): i for i, line in enumerate(lines)}
+            # Collect results in submission order for deterministic output
+            results = [None] * len(lines)
+            pbar = tqdm(total=len(lines), desc=f"Filtering ({num_workers} workers)")
+            for future in as_completed(futures):
+                idx = futures[future]
+                results[idx] = future.result()
+                stats_tmp = sum(1 for r in results if r is not None and r[1] == REASON_PASS)
+                pbar.update(1)
+                pbar.set_postfix(passed=stats_tmp)
+            pbar.close()
 
-        # Check width/height exist
-        if width is None or height is None:
-            stats['no_width_height'] += 1
-            continue
-
-        # Check height >= min_height
-        if height < args.min_height:
-            stats['height_too_small'] += 1
-            continue
-
-        # Check 16:9 aspect ratio
-        if not is_16by9(width, height, args.aspect_tolerance):
-            stats['not_16by9'] += 1
-            continue
-
-        # Resolve full video path
-        if args.video_root:
-            full_video_path = os.path.join(args.video_root, video_fn)
-        else:
-            full_video_path = video_fn
-
-        # Check file existence
-        if not video_exists(full_video_path, args.use_moxing):
-            stats['file_not_found'] += 1
-            continue
-
-        # Read video info (frame count, fps)
-        info = read_video_info(full_video_path, args.use_moxing)
-        if info is None:
-            stats['read_error'] += 1
-            continue
-
-        num_frames, fps = info
-
-        # Check frame count
-        if num_frames < args.min_frames:
-            stats['too_few_frames'] += 1
-            continue
-
-        # Check fps range
-        if fps < args.fps_min or fps > args.fps_max:
-            stats['fps_out_of_range'] += 1
-            continue
-
-        # Check duration
-        if args.max_duration > 0:
-            duration = num_frames / fps
-            if duration > args.max_duration:
-                stats['duration_too_long'] += 1
-                continue
-
-        passed.append(line)
+            for line_out, reason in results:
+                stats[reason] += 1
+                if reason == REASON_PASS:
+                    passed.append(line_out)
 
     # Write output JSONL
     if is_output_remote:
@@ -234,17 +256,18 @@ def main():
                 f.write(line + '\n')
 
     # Print summary
+    total = len(lines)
     print(f"\nFiltering summary:")
-    print(f"  Total input items:    {stats['total']}")
-    print(f"  Missing width/height: {stats['no_width_height']}")
-    print(f"  Not 16:9:             {stats['not_16by9']}")
-    print(f"  Height < {args.min_height}:           {stats['height_too_small']}")
-    print(f"  File not found:       {stats['file_not_found']}")
-    print(f"  Frames < {args.min_frames}:            {stats['too_few_frames']}")
-    print(f"  FPS out of range:     {stats['fps_out_of_range']}")
+    print(f"  Total input items:    {total}")
+    print(f"  Missing width/height: {stats[REASON_NO_WIDTH_HEIGHT]}")
+    print(f"  Not 16:9:             {stats[REASON_NOT_16BY9]}")
+    print(f"  Height < {args.min_height}:           {stats[REASON_HEIGHT_TOO_SMALL]}")
+    print(f"  File not found:       {stats[REASON_FILE_NOT_FOUND]}")
+    print(f"  Frames < {args.min_frames}:            {stats[REASON_TOO_FEW_FRAMES]}")
+    print(f"  FPS out of range:     {stats[REASON_FPS_OUT_OF_RANGE]}")
     if args.max_duration > 0:
-        print(f"  Duration > {args.max_duration}s:       {stats['duration_too_long']}")
-    print(f"  Video read error:     {stats['read_error']}")
+        print(f"  Duration > {args.max_duration}s:       {stats[REASON_DURATION_TOO_LONG]}")
+    print(f"  Video read error:     {stats[REASON_READ_ERROR]}")
     print(f"  Passed:               {len(passed)}")
     print(f"\nOutput written to: {args.output_jsonl}")
 
