@@ -25,7 +25,6 @@ DEFAULT_NEGATIVE_PROMPT = (
     "画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，"
     "杂乱的背景，三条腿，背景人很多，倒着走"
 )
-DEFAULT_NUM_FRAME_PER_BLOCK = 3
 DEFAULT_NUM_INFERENCE_STEPS = 48
 DEFAULT_SCHEDULER_SHIFT = 5.0
 DEFAULT_TARGET_NUM_FRAMES = 21
@@ -89,7 +88,7 @@ def prepare_clean_latent(
             f"{clean_latent.shape[1]} < {target_num_frames}"
         )
     if clean_latent.shape[1] != target_num_frames:
-        clean_latent = clean_latent[:, :target_num_frames].contiguous()
+        clean_latent = clean_latent[:, :target_num_frames, ...]
     return clean_latent.contiguous()
 
 
@@ -99,6 +98,7 @@ def main():
     parser.add_argument("--output_folder", type=str, required=True)
     parser.add_argument("--rawdata_path", type=str, required=True)
     parser.add_argument("--generator_ckpt", type=str, required=True)
+    parser.add_argument("--num_frames_per_chunk", type=int, required=True)
     parser.add_argument("--guidance_scale", type=float, default=6.0)
     parser.add_argument(
         "--generation_mode",
@@ -120,7 +120,7 @@ def main():
 
     model, encoder, scheduler, unconditional_dict = init_model(
         device=device,
-        num_frame_per_block=DEFAULT_NUM_FRAME_PER_BLOCK,
+        num_frame_per_block=args.num_frame_per_block,
         scheduler_shift=DEFAULT_SCHEDULER_SHIFT,
         num_inference_steps=DEFAULT_NUM_INFERENCE_STEPS,
         negative_prompt=DEFAULT_NEGATIVE_PROMPT,
@@ -142,7 +142,7 @@ def main():
     trajectory_generator = CausalODETrajectoryGenerator(
         model=model,
         scheduler=scheduler,
-        num_frame_per_block=DEFAULT_NUM_FRAME_PER_BLOCK,
+        num_frame_per_block=args.num_frame_per_block,
         num_inference_steps=DEFAULT_NUM_INFERENCE_STEPS,
         guidance_scale=args.guidance_scale,
     )
