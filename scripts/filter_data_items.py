@@ -273,26 +273,20 @@ def main():
                     flush_batch()
             pbar.set_postfix(passed=total_passed + len(batch))
     else:
-        # Parallel path
+        # Parallel path: flush incrementally as results arrive
         with ThreadPoolExecutor(max_workers=num_workers) as executor:
             futures = {executor.submit(filter_one, line, args): i for i, line in enumerate(lines)}
-            results = [None] * len(lines)
             pbar = tqdm(total=len(lines), desc=f"Filtering ({num_workers} workers)")
             for future in as_completed(futures):
-                idx = futures[future]
-                results[idx] = future.result()
-                pbar.update(1)
-                # Approximate count for display (some results may not be counted yet)
-                passed_so_far = sum(1 for r in results if r is not None and r[1] == REASON_PASS)
-                pbar.set_postfix(passed=passed_so_far)
-            pbar.close()
-
-            for line_out, reason in results:
+                line_out, reason = future.result()
                 stats[reason] += 1
                 if reason == REASON_PASS:
                     batch.append(line_out)
                     if max_per_file > 0 and len(batch) >= max_per_file:
                         flush_batch()
+                pbar.update(1)
+                pbar.set_postfix(passed=total_passed + len(batch))
+            pbar.close()
 
     # Flush remaining items
     flush_batch()
