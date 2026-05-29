@@ -1,30 +1,41 @@
 """
-Process custom video data: read JSONL, resize, extract VAE latents, save to directory.
+Process custom video data: read JSONL(s), resize, extract VAE latents, save to directory.
 
 Features:
-1. Read from JSONL (video_fn, long_prompt)
+1. Read from one or more JSONL files (video_fn, long_prompt)
 2. Resize to 81 frames, 480x848
 3. Extract VAE latents using WanVAEWrapper
 4. Save latents and prompts to directory (one .npz per video)
 5. Supports moxing for remote paths (obs://)
-6. Optional: save resized videos
+6. Optional: save resized videos alongside latents in the same directory
 
 Usage:
-    # Single GPU (local files)
+    # Single GPU, single JSONL
     python scripts/process_custom_data.py \
-        --jsonl_path data.jsonl \
+        --jsonl_paths data.jsonl \
+        --output_dir processed_data
+
+    # Multiple JSONL files
+    python scripts/process_custom_data.py \
+        --jsonl_paths data1.jsonl data2.jsonl data3.jsonl \
         --output_dir processed_data
 
     # Multi-GPU with torchrun
     torchrun --nproc_per_node=8 scripts/process_custom_data.py \
-        --jsonl_path data.jsonl \
+        --jsonl_paths data.jsonl \
         --output_dir processed_data
 
     # With moxing for remote videos (obs://)
     python scripts/process_custom_data.py \
-        --jsonl_path data.jsonl \
+        --jsonl_paths data.jsonl \
         --output_dir obs://bucket/processed_data \
         --use_moxing
+
+    # Also save resized videos in a separate directory
+    python scripts/process_custom_data.py \
+        --jsonl_paths data.jsonl \
+        --output_dir processed_data/latents \
+        --save_video_dir processed_data/videos
 """
 import sys
 import os
@@ -90,6 +101,17 @@ def read_jsonl(jsonl_path):
     return data
 
 
+def read_multiple_jsonl(jsonl_paths):
+    """Read multiple JSONL files and return combined list of (VIDEO_FN_KEY, PROMPT_KEY)."""
+    all_data = []
+    for path in jsonl_paths:
+        print(f"  Reading: {path}")
+        data = read_jsonl(path)
+        print(f"    Found {len(data)} items")
+        all_data.extend(data)
+    return all_data
+
+
 def get_video_reader(video_path, use_moxing):
     """Get a video reader that works with local or remote (moxing) paths."""
     # Prepend VIDEO_DIR environment variable if exists
@@ -98,41 +120,34 @@ def get_video_reader(video_path, use_moxing):
         video_path = os.path.join(video_dir, video_path)
 
     if use_moxing and mox is not None and (video_path.startswith('obs://') or video_path.startswith('s3://')):
-        # Read directly into memory via mox.file.File
         with mox.file.File(video_path, 'rb') as f:
             video_bytes = f.read()
         video_buffer = BytesIO(video_bytes)
         return iio.imread(video_buffer, plugin='pyav')
     else:
-        # Local read
         return iio.imread(video_path, plugin='pyav')
 
 
 def save_resized_video(video_np, save_path, fps=16, use_moxing=False):
     """Save resized video (T, H, W, 3) as mp4, supports moxing remote paths."""
-    # Check if remote path
     is_remote = use_moxing and (save_path.startswith('obs://') or save_path.startswith('s3://'))
 
     if is_remote and mox is not None:
-        # Write to local temp file first, then copy to remote
         with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
             tmp_path = tmp.name
         try:
-            # Write to temp
             writer = imageio.get_writer(tmp_path, fps=fps, codec='libx264', output_params=['-pix_fmt', 'yuv420p'])
             for frame in video_np:
                 writer.append_data(frame)
             writer.close()
-            # Copy to remote
             try:
                 mox.file.make_dirs(os.path.dirname(save_path))
             except Exception:
-                pass  # Directory might already exist
+                pass
             mox.file.copy(tmp_path, save_path)
         finally:
             os.unlink(tmp_path)
     else:
-        # Local write
         os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
         writer = imageio.get_writer(save_path, fps=fps, codec='libx264', output_params=['-pix_fmt', 'yuv420p'])
         for frame in video_np:
@@ -148,18 +163,15 @@ def resize_video(video_np, target_frames=81, target_height=480, target_width=848
     """
     T, H, W, C = video_np.shape
 
-    # Step 1: Temporal crop - take first 5 seconds (81 frames @16fps)
-    max_frames = int(fps * (81 / fps))  # exactly 81 frames
+    max_frames = int(fps * (81 / fps))
     resized_t = video_np[:min(T, max_frames)]
 
-    # Pad with last frame if too short
     if resized_t.shape[0] < max_frames:
         pad_frames = max_frames - resized_t.shape[0]
         last_frame = resized_t[-1:]
         padding = np.tile(last_frame, (pad_frames, 1, 1, 1))
         resized_t = np.concatenate([resized_t, padding], axis=0)
 
-    # Step 2: Spatial resize (height, width) - same as process_mixkit.py
     resized = []
     for frame in resized_t:
         frame_float = frame.astype(float) / 255.0
@@ -180,14 +192,12 @@ def encode_video(vae, video_np, device):
     """
     Encode video using VAE (exact same logic as compute_vae_latent.py).
     Input: (T, H, W, 3) numpy array (uint8)
-    Output: (1, T, C, H/8, W/8) tensor (exact same as compute_vae_latent.py saves)
+    Output: (1, T, C, H/8, W/8) tensor
     """
-    # Normalize to [-1, 1] and reshape - same as compute_vae_latent.py line 93-97
     video_tensor = torch.tensor(video_np, dtype=torch.float32, device=device).unsqueeze(0).permute(0, 4, 1, 2, 3) / 255.0
-    video_tensor = video_tensor * 2 - 1  # [0,1] -> [-1,1]
+    video_tensor = video_tensor * 2 - 1
     video_tensor = video_tensor.to(torch.bfloat16)
 
-    # Encode - same as compute_vae_latent.py line 36-46 encode() function
     def encode_fn(vae_model, videos):
         device, dtype = videos[0].device, videos[0].dtype
         scale = [vae_model.mean.to(device=device, dtype=dtype),
@@ -200,9 +210,9 @@ def encode_video(vae, video_np, device):
         return output
 
     with torch.no_grad():
-        encoded_latents = encode_fn(vae, video_tensor).transpose(2, 1)  # line 98: (1, C, T, H, W) -> (1, T, C, H, W)
+        encoded_latents = encode_fn(vae, video_tensor).transpose(2, 1)
 
-    return encoded_latents.cpu().detach()  # keep batch dim (1, T, C, H, W), same as .pt files
+    return encoded_latents.cpu().detach()
 
 
 def save_latent_and_prompt(latent_np, prompt, output_path, use_moxing):
@@ -210,26 +220,53 @@ def save_latent_and_prompt(latent_np, prompt, output_path, use_moxing):
     is_remote = use_moxing and (output_path.startswith('obs://') or output_path.startswith('s3://'))
 
     if is_remote and mox is not None:
-        # Save to BytesIO first, then write to remote
         bio = BytesIO()
         np.savez(bio, latent=latent_np, prompt=prompt)
         bio.seek(0)
-        # Create remote directory
         try:
             mox.file.make_dirs(os.path.dirname(output_path))
         except Exception:
-            pass  # Directory might already exist
+            pass
         with mox.file.File(output_path, 'wb') as f:
             f.write(bio.read())
     else:
-        # Local save
         os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
         np.savez(output_path, latent=latent_np, prompt=prompt)
 
 
+def find_existing_max_index(output_dir, use_moxing):
+    """Scan output directory for existing latent_XXXXXXXX.npz files and return the max index + 1."""
+    is_remote = use_moxing and (output_dir.startswith('obs://') or output_dir.startswith('s3://'))
+    if is_remote and mox is not None:
+        if not mox.file.exists(output_dir):
+            return 0
+        existing = mox.file.list_directory(output_dir)
+        max_idx = 0
+        for name in existing:
+            if name.startswith('latent_') and name.endswith('.npz'):
+                try:
+                    idx = int(name[7:-4])
+                    max_idx = max(max_idx, idx + 1)
+                except ValueError:
+                    pass
+        return max_idx
+    else:
+        path = Path(output_dir)
+        if not path.exists():
+            return 0
+        max_idx = 0
+        for f in path.glob('latent_*.npz'):
+            try:
+                idx = int(f.stem[7:])  # latent_XXXXXXXX
+                max_idx = max(max_idx, idx + 1)
+            except ValueError:
+                pass
+        return max_idx
+
+
 def main():
     parser = argparse.ArgumentParser(description="Process custom video data and save latents to directory")
-    parser.add_argument("--jsonl_path", type=str, required=True, help="Path to JSONL file")
+    parser.add_argument("--jsonl_paths", type=str, nargs='+', required=True, help="Path(s) to JSONL file(s)")
     parser.add_argument("--output_dir", type=str, required=True, help="Directory to save processed latents")
     parser.add_argument("--save_video_dir", type=str, default=None, help="Directory to save resized videos (optional)")
     parser.add_argument("--use_moxing", action="store_true", help="Enable moxing for remote file access")
@@ -237,17 +274,8 @@ def main():
     parser.add_argument("--target_height", type=int, default=480, help="Target height (default: 480)")
     parser.add_argument("--target_width", type=int, default=832, help="Target width (default: 832)")
     parser.add_argument("--device", type=str, default="cuda", help="Device for VAE (default: cuda)")
-    parser.add_argument("--deduplicate_prompts", action="store_true", help="Deduplicate prompts (same as create_lmdb_iterative.py)")
+    parser.add_argument("--deduplicate_prompts", action="store_true", help="Deduplicate prompts")
     args = parser.parse_args()
-
-    # Prepend OUTPUT_URL environment variable if exists
-    output_url = os.environ.get('OUTPUT_URL', '')
-    if output_url:
-        # Only prepend if path doesn't already start with obs:// or s3://
-        if not (args.output_dir.startswith('obs://') or args.output_dir.startswith('s3://')):
-            args.output_dir = os.path.join(output_url, args.output_dir)
-        if args.save_video_dir and not (args.save_video_dir.startswith('obs://') or args.save_video_dir.startswith('s3://')):
-            args.save_video_dir = os.path.join(output_url, args.save_video_dir)
 
     # Import moxing if needed
     if args.use_moxing:
@@ -262,17 +290,18 @@ def main():
     is_main = rank == 0
 
     if is_main:
-        print(f"Processing data from: {args.jsonl_path}")
-        print(f"Saving latents to: {args.output_dir}")
+        print(f"Processing data from: {args.jsonl_paths}")
+        print(f"Saving to: {args.output_dir}")
+        if args.save_video_dir:
+            print(f"Videos will be saved to: {args.save_video_dir}")
         print(f"Target size: {args.target_frames} frames, {args.target_height}x{args.target_width}")
 
     # Read all data on main rank
     all_data = []
     if is_main:
-        all_data = read_jsonl(args.jsonl_path)
-        print(f"Total videos in JSONL: {len(all_data)}")
+        all_data = read_multiple_jsonl(args.jsonl_paths)
+        print(f"Total videos across all JSONLs: {len(all_data)}")
 
-        # Deduplicate prompts if needed
         if args.deduplicate_prompts:
             seen_prompts = set()
             deduplicated = []
@@ -294,11 +323,17 @@ def main():
 
     # Determine this rank's share of work
     num_total = len(all_data)
-    start_idx = rank * (num_total // world_size) + min(rank, num_total % world_size)
-    end_idx = start_idx + (num_total // world_size) + (1 if rank < num_total % world_size else 0)
-    local_data = all_data[start_idx:end_idx]
+    rank_start = rank * (num_total // world_size) + min(rank, num_total % world_size)
+    rank_end = rank_start + (num_total // world_size) + (1 if rank < num_total % world_size else 0)
+    local_data = all_data[rank_start:rank_end]
 
-    print(f"Rank {rank}: processing videos {start_idx} to {end_idx - 1} ({len(local_data)} videos)")
+    # Find existing files to avoid overwriting (all ranks scan, then take offset by rank)
+    existing_offset = find_existing_max_index(args.output_dir, args.use_moxing)
+    start_idx = existing_offset + rank_start
+
+    if is_main and existing_offset > 0:
+        print(f"Found {existing_offset} existing files, continuing from index {existing_offset}")
+    print(f"Rank {rank}: processing videos (output indices {start_idx} to {start_idx + len(local_data) - 1}, {len(local_data)} videos)")
 
     # Load VAE
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
@@ -325,17 +360,17 @@ def main():
                 fps=16
             )
 
-            # Save resized video if save_video_dir is set
+            # Save resized video if requested
             if args.save_video_dir:
                 video_basename = os.path.basename(video_fn)
                 video_name, _ = os.path.splitext(video_basename)
-                save_path = os.path.join(args.save_video_dir, f"{video_name}_{start_idx + idx:08d}.mp4")
-                save_resized_video(resized_np, save_path, 16, args.use_moxing)
+                video_save_path = os.path.join(args.save_video_dir, f"{video_name}_{start_idx + idx:08d}.mp4")
+                save_resized_video(resized_np, video_save_path, 16, args.use_moxing)
 
             # Encode
             latent = encode_video(vae, resized_np, device)
 
-            # Save to output directory
+            # Save latent to output directory
             latent_np = latent.numpy().astype(np.float16).squeeze(0)  # (T, C, H, W) float16
             output_path = os.path.join(args.output_dir, f"latent_{start_idx + idx:08d}.npz")
             save_latent_and_prompt(latent_np, prompt, output_path, args.use_moxing)
@@ -369,7 +404,7 @@ def main():
         dist.barrier()
 
     if is_main:
-        print(f"Done! Successfully processed videos. Latents saved to: {args.output_dir}")
+        print(f"Done! Successfully processed videos. Output saved to: {args.output_dir}")
 
 
 if __name__ == "__main__":

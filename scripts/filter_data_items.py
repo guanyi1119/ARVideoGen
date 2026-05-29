@@ -48,7 +48,9 @@ sys.path.insert(0, project_root)
 
 import argparse
 import json
+import signal
 import tempfile
+import threading
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from io import BytesIO
@@ -78,31 +80,23 @@ def video_exists(video_path, use_moxing):
 def read_video_info(video_path, use_moxing):
     """
     Read video metadata (num_frames, fps) without decoding pixel data.
-    Uses PyAV directly for reliable metadata access.
+    Uses decord for fast and robust metadata access.
     Returns (num_frames, fps) or None if reading fails.
     """
-    import av
-    container = None
+    import decord
     try:
         if use_moxing and mox is not None and (video_path.startswith('obs://') or video_path.startswith('s3://')):
             with mox.file.File(video_path, 'rb') as f:
                 video_bytes = f.read()
-            container = av.open(BytesIO(video_bytes))
+            vr = decord.VideoReader(BytesIO(video_bytes))
         else:
-            container = av.open(video_path)
+            vr = decord.VideoReader(video_path)
 
-        stream = container.streams.video[0]
-        num_frames = stream.frames
-        fps = float(stream.average_rate)
-        container.close()
-        container = None
+        num_frames = len(vr)
+        fps = float(vr.get_avg_fps())
+        del vr
         return num_frames, fps
     except Exception:
-        if container is not None:
-            try:
-                container.close()
-            except Exception:
-                pass
         return None
 
 
@@ -125,6 +119,7 @@ REASON_TOO_FEW_FRAMES = 'too_few_frames'
 REASON_FPS_OUT_OF_RANGE = 'fps_out_of_range'
 REASON_DURATION_TOO_LONG = 'duration_too_long'
 REASON_READ_ERROR = 'read_error'
+REASON_TIMEOUT = 'timeout'
 
 
 def filter_one(line, args):
@@ -174,6 +169,27 @@ def filter_one(line, args):
     return line, REASON_PASS
 
 
+def filter_one_with_timeout(line, args, timeout_sec):
+    """
+    Filter a single JSONL line with a timeout.
+    If the filter hangs (e.g. av.open on corrupt file), return REASON_TIMEOUT.
+    """
+    result = [None]
+
+    def worker():
+        result[0] = filter_one(line, args)
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    t.join(timeout=timeout_sec)
+
+    if t.is_alive():
+        # Thread is still running — it's stuck, we can't kill it but can move on
+        return line, REASON_TIMEOUT
+
+    return result[0]
+
+
 def write_jsonl_lines(lines, output_path, is_remote):
     """Write a list of JSONL strings to a file, supports moxing remote paths."""
     if is_remote and mox is not None:
@@ -217,6 +233,7 @@ def main():
     parser.add_argument("--max_duration", type=float, default=0, help="Maximum video duration in seconds (0 = no limit, default: 0)")
     parser.add_argument("--max_per_file", type=int, default=0, help="Max passed items per output file; flush to a new shard when reached (0 = single file, default: 0)")
     parser.add_argument("--num_workers", type=int, default=1, help="Number of worker threads for parallel video reading (default: 1)")
+    parser.add_argument("--per_task_timeout", type=int, default=30, help="Timeout in seconds for reading a single video (default: 30)")
     parser.add_argument("--use_moxing", action="store_true", help="Enable moxing for remote file access")
     args = parser.parse_args()
 
@@ -247,6 +264,7 @@ def main():
     # Filter
     num_workers = max(1, args.num_workers)
     max_per_file = max(0, args.max_per_file)
+    per_task_timeout = max(1, args.per_task_timeout)
 
     # Accumulate passed items; flush to file when batch reaches max_per_file
     batch = []
@@ -268,44 +286,51 @@ def main():
         batch = []
         shard_idx += 1
 
+    # SIGINT handler: flush and force exit
+    def sigint_handler(signum, frame):
+        print("\nInterrupted! Flushing collected data...")
+        flush_batch()
+        print(f"Saved {total_passed} items before interrupt.")
+        os._exit(1)
+
+    signal.signal(signal.SIGINT, sigint_handler)
+
     if num_workers == 1:
-        # Sequential path (no threading overhead)
+        # Sequential path
         pbar = tqdm(lines, desc="Filtering")
         for line in pbar:
-            line_out, reason = filter_one(line, args)
+            line_out, reason = filter_one_with_timeout(line, args, per_task_timeout)
             stats[reason] += 1
             if reason == REASON_PASS:
                 batch.append(line_out)
                 if max_per_file > 0 and len(batch) >= max_per_file:
                     flush_batch()
-            pbar.set_postfix(passed=total_passed + len(batch))
+            pbar.set_postfix(passed=total_passed + len(batch), timeout=stats[REASON_TIMEOUT])
     else:
-        # Parallel path: submit in small batches to avoid memory/FD exhaustion
-        batch_size = num_workers * 4  # keep only a few tasks queued per worker
-        try:
-            with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                pbar = tqdm(total=len(lines), desc=f"Filtering ({num_workers} workers)")
-                offset = 0
-                while offset < len(lines):
-                    chunk = lines[offset:offset + batch_size]
-                    futures = [executor.submit(filter_one, line, args) for line in chunk]
-                    for future in as_completed(futures):
-                        line_out, reason = future.result()
-                        stats[reason] += 1
-                        if reason == REASON_PASS:
-                            batch.append(line_out)
-                            if max_per_file > 0 and len(batch) >= max_per_file:
-                                flush_batch()
-                        pbar.update(1)
-                        pbar.set_postfix(passed=total_passed + len(batch))
-                    offset += batch_size
-                pbar.close()
-        except KeyboardInterrupt:
+        # Parallel path: submit in small batches
+        batch_size = num_workers * 4
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            pbar = tqdm(total=len(lines), desc=f"Filtering ({num_workers} workers)")
+            offset = 0
+            while offset < len(lines):
+                chunk = lines[offset:offset + batch_size]
+                # Each future wraps filter_one_with_timeout so individual tasks can't hang
+                futures = [executor.submit(filter_one_with_timeout, line, args, per_task_timeout)
+                           for line in chunk]
+                for future in as_completed(futures, timeout=per_task_timeout * len(chunk)):
+                    try:
+                        line_out, reason = future.result(timeout=per_task_timeout)
+                    except Exception:
+                        line_out, reason = None, REASON_TIMEOUT
+                    stats[reason] += 1
+                    if reason == REASON_PASS:
+                        batch.append(line_out)
+                        if max_per_file > 0 and len(batch) >= max_per_file:
+                            flush_batch()
+                    pbar.update(1)
+                    pbar.set_postfix(passed=total_passed + len(batch), timeout=stats[REASON_TIMEOUT])
+                offset += batch_size
             pbar.close()
-            print("\nInterrupted! Flushing collected data...")
-            flush_batch()
-            print(f"Saved {total_passed} items before interrupt.")
-            os._exit(1)
 
     # Flush remaining items
     flush_batch()
@@ -324,6 +349,8 @@ def main():
     if args.max_duration > 0:
         print(f"  Duration > {args.max_duration}s:       {stats[REASON_DURATION_TOO_LONG]}")
     print(f"  Video read error:     {stats[REASON_READ_ERROR]}")
+    if stats[REASON_TIMEOUT] > 0:
+        print(f"  Timeout:              {stats[REASON_TIMEOUT]}")
     print(f"  Passed:               {total_passed}")
     if num_shards > 1:
         print(f"  Shards:               {num_shards} ({shard_counts})")
