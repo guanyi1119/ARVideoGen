@@ -33,12 +33,12 @@ Usage:
         --fps_max 28 \
         --num_workers 8
 
-    # Shard output: flush every 1000 passed items into separate files
+    # Shard output: flush every 6000 passed items into separate files
     python scripts/filter_data_items.py \
         --input_jsonl data.jsonl \
         --output_jsonl filtered.jsonl \
         --video_root /path/to/videos \
-        --max_per_file 1000
+        --max_per_file 6000
 """
 import sys
 import os
@@ -51,7 +51,6 @@ import json
 import tempfile
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import signal
 from io import BytesIO
 from pathlib import Path
 
@@ -83,6 +82,7 @@ def read_video_info(video_path, use_moxing):
     Returns (num_frames, fps) or None if reading fails.
     """
     import av
+    container = None
     try:
         if use_moxing and mox is not None and (video_path.startswith('obs://') or video_path.startswith('s3://')):
             with mox.file.File(video_path, 'rb') as f:
@@ -91,12 +91,18 @@ def read_video_info(video_path, use_moxing):
         else:
             container = av.open(video_path)
 
-        with container:
-            stream = container.streams.video[0]
-            num_frames = stream.frames
-            fps = float(stream.average_rate)
-            return num_frames, fps
+        stream = container.streams.video[0]
+        num_frames = stream.frames
+        fps = float(stream.average_rate)
+        container.close()
+        container = None
+        return num_frames, fps
     except Exception:
+        if container is not None:
+            try:
+                container.close()
+            except Exception:
+                pass
         return None
 
 
@@ -238,7 +244,7 @@ def main():
     # Ensure output directory exists
     is_output_remote = args.use_moxing and (args.output_jsonl.startswith('obs://') or args.output_jsonl.startswith('s3://'))
 
-    # Filter with thread pool
+    # Filter
     num_workers = max(1, args.num_workers)
     max_per_file = max(0, args.max_per_file)
 
@@ -274,20 +280,25 @@ def main():
                     flush_batch()
             pbar.set_postfix(passed=total_passed + len(batch))
     else:
-        # Parallel path: flush incrementally as results arrive
+        # Parallel path: submit in small batches to avoid memory/FD exhaustion
+        batch_size = num_workers * 4  # keep only a few tasks queued per worker
         try:
             with ThreadPoolExecutor(max_workers=num_workers) as executor:
-                futures = {executor.submit(filter_one, line, args): i for i, line in enumerate(lines)}
                 pbar = tqdm(total=len(lines), desc=f"Filtering ({num_workers} workers)")
-                for future in as_completed(futures):
-                    line_out, reason = future.result()
-                    stats[reason] += 1
-                    if reason == REASON_PASS:
-                        batch.append(line_out)
-                        if max_per_file > 0 and len(batch) >= max_per_file:
-                            flush_batch()
-                    pbar.update(1)
-                    pbar.set_postfix(passed=total_passed + len(batch))
+                offset = 0
+                while offset < len(lines):
+                    chunk = lines[offset:offset + batch_size]
+                    futures = [executor.submit(filter_one, line, args) for line in chunk]
+                    for future in as_completed(futures):
+                        line_out, reason = future.result()
+                        stats[reason] += 1
+                        if reason == REASON_PASS:
+                            batch.append(line_out)
+                            if max_per_file > 0 and len(batch) >= max_per_file:
+                                flush_batch()
+                        pbar.update(1)
+                        pbar.set_postfix(passed=total_passed + len(batch))
+                    offset += batch_size
                 pbar.close()
         except KeyboardInterrupt:
             pbar.close()
