@@ -286,19 +286,34 @@ def main():
         batch = []
         shard_idx += 1
 
-    # SIGINT handler: flush and force exit
+    # Interrupt flag — checked in main loop. SIGINT just sets it and bails.
+    interrupted = threading.Event()
+
     def sigint_handler(signum, frame):
-        print("\nInterrupted! Flushing collected data...")
-        flush_batch()
-        print(f"Saved {total_passed} items before interrupt.")
-        os._exit(1)
+        # Avoid re-entrancy: second Ctrl+C immediately kills the process
+        if interrupted.is_set():
+            print("\n[Force exit]")
+            os._exit(130)
+        interrupted.set()
+        print("\n[Ctrl+C received] Flushing and exiting (Ctrl+C again to force kill)...")
+        try:
+            flush_batch()
+            print(f"Saved {total_passed} items before interrupt.")
+        except Exception as e:
+            print(f"Flush failed: {e}")
+        # Hard exit — don't wait for any thread pool / decord C threads to finish
+        os._exit(130)
 
     signal.signal(signal.SIGINT, sigint_handler)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, sigint_handler)
 
     if num_workers == 1:
         # Sequential path
         pbar = tqdm(lines, desc="Filtering")
         for line in pbar:
+            if interrupted.is_set():
+                break
             line_out, reason = filter_one_with_timeout(line, args, per_task_timeout)
             stats[reason] += 1
             if reason == REASON_PASS:
@@ -306,34 +321,57 @@ def main():
                 if max_per_file > 0 and len(batch) >= max_per_file:
                     flush_batch()
             pbar.set_postfix(passed=total_passed + len(batch), timeout=stats[REASON_TIMEOUT])
+        pbar.close()
     else:
         # Parallel path: submit in small batches
         batch_size = num_workers * 4
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        # Note: we never use `with ThreadPoolExecutor` because its __exit__
+        # calls shutdown(wait=True) which would hang on stuck decord workers.
+        executor = ThreadPoolExecutor(max_workers=num_workers)
+        try:
             pbar = tqdm(total=len(lines), desc=f"Filtering ({num_workers} workers)")
             offset = 0
             while offset < len(lines):
+                if interrupted.is_set():
+                    break
                 chunk = lines[offset:offset + batch_size]
-                # Each future wraps filter_one_with_timeout so individual tasks can't hang
                 futures = [executor.submit(filter_one_with_timeout, line, args, per_task_timeout)
                            for line in chunk]
-                for future in as_completed(futures, timeout=per_task_timeout * len(chunk)):
-                    try:
-                        line_out, reason = future.result(timeout=per_task_timeout)
-                    except Exception:
-                        line_out, reason = None, REASON_TIMEOUT
-                    stats[reason] += 1
-                    if reason == REASON_PASS:
-                        batch.append(line_out)
-                        if max_per_file > 0 and len(batch) >= max_per_file:
-                            flush_batch()
-                    pbar.update(1)
-                    pbar.set_postfix(passed=total_passed + len(batch), timeout=stats[REASON_TIMEOUT])
+                # Use short poll loop so SIGINT can interrupt promptly
+                remaining = set(futures)
+                while remaining and not interrupted.is_set():
+                    done = []
+                    for fut in list(remaining):
+                        if fut.done():
+                            done.append(fut)
+                    if not done:
+                        # Brief sleep so the main thread can respond to signals
+                        if interrupted.wait(timeout=0.1):
+                            break
+                        continue
+                    for fut in done:
+                        remaining.discard(fut)
+                        try:
+                            line_out, reason = fut.result(timeout=0)
+                        except Exception:
+                            line_out, reason = None, REASON_TIMEOUT
+                        stats[reason] += 1
+                        if reason == REASON_PASS:
+                            batch.append(line_out)
+                            if max_per_file > 0 and len(batch) >= max_per_file:
+                                flush_batch()
+                        pbar.update(1)
+                        pbar.set_postfix(passed=total_passed + len(batch), timeout=stats[REASON_TIMEOUT])
                 offset += batch_size
             pbar.close()
+        finally:
+            # Don't wait — if some worker thread is stuck in decord C code,
+            # waiting would hang us. Daemon-ish shutdown.
+            executor.shutdown(wait=False, cancel_futures=True)
 
-    # Flush remaining items
-    flush_batch()
+    # Flush remaining items (skipped if interrupted, handler already flushed)
+    if not interrupted.is_set():
+        flush_batch()
 
     # Print summary
     total = len(lines)
