@@ -33,6 +33,7 @@ parser.add_argument("--num_output_frames", type=int, default=21)
 parser.add_argument("--use_ema", action="store_true")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--i2v", action="store_true")
+parser.add_argument("--fps", type=int, default=16, help="FPS for saved output videos")
 args = parser.parse_args()
 
 if args.output_folder:
@@ -183,4 +184,4 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
     pipeline.vae.model.clear_cache()
 
     output_path = os.path.join(args.output_folder, f'{prompt[:100]}.mp4')
-    write_video(output_path, video[0], fps=16)
+    write_video(output_path, video[0], fps=args.fps)
