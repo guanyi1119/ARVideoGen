@@ -526,16 +526,19 @@ def main():
     pbar = tqdm(total=total, desc=f"Rank {rank} processing", disable=not is_main)
 
     # ---------- IO Workers (read + resize) ----------
-    io_completed = threading.Event()
-    io_tasks_left = len(work_items)
+    io_tasks_submitted = 0
+    io_tasks_completed = 0
+    io_lock = threading.Lock()
+    all_io_submitted = threading.Event()
+    all_work_done = threading.Event()
 
     def io_worker():
-        nonlocal io_tasks_left
+        nonlocal io_tasks_completed
         while True:
             try:
                 item = io_queue.get(timeout=0.1)
             except:
-                if io_completed.is_set():
+                if all_io_submitted.is_set() and io_queue.empty():
                     break
                 continue
 
@@ -548,16 +551,20 @@ def main():
                 item.error_msg = str(e)
                 resized_queue.put(item)
 
+            with io_lock:
+                io_tasks_completed += 1
+
+            # Check if all done
+            with io_lock:
+                if all_io_submitted.is_set() and io_tasks_completed >= io_tasks_submitted:
+                    all_work_done.set()
+
     # Start IO workers
     io_threads = []
     for _ in range(args.num_io_workers):
         t = threading.Thread(target=io_worker, daemon=True)
         t.start()
         io_threads.append(t)
-
-    # Feed work items to IO queue
-    for item in work_items:
-        io_queue.put(item)
 
     # ---------- VAE Worker (batch encode) ----------
     vae_completed = threading.Event()
@@ -573,9 +580,9 @@ def main():
             try:
                 item = resized_queue.get(timeout=0.1)
             except:
-                if io_completed.is_set() and items_received >= total:
+                if all_work_done.is_set() and items_received >= total:
                     break
-                if len(batch_buffer) > 0 and io_completed.is_set():
+                if len(batch_buffer) > 0 and all_work_done.is_set():
                     # Flush remaining items
                     pass
                 else:
@@ -592,7 +599,7 @@ def main():
                 failed += 1
 
             # Process batch if buffer full or all items received
-            if len(batch_buffer) >= vae_batch_size or (items_received >= total and len(batch_buffer) > 0):
+            if len(batch_buffer) >= vae_batch_size or (all_work_done.is_set() and len(batch_buffer) > 0):
                 try:
                     with torch.no_grad():
                         if vae_batch_size == 1:
@@ -621,7 +628,7 @@ def main():
 
                 batch_buffer = []
 
-            if items_received >= total:
+            if all_work_done.is_set() and items_received >= total:
                 break
 
         vae_completed.set()
@@ -629,6 +636,18 @@ def main():
     # Start VAE worker
     vae_thread = threading.Thread(target=vae_worker, daemon=True)
     vae_thread.start()
+
+    # ---------- Feeder Thread (feeds IO queue without blocking) ----------
+    def feeder():
+        nonlocal io_tasks_submitted
+        for item in work_items:
+            io_queue.put(item)  # This blocks if queue is full (backpressure)
+            with io_lock:
+                io_tasks_submitted += 1
+        all_io_submitted.set()
+
+    feeder_thread = threading.Thread(target=feeder, daemon=True)
+    feeder_thread.start()
 
     # ---------- Write Workers (save to disk) ----------
     items_to_write = total
@@ -667,10 +686,8 @@ def main():
         t.start()
         write_threads.append(t)
 
-    # Signal IO completed once all items are processed by IO workers
-    io_completed.set()
-
     # Wait for all threads to finish
+    feeder_thread.join()
     for t in io_threads:
         t.join()
     vae_thread.join()
