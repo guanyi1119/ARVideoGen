@@ -297,25 +297,9 @@ def encode_video(vae, video_np, device):
     Input: (T, H, W, 3) numpy array (uint8)
     Output: (1, T, C, H/8, W/8) tensor
     """
-    video_tensor = torch.tensor(video_np, dtype=torch.float32, device=device).unsqueeze(0).permute(0, 4, 1, 2, 3) / 255.0
-    video_tensor = video_tensor * 2 - 1
-    video_tensor = video_tensor.to(torch.bfloat16)
-
-    def encode_fn(vae_model, videos):
-        device, dtype = videos[0].device, videos[0].dtype
-        scale = [vae_model.mean.to(device=device, dtype=dtype),
-                 1.0 / vae_model.std.to(device=device, dtype=dtype)]
-        output = [
-            vae_model.model.encode(u.unsqueeze(0), scale).float().squeeze(0)
-            for u in videos
-        ]
-        output = torch.stack(output, dim=0)
-        return output
-
-    with torch.no_grad():
-        encoded_latents = encode_fn(vae, video_tensor).transpose(2, 1)
-
-    return encoded_latents.cpu().detach()
+    # Use same logic as encode_batch for consistency
+    latent_np_list = encode_batch(vae, [video_np], device)
+    return torch.tensor(latent_np_list[0]).unsqueeze(0)
 
 
 def save_resized_video(video_np, save_path, fps=16, use_moxing=False):
