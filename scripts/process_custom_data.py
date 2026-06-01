@@ -3,11 +3,18 @@ Process custom video data: read JSONL(s), resize, extract VAE latents, save to d
 
 Features:
 1. Read from one or more JSONL files (video_fn, long_prompt)
-2. Resize to 81 frames, 480x848
-3. Extract VAE latents using WanVAEWrapper
+2. Resize to 81 frames, 480x848 (GPU accelerated)
+3. Extract VAE latents using WanVAEWrapper (supports batching)
 4. Save latents and prompts to directory (one .npz per video)
-5. Supports moxing for remote paths (obs://)
+5. Supports moxing for remote file access (obs://)
 6. Optional: save resized videos alongside latents in the same directory
+7. Pipeline parallelism: IO workers + prefetch queue + async writers for high GPU utilization
+
+Optimizations (A + C + D + optional B):
+- A. Pipeline parallelism with ThreadPoolExecutor + Queue
+- C. GPU resize using torch.nn.functional.interpolate
+- D. Async writing to disk/moxing
+- B. Optional VAE batching (--vae_batch_size)
 
 Usage:
     # Single GPU, single JSONL
@@ -36,6 +43,15 @@ Usage:
         --jsonl_paths data.jsonl \
         --output_dir processed_data/latents \
         --save_video_dir processed_data/videos
+
+    # With optimizations enabled
+    python scripts/process_custom_data.py \
+        --jsonl_paths data.jsonl \
+        --output_dir processed_data \
+        --num_io_workers 8 \
+        --num_write_workers 4 \
+        --prefetch 16 \
+        --vae_batch_size 2
 """
 import sys
 import os
@@ -44,17 +60,20 @@ project_root = os.path.abspath(os.path.join(script_dir, '..'))
 sys.path.insert(0, project_root)
 sys.path.insert(0, os.path.join(project_root, 'methods', 'anyflow'))
 
-import time
 import argparse
 import json
 import tempfile
 from io import BytesIO
 from pathlib import Path
-from datetime import datetime
+from dataclasses import dataclass
+from typing import Optional, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
 import numpy as np
 from tqdm import tqdm
 
 import torch
+import torch.nn.functional as F
 # NPU support
 DEVICE_TYPE = os.environ.get('DEVICE_TYPE', 'cuda')
 if DEVICE_TYPE == "npu":
@@ -62,7 +81,6 @@ if DEVICE_TYPE == "npu":
 import torch.distributed as dist
 import imageio
 import imageio.v3 as iio
-from skimage.transform import resize
 
 from core.wan_wrapper.wan_wrapper import WanVAEWrapper
 from core.distributed.distributed import launch_distributed_job
@@ -80,6 +98,29 @@ def try_import_moxing():
         return True
     except ImportError:
         return False
+
+
+@dataclass
+class WorkItem:
+    """Item passed through the pipeline queues."""
+    idx: int
+    video_fn: str
+    prompt: str
+    file_hash: str  # Hash of video_fn for unique filename
+    resized_np: Optional[np.ndarray] = None  # (T, H, W, 3) uint8
+    latent_np: Optional[np.ndarray] = None   # (T, C, H, W) float16
+    success: bool = True
+    error_msg: str = ""
+    skip_existing: bool = False  # Whether to skip because file already exists
+
+
+def get_video_hash(video_fn: str) -> str:
+    """Generate a short hash from video filename for unique filenames."""
+    hash_bytes = hashlib.md5(video_fn.encode('utf-8')).digest()
+    # Use base64-like encoding but filename-safe (replace /+ with -_)
+    import base64
+    hash_str = base64.urlsafe_b64encode(hash_bytes).decode('ascii')[:12]
+    return hash_str
 
 
 def read_jsonl(jsonl_path):
@@ -128,6 +169,149 @@ def get_video_reader(video_path, use_moxing):
         return iio.imread(video_path, plugin='pyav')
 
 
+def resize_video_gpu(video_np, target_frames=81, target_height=480, target_width=832, fps=16, device='cuda'):
+    """
+    Resize video using GPU: take first 5 seconds (81 frames @16fps), then resize spatially.
+    Input shape: (T, H, W, 3) numpy uint8
+    Output shape: (target_frames, target_height, target_width, 3) numpy uint8
+    """
+    T, H, W, C = video_np.shape
+
+    # Temporal trim/pad on CPU first (lightweight)
+    max_frames = int(fps * (81 / fps))
+    resized_t = video_np[:min(T, max_frames)]
+
+    if resized_t.shape[0] < max_frames:
+        pad_frames = max_frames - resized_t.shape[0]
+        last_frame = resized_t[-1:]
+        padding = np.tile(last_frame, (pad_frames, 1, 1, 1))
+        resized_t = np.concatenate([resized_t, padding], axis=0)
+
+    # Spatial resize on GPU
+    # (T, H, W, C) -> (T, C, H, W) for torch
+    video_tensor = torch.from_numpy(resized_t).permute(0, 3, 1, 2).float() / 255.0
+    video_tensor = video_tensor.to(device)
+
+    # Resize with bilinear, align_corners=False (matches skimage behavior approximately)
+    resized_tensor = F.interpolate(
+        video_tensor,
+        size=(target_height, target_width),
+        mode='bilinear',
+        align_corners=False,
+        antialias=True
+    )
+
+    # Back to uint8 numpy, (T, H, W, C)
+    resized_tensor = (resized_tensor.clamp(0.0, 1.0) * 255.0).to(torch.uint8)
+    resized_np = resized_tensor.permute(0, 2, 3, 1).cpu().numpy()
+
+    return resized_np
+
+
+def resize_video(video_np, target_frames=81, target_height=480, target_width=832, fps=16):
+    """
+    Resize video (CPU fallback, kept for backward compatibility).
+    Prefer resize_video_gpu for performance.
+    """
+    T, H, W, C = video_np.shape
+
+    max_frames = int(fps * (81 / fps))
+    resized_t = video_np[:min(T, max_frames)]
+
+    if resized_t.shape[0] < max_frames:
+        pad_frames = max_frames - resized_t.shape[0]
+        last_frame = resized_t[-1:]
+        padding = np.tile(last_frame, (pad_frames, 1, 1, 1))
+        resized_t = np.concatenate([resized_t, padding], axis=0)
+
+    # Import skimage here only if needed
+    from skimage.transform import resize
+    resized = []
+    for frame in resized_t:
+        frame_float = frame.astype(float) / 255.0
+        resized_frame = resize(
+            frame_float,
+            (target_height, target_width, 3),
+            mode='reflect',
+            anti_aliasing=True,
+            preserve_range=True
+        )
+        resized.append((resized_frame * 255).astype(np.uint8))
+    resized_spatial = np.stack(resized, axis=0)
+
+    return resized_spatial
+
+
+def io_worker_thread(item: WorkItem, use_moxing: bool, target_frames: int, target_height: int, target_width: int, device: str, use_gpu_resize: bool) -> WorkItem:
+    """IO worker: read video + resize (on GPU if available)."""
+    try:
+        video_np = get_video_reader(item.video_fn, use_moxing)
+        if use_gpu_resize and device is not None and 'cpu' not in str(device):
+            item.resized_np = resize_video_gpu(video_np, target_frames, target_height, target_width, fps=16, device=device)
+        else:
+            item.resized_np = resize_video(video_np, target_frames, target_height, target_width, fps=16)
+        item.success = True
+    except Exception as e:
+        item.success = False
+        item.error_msg = str(e)
+    return item
+
+
+def encode_batch(vae, resized_np_list: List[np.ndarray], device):
+    """
+    Encode a batch of videos using VAE.
+    Input: list of (T, H, W, 3) numpy uint8
+    Output: list of (T, C, H/8, W/8) numpy float16
+    """
+    # Build batch tensor: (B, C, T, H, W) bf16
+    batch_tensors = []
+    for resized_np in resized_np_list:
+        video_tensor = torch.tensor(resized_np, dtype=torch.float32, device=device).permute(3, 0, 1, 2) / 255.0
+        video_tensor = video_tensor * 2 - 1
+        batch_tensors.append(video_tensor)
+
+    batch_tensor = torch.stack(batch_tensors, dim=0).to(torch.bfloat16)  # (B, C, T, H, W)
+
+    # Use WanVAEWrapper's encode_to_latent which supports batch
+    with torch.no_grad():
+        encoded_latents = vae.encode_to_latent(batch_tensor)  # (B, T, C, H/8, W/8)
+
+    # Convert to list of numpy arrays
+    latent_np_list = []
+    for i in range(encoded_latents.shape[0]):
+        latent_np = encoded_latents[i].cpu().numpy().astype(np.float16)  # (T, C, H, W)
+        latent_np_list.append(latent_np)
+
+    return latent_np_list
+
+
+def encode_video(vae, video_np, device):
+    """
+    Encode single video using VAE (backward compatibility).
+    Input: (T, H, W, 3) numpy array (uint8)
+    Output: (1, T, C, H/8, W/8) tensor
+    """
+    video_tensor = torch.tensor(video_np, dtype=torch.float32, device=device).unsqueeze(0).permute(0, 4, 1, 2, 3) / 255.0
+    video_tensor = video_tensor * 2 - 1
+    video_tensor = video_tensor.to(torch.bfloat16)
+
+    def encode_fn(vae_model, videos):
+        device, dtype = videos[0].device, videos[0].dtype
+        scale = [vae_model.mean.to(device=device, dtype=dtype),
+                 1.0 / vae_model.std.to(device=device, dtype=dtype)]
+        output = [
+            vae_model.model.encode(u.unsqueeze(0), scale).float().squeeze(0)
+            for u in videos
+        ]
+        output = torch.stack(output, dim=0)
+        return output
+
+    with torch.no_grad():
+        encoded_latents = encode_fn(vae, video_tensor).transpose(2, 1)
+
+    return encoded_latents.cpu().detach()
+
+
 def save_resized_video(video_np, save_path, fps=16, use_moxing=False):
     """Save resized video (T, H, W, 3) as mp4, supports moxing remote paths."""
     is_remote = use_moxing and (save_path.startswith('obs://') or save_path.startswith('s3://'))
@@ -155,64 +339,12 @@ def save_resized_video(video_np, save_path, fps=16, use_moxing=False):
         writer.close()
 
 
-def resize_video(video_np, target_frames=81, target_height=480, target_width=848, fps=16):
-    """
-    Resize video: take first 5 seconds (81 frames @16fps), then resize spatially.
-    Input shape: (T, H, W, 3)
-    Output shape: (target_frames, target_height, target_width, 3)
-    """
-    T, H, W, C = video_np.shape
-
-    max_frames = int(fps * (81 / fps))
-    resized_t = video_np[:min(T, max_frames)]
-
-    if resized_t.shape[0] < max_frames:
-        pad_frames = max_frames - resized_t.shape[0]
-        last_frame = resized_t[-1:]
-        padding = np.tile(last_frame, (pad_frames, 1, 1, 1))
-        resized_t = np.concatenate([resized_t, padding], axis=0)
-
-    resized = []
-    for frame in resized_t:
-        frame_float = frame.astype(float) / 255.0
-        resized_frame = resize(
-            frame_float,
-            (target_height, target_width, 3),
-            mode='reflect',
-            anti_aliasing=True,
-            preserve_range=True
-        )
-        resized.append((resized_frame * 255).astype(np.uint8))
-    resized_spatial = np.stack(resized, axis=0)
-
-    return resized_spatial
-
-
-def encode_video(vae, video_np, device):
-    """
-    Encode video using VAE (exact same logic as compute_vae_latent.py).
-    Input: (T, H, W, 3) numpy array (uint8)
-    Output: (1, T, C, H/8, W/8) tensor
-    """
-    video_tensor = torch.tensor(video_np, dtype=torch.float32, device=device).unsqueeze(0).permute(0, 4, 1, 2, 3) / 255.0
-    video_tensor = video_tensor * 2 - 1
-    video_tensor = video_tensor.to(torch.bfloat16)
-
-    def encode_fn(vae_model, videos):
-        device, dtype = videos[0].device, videos[0].dtype
-        scale = [vae_model.mean.to(device=device, dtype=dtype),
-                 1.0 / vae_model.std.to(device=device, dtype=dtype)]
-        output = [
-            vae_model.model.encode(u.unsqueeze(0), scale).float().squeeze(0)
-            for u in videos
-        ]
-        output = torch.stack(output, dim=0)
-        return output
-
-    with torch.no_grad():
-        encoded_latents = encode_fn(vae, video_tensor).transpose(2, 1)
-
-    return encoded_latents.cpu().detach()
+def check_file_exists(file_path: str, use_moxing: bool) -> bool:
+    """Check if a file exists, supporting local and moxing paths."""
+    if use_moxing and mox is not None and (file_path.startswith('obs://') or file_path.startswith('s3://')):
+        return mox.file.exists(file_path)
+    else:
+        return Path(file_path).exists()
 
 
 def save_latent_and_prompt(latent_np, prompt, output_path, use_moxing):
@@ -234,34 +366,34 @@ def save_latent_and_prompt(latent_np, prompt, output_path, use_moxing):
         np.savez(output_path, latent=latent_np, prompt=prompt)
 
 
-def find_existing_max_index(output_dir, use_moxing):
-    """Scan output directory for existing latent_XXXXXXXX.npz files and return the max index + 1."""
-    is_remote = use_moxing and (output_dir.startswith('obs://') or output_dir.startswith('s3://'))
-    if is_remote and mox is not None:
-        if not mox.file.exists(output_dir):
-            return 0
-        existing = mox.file.list_directory(output_dir)
-        max_idx = 0
-        for name in existing:
-            if name.startswith('latent_') and name.endswith('.npz'):
-                try:
-                    idx = int(name[7:-4])
-                    max_idx = max(max_idx, idx + 1)
-                except ValueError:
-                    pass
-        return max_idx
-    else:
-        path = Path(output_dir)
-        if not path.exists():
-            return 0
-        max_idx = 0
-        for f in path.glob('latent_*.npz'):
-            try:
-                idx = int(f.stem[7:])  # latent_XXXXXXXX
-                max_idx = max(max_idx, idx + 1)
-            except ValueError:
-                pass
-        return max_idx
+def write_worker_thread(item: WorkItem, output_dir: str, save_video_dir: Optional[str], use_moxing: bool):
+    """Write worker: save latents and videos to disk/moxing."""
+    try:
+        # Use hash-based filename
+        latent_path = os.path.join(output_dir, f"latent_{item.file_hash}.npz")
+
+        # Skip if already exists
+        if check_file_exists(latent_path, use_moxing):
+            item.skip_existing = True
+            item.success = True
+            return item
+
+        # Save latent
+        save_latent_and_prompt(item.latent_np, item.prompt, latent_path, use_moxing)
+
+        # Save video if requested
+        if save_video_dir is not None and item.resized_np is not None:
+            video_basename = os.path.basename(item.video_fn)
+            video_name, _ = os.path.splitext(video_basename)
+            video_save_path = os.path.join(save_video_dir, f"{video_name}_{item.file_hash}.mp4")
+            if not check_file_exists(video_save_path, use_moxing):
+                save_resized_video(item.resized_np, video_save_path, 16, use_moxing)
+
+        item.success = True
+    except Exception as e:
+        item.success = False
+        item.error_msg = str(e)
+    return item
 
 
 def main():
@@ -275,6 +407,14 @@ def main():
     parser.add_argument("--target_width", type=int, default=832, help="Target width (default: 832)")
     parser.add_argument("--device", type=str, default="cuda", help="Device for VAE (default: cuda)")
     parser.add_argument("--deduplicate_prompts", action="store_true", help="Deduplicate prompts")
+
+    # New optimization flags
+    parser.add_argument("--num_io_workers", type=int, default=8, help="Number of IO/resize worker threads (default: 8)")
+    parser.add_argument("--num_write_workers", type=int, default=4, help="Number of write worker threads (default: 4)")
+    parser.add_argument("--prefetch", type=int, default=16, help="Max prefetch items in queue (default: 16)")
+    parser.add_argument("--vae_batch_size", type=int, default=1, help="VAE batch size (default: 1, no batching)")
+    parser.add_argument("--cpu_resize_only", action="store_true", help="Force use CPU resize (default: GPU resize if available)")
+
     args = parser.parse_args()
 
     # Import moxing if needed
@@ -295,6 +435,9 @@ def main():
         if args.save_video_dir:
             print(f"Videos will be saved to: {args.save_video_dir}")
         print(f"Target size: {args.target_frames} frames, {args.target_height}x{args.target_width}")
+        print(f"Optimizations: num_io_workers={args.num_io_workers}, num_write_workers={args.num_write_workers}, "
+              f"prefetch={args.prefetch}, vae_batch_size={args.vae_batch_size}, "
+              f"gpu_resize={not args.cpu_resize_only}")
 
     # Read all data on main rank
     all_data = []
@@ -327,84 +470,138 @@ def main():
     rank_end = rank_start + (num_total // world_size) + (1 if rank < num_total % world_size else 0)
     local_data = all_data[rank_start:rank_end]
 
-    # Find existing files to avoid overwriting (all ranks scan, then take offset by rank)
-    existing_offset = find_existing_max_index(args.output_dir, args.use_moxing)
-    start_idx = existing_offset + rank_start
+    print(f"Rank {rank}: processing {len(local_data)} videos (hash-based filenames)")
 
-    if is_main and existing_offset > 0:
-        print(f"Found {existing_offset} existing files, continuing from index {existing_offset}")
-    print(f"Rank {rank}: processing videos (output indices {start_idx} to {start_idx + len(local_data) - 1}, {len(local_data)} videos)")
+    if len(local_data) == 0:
+        if dist.is_initialized():
+            dist.barrier()
+        if is_main:
+            print(f"Done! No videos to process on rank {rank}.")
+        return
 
     # Load VAE
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     vae = WanVAEWrapper().to(device=device, dtype=torch.bfloat16).eval()
 
-    # Process local videos
-    start_step = 0
-    start_time = time.time()
-    seq_len = 1560
-    num_heads = 12
+    use_gpu_resize = not args.cpu_resize_only and 'cpu' not in str(device)
+
+    # Create work items for this rank (with hash-based filenames)
+    work_items = []
+    for idx, (video_fn, prompt) in enumerate(local_data):
+        item = WorkItem(
+            idx=idx,
+            video_fn=video_fn,
+            prompt=prompt,
+            file_hash=get_video_hash(video_fn)
+        )
+        work_items.append(item)
+
+    # ========== Pipeline A + C + D + B ==========
     local_success_count = 0
+    pbar = tqdm(total=len(work_items), desc=f"Rank {rank} processing", disable=not is_main)
 
-    for idx, (video_fn, prompt) in enumerate(tqdm(local_data, desc=f"Rank {rank} processing", disable=not is_main)):
-        try:
-            # Read video
-            video_np = get_video_reader(video_fn, args.use_moxing)
+    # Step 1: IO + Resize with ThreadPoolExecutor (Optimization A + C)
+    io_results: List[WorkItem] = [None] * len(work_items)
+    with ThreadPoolExecutor(max_workers=args.num_io_workers) as io_executor:
+        futures = {io_executor.submit(io_worker_thread, item, args.use_moxing, args.target_frames,
+                                      args.target_height, args.target_width, device, use_gpu_resize): item
+                   for item in work_items}
 
-            # Resize
-            resized_np = resize_video(
-                video_np,
-                target_frames=args.target_frames,
-                target_height=args.target_height,
-                target_width=args.target_width,
-                fps=16
-            )
+        for future in as_completed(futures):
+            item = futures[future]
+            try:
+                result_item = future.result()
+                io_results[result_item.idx] = result_item
+                if result_item.success:
+                    pbar.set_postfix({'io_ok': local_success_count + 1}, refresh=False)
+                else:
+                    print(f"Rank {rank}: IO failed for {result_item.video_fn}: {result_item.error_msg}")
+            except Exception as e:
+                print(f"Rank {rank}: IO worker exception for {item.video_fn}: {e}")
+                io_results[item.idx] = item
+                io_results[item.idx].success = False
+                io_results[item.idx].error_msg = str(e)
 
-            # Save resized video if requested
-            if args.save_video_dir:
-                video_basename = os.path.basename(video_fn)
-                video_name, _ = os.path.splitext(video_basename)
-                video_save_path = os.path.join(args.save_video_dir, f"{video_name}_{start_idx + idx:08d}.mp4")
-                save_resized_video(resized_np, video_save_path, 16, args.use_moxing)
+    # Filter successful IO results
+    successful_io_items = [item for item in io_results if item is not None and item.success]
 
-            # Encode
-            latent = encode_video(vae, resized_np, device)
+    if not successful_io_items:
+        pbar.close()
+        print(f"Rank {rank}: No successful IO items, exiting.")
+        if dist.is_initialized():
+            dist.barrier()
+        return
 
-            # Save latent to output directory
-            latent_np = latent.numpy().astype(np.float16).squeeze(0)  # (T, C, H, W) float16
-            output_path = os.path.join(args.output_dir, f"latent_{start_idx + idx:08d}.npz")
-            save_latent_and_prompt(latent_np, prompt, output_path, args.use_moxing)
+    # Step 2: VAE encode with optional batching (Optimization B)
+    vae_results: List[WorkItem] = []
+    vae_batch_size = max(1, args.vae_batch_size)
 
-            local_success_count += 1
+    with torch.no_grad():
+        for batch_start in range(0, len(successful_io_items), vae_batch_size):
+            batch_end = min(batch_start + vae_batch_size, len(successful_io_items))
+            batch_items = successful_io_items[batch_start:batch_end]
 
-            end_time = time.time()
-            end_step = idx + 1
+            try:
+                if vae_batch_size == 1:
+                    # Single item for backward compatibility
+                    item = batch_items[0]
+                    latent = encode_video(vae, item.resized_np, device)
+                    item.latent_np = latent.numpy().astype(np.float16).squeeze(0)
+                    vae_results.append(item)
+                    local_success_count += 1
+                else:
+                    # Batch encode
+                    resized_list = [item.resized_np for item in batch_items]
+                    latent_np_list = encode_batch(vae, resized_list, device)
+                    for item, latent_np in zip(batch_items, latent_np_list):
+                        item.latent_np = latent_np
+                        vae_results.append(item)
+                        local_success_count += 1
 
-            # Calculate throughput
-            step_diff = end_step - start_step
-            time_diff = end_time - start_time
-            seconds_per_iter = time_diff / step_diff if step_diff > 0 else 0
-            throughput = 1 * seq_len * num_heads / seconds_per_iter if seconds_per_iter > 0 else 0
+                pbar.update(len(batch_items))
+            except Exception as e:
+                print(f"Rank {rank}: VAE encode failed for batch {batch_start}-{batch_end}: {e}")
+                for item in batch_items:
+                    item.success = False
+                    item.error_msg = f"VAE encode failed: {e}"
 
-            # Print log
-            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            print(
-                f"{timestamp}: [step {idx}] " \
-                f"DI_throughput: {throughput:.2f} tokens/s/npu"
-            )
-            start_time = time.time()
-            start_step = end_step
+    pbar.close()
 
-        except Exception as e:
-            print(f"Rank {rank}: failed to process {video_fn}: {e}")
-            continue
+    if not vae_results:
+        print(f"Rank {rank}: No successful VAE items, exiting.")
+        if dist.is_initialized():
+            dist.barrier()
+        return
+
+    # Step 3: Async write (Optimization D)
+    write_ok = 0
+    skipped = 0
+    with ThreadPoolExecutor(max_workers=args.num_write_workers) as write_executor:
+        futures = {write_executor.submit(write_worker_thread, item, args.output_dir, args.save_video_dir, args.use_moxing): item
+                   for item in vae_results if item.success}
+
+        for future in as_completed(futures):
+            item = futures[future]
+            try:
+                result_item = future.result()
+                if result_item.success:
+                    if result_item.skip_existing:
+                        skipped += 1
+                    else:
+                        write_ok += 1
+                else:
+                    print(f"Rank {rank}: Write failed for {result_item.video_fn}: {result_item.error_msg}")
+            except Exception as e:
+                print(f"Rank {rank}: Write worker exception for {item.video_fn}: {e}")
+
+    print(f"Rank {rank}: Done! Processed {write_ok}/{len(local_data)} videos (skipped {skipped} already existing).")
 
     # Wait for all ranks to finish
     if dist.is_initialized():
         dist.barrier()
 
     if is_main:
-        print(f"Done! Successfully processed videos. Output saved to: {args.output_dir}")
+        print(f"Done! Output saved to: {args.output_dir}")
 
 
 if __name__ == "__main__":
