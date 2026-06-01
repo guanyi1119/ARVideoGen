@@ -615,22 +615,20 @@ def main():
 
                     # Print throughput periodically (only from main rank, with lock protection)
                     if is_main:
-                        with throughput_lock:
-                            current_step = items_encoded
-                            if current_step > 0 and current_step >= last_printed_step + throughput_print_interval:
-                                end_time = time.time()
-                                end_step = current_step
-                                step_diff = end_step - start_step
-                                time_diff = end_time - start_time
-                                throughput = 1560*12*step_diff / time_diff if time_diff > 0 else 0
-                                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                                print(
-                                    f"{timestamp}: [processed {current_step}/{total}] "
-                                    f"DI_throughput: {throughput:.2f} tokens/s/npu"
-                                )
-                                start_time = end_time
-                                start_step = end_step
-                                last_printed_step = current_step
+                        current_step = items_encoded
+                        end_time = time.time()
+                        end_step = current_step
+                        step_diff = end_step - start_step
+                        time_diff = end_time - start_time
+                        throughput = step_diff / time_diff if time_diff > 0 else 0
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        print(
+                            f"{timestamp}: [processed {current_step}/{total}] "
+                            f"DI_throughput: {throughput:.2f} samples/s/npu"
+                        )
+                        start_time = end_time
+                        start_step = end_step
+                        last_printed_step = current_step
                 except Exception as e:
                     import traceback
                     print(f"Rank {rank}: VAE encode failed for batch: {e}")
