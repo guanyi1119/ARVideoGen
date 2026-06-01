@@ -273,7 +273,10 @@ def encode_batch(vae, resized_np_list: List[np.ndarray], device):
         video_tensor = video_tensor * 2 - 1
         batch_tensors.append(video_tensor)
 
-    batch_tensor = torch.stack(batch_tensors, dim=0).to(torch.bfloat16)  # (B, C, T, H, W)
+    batch_tensor = torch.stack(batch_tensors, dim=0).to(device=device, dtype=torch.bfloat16)  # (B, C, T, H, W)
+
+    # Ensure vae is on the correct device (safety check)
+    vae = vae.to(device)
 
     # Use WanVAEWrapper's encode_to_latent which supports batch
     with torch.no_grad():
@@ -611,7 +614,6 @@ def main():
                             single_item.latent_np = latent.numpy().astype(np.float16).squeeze(0)
                             write_queue.put(single_item)
                         else:
-                            # Batch encode
                             resized_list = [i.resized_np for i in batch_buffer]
                             latent_np_list = encode_batch(vae, resized_list, device)
                             for i, latent_np in zip(batch_buffer, latent_np_list):
@@ -620,7 +622,9 @@ def main():
 
                     pbar.update(len(batch_buffer))
                 except Exception as e:
+                    import traceback
                     print(f"Rank {rank}: VAE encode failed for batch: {e}")
+                    print(f"Rank {rank}: Stack trace: {traceback.format_exc()}")
                     for i in batch_buffer:
                         i.success = False
                         i.error_msg = f"VAE encode failed: {e}"
