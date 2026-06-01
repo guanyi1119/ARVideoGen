@@ -67,7 +67,8 @@ from io import BytesIO
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, List
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from queue import Queue
+import threading
 import hashlib
 import numpy as np
 from tqdm import tqdm
@@ -487,6 +488,7 @@ def main():
 
     # Create work items for this rank (with hash-based filenames)
     work_items = []
+    skipped_precheck = 0
     for idx, (video_fn, prompt) in enumerate(local_data):
         item = WorkItem(
             idx=idx,
@@ -494,107 +496,190 @@ def main():
             prompt=prompt,
             file_hash=get_video_hash(video_fn)
         )
+        # Pre-check if already exists to avoid unnecessary IO
+        latent_path = os.path.join(args.output_dir, f"latent_{item.file_hash}.npz")
+        if check_file_exists(latent_path, args.use_moxing):
+            skipped_precheck += 1
+            continue
         work_items.append(item)
 
-    # ========== Pipeline A + C + D + B ==========
-    local_success_count = 0
-    pbar = tqdm(total=len(work_items), desc=f"Rank {rank} processing", disable=not is_main)
+    if skipped_precheck > 0:
+        print(f"Rank {rank}: Pre-skipped {skipped_precheck} already existing videos")
 
-    # Step 1: IO + Resize with ThreadPoolExecutor (Optimization A + C)
-    io_results: List[WorkItem] = [None] * len(work_items)
-    with ThreadPoolExecutor(max_workers=args.num_io_workers) as io_executor:
-        futures = {io_executor.submit(io_worker_thread, item, args.use_moxing, args.target_frames,
-                                      args.target_height, args.target_width, device, use_gpu_resize): item
-                   for item in work_items}
-
-        for future in as_completed(futures):
-            item = futures[future]
-            try:
-                result_item = future.result()
-                io_results[result_item.idx] = result_item
-                if result_item.success:
-                    pbar.set_postfix({'io_ok': local_success_count + 1}, refresh=False)
-                else:
-                    print(f"Rank {rank}: IO failed for {result_item.video_fn}: {result_item.error_msg}")
-            except Exception as e:
-                print(f"Rank {rank}: IO worker exception for {item.video_fn}: {e}")
-                io_results[item.idx] = item
-                io_results[item.idx].success = False
-                io_results[item.idx].error_msg = str(e)
-
-    # Filter successful IO results
-    successful_io_items = [item for item in io_results if item is not None and item.success]
-
-    if not successful_io_items:
-        pbar.close()
-        print(f"Rank {rank}: No successful IO items, exiting.")
+    if len(work_items) == 0:
+        print(f"Rank {rank}: No videos to process (all skipped).")
         if dist.is_initialized():
             dist.barrier()
         return
 
-    # Step 2: VAE encode with optional batching (Optimization B)
-    vae_results: List[WorkItem] = []
-    vae_batch_size = max(1, args.vae_batch_size)
+    # ========== Stream processing with queues ==========
+    io_queue = Queue(maxsize=args.prefetch)  # Holds WorkItem
+    resized_queue = Queue(maxsize=args.prefetch)  # Holds WorkItem with resized_np
+    write_queue = Queue(maxsize=args.prefetch)  # Holds WorkItem with latent_np
 
-    with torch.no_grad():
-        for batch_start in range(0, len(successful_io_items), vae_batch_size):
-            batch_end = min(batch_start + vae_batch_size, len(successful_io_items))
-            batch_items = successful_io_items[batch_start:batch_end]
-
-            try:
-                if vae_batch_size == 1:
-                    # Single item for backward compatibility
-                    item = batch_items[0]
-                    latent = encode_video(vae, item.resized_np, device)
-                    item.latent_np = latent.numpy().astype(np.float16).squeeze(0)
-                    vae_results.append(item)
-                    local_success_count += 1
-                else:
-                    # Batch encode
-                    resized_list = [item.resized_np for item in batch_items]
-                    latent_np_list = encode_batch(vae, resized_list, device)
-                    for item, latent_np in zip(batch_items, latent_np_list):
-                        item.latent_np = latent_np
-                        vae_results.append(item)
-                        local_success_count += 1
-
-                pbar.update(len(batch_items))
-            except Exception as e:
-                print(f"Rank {rank}: VAE encode failed for batch {batch_start}-{batch_end}: {e}")
-                for item in batch_items:
-                    item.success = False
-                    item.error_msg = f"VAE encode failed: {e}"
-
-    pbar.close()
-
-    if not vae_results:
-        print(f"Rank {rank}: No successful VAE items, exiting.")
-        if dist.is_initialized():
-            dist.barrier()
-        return
-
-    # Step 3: Async write (Optimization D)
+    # Counters and flags
+    total = len(work_items)
     write_ok = 0
     skipped = 0
-    with ThreadPoolExecutor(max_workers=args.num_write_workers) as write_executor:
-        futures = {write_executor.submit(write_worker_thread, item, args.output_dir, args.save_video_dir, args.use_moxing): item
-                   for item in vae_results if item.success}
+    failed = 0
 
-        for future in as_completed(futures):
-            item = futures[future]
+    pbar = tqdm(total=total, desc=f"Rank {rank} processing", disable=not is_main)
+
+    # ---------- IO Workers (read + resize) ----------
+    io_completed = threading.Event()
+    io_tasks_left = len(work_items)
+
+    def io_worker():
+        nonlocal io_tasks_left
+        while True:
             try:
-                result_item = future.result()
+                item = io_queue.get(timeout=0.1)
+            except:
+                if io_completed.is_set():
+                    break
+                continue
+
+            try:
+                result_item = io_worker_thread(item, args.use_moxing, args.target_frames,
+                                               args.target_height, args.target_width, device, use_gpu_resize)
+                resized_queue.put(result_item)
+            except Exception as e:
+                item.success = False
+                item.error_msg = str(e)
+                resized_queue.put(item)
+
+    # Start IO workers
+    io_threads = []
+    for _ in range(args.num_io_workers):
+        t = threading.Thread(target=io_worker, daemon=True)
+        t.start()
+        io_threads.append(t)
+
+    # Feed work items to IO queue
+    for item in work_items:
+        io_queue.put(item)
+
+    # ---------- VAE Worker (batch encode) ----------
+    vae_completed = threading.Event()
+
+    def vae_worker():
+        nonlocal failed
+        vae_batch_size = max(1, args.vae_batch_size)
+        batch_buffer = []
+        items_received = 0
+
+        while True:
+            # Try to fill batch buffer
+            try:
+                item = resized_queue.get(timeout=0.1)
+            except:
+                if io_completed.is_set() and items_received >= total:
+                    break
+                if len(batch_buffer) > 0 and io_completed.is_set():
+                    # Flush remaining items
+                    pass
+                else:
+                    continue
+
+            items_received += 1
+
+            if item.success:
+                batch_buffer.append(item)
+            else:
+                # Failed, send directly to write queue for error handling
+                write_queue.put(item)
+                pbar.update(1)
+                failed += 1
+
+            # Process batch if buffer full or all items received
+            if len(batch_buffer) >= vae_batch_size or (items_received >= total and len(batch_buffer) > 0):
+                try:
+                    with torch.no_grad():
+                        if vae_batch_size == 1:
+                            # Single item
+                            single_item = batch_buffer[0]
+                            latent = encode_video(vae, single_item.resized_np, device)
+                            single_item.latent_np = latent.numpy().astype(np.float16).squeeze(0)
+                            write_queue.put(single_item)
+                        else:
+                            # Batch encode
+                            resized_list = [i.resized_np for i in batch_buffer]
+                            latent_np_list = encode_batch(vae, resized_list, device)
+                            for i, latent_np in zip(batch_buffer, latent_np_list):
+                                i.latent_np = latent_np
+                                write_queue.put(i)
+
+                    pbar.update(len(batch_buffer))
+                except Exception as e:
+                    print(f"Rank {rank}: VAE encode failed for batch: {e}")
+                    for i in batch_buffer:
+                        i.success = False
+                        i.error_msg = f"VAE encode failed: {e}"
+                        write_queue.put(i)
+                        failed += 1
+                    pbar.update(len(batch_buffer))
+
+                batch_buffer = []
+
+            if items_received >= total:
+                break
+
+        vae_completed.set()
+
+    # Start VAE worker
+    vae_thread = threading.Thread(target=vae_worker, daemon=True)
+    vae_thread.start()
+
+    # ---------- Write Workers (save to disk) ----------
+    items_to_write = total
+
+    def write_worker():
+        nonlocal write_ok, skipped, failed
+        written = 0
+        while True:
+            try:
+                item = write_queue.get(timeout=0.1)
+            except:
+                if vae_completed.is_set() and written >= items_to_write:
+                    break
+                continue
+
+            written += 1
+
+            try:
+                result_item = write_worker_thread(item, args.output_dir, args.save_video_dir, args.use_moxing)
                 if result_item.success:
                     if result_item.skip_existing:
                         skipped += 1
                     else:
                         write_ok += 1
                 else:
+                    failed += 1
                     print(f"Rank {rank}: Write failed for {result_item.video_fn}: {result_item.error_msg}")
             except Exception as e:
+                failed += 1
                 print(f"Rank {rank}: Write worker exception for {item.video_fn}: {e}")
 
-    print(f"Rank {rank}: Done! Processed {write_ok}/{len(local_data)} videos (skipped {skipped} already existing).")
+    # Start write workers
+    write_threads = []
+    for _ in range(args.num_write_workers):
+        t = threading.Thread(target=write_worker, daemon=True)
+        t.start()
+        write_threads.append(t)
+
+    # Signal IO completed once all items are processed by IO workers
+    io_completed.set()
+
+    # Wait for all threads to finish
+    for t in io_threads:
+        t.join()
+    vae_thread.join()
+    for t in write_threads:
+        t.join()
+
+    pbar.close()
+
+    print(f"Rank {rank}: Done! Processed {write_ok}/{len(local_data)} videos (pre-skipped {skipped_precheck}, runtime-skipped {skipped}, failed {failed}).")
 
     # Wait for all ranks to finish
     if dist.is_initialized():
