@@ -63,6 +63,8 @@ sys.path.insert(0, os.path.join(project_root, 'methods', 'anyflow'))
 import argparse
 import json
 import tempfile
+import time
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path
 from dataclasses import dataclass
@@ -651,9 +653,14 @@ def main():
 
     # ---------- Write Workers (save to disk) ----------
     items_to_write = total
+    start_time = time.time()
+    start_step = 0
+    throughput_print_interval = max(10, min(100, total // 10))  # Adaptive interval
+    throughput_lock = threading.Lock()
+    last_printed_step = 0
 
     def write_worker():
-        nonlocal write_ok, skipped, failed
+        nonlocal write_ok, skipped, failed, start_time, start_step, last_printed_step
         written = 0
         while True:
             try:
@@ -679,6 +686,25 @@ def main():
                 failed += 1
                 print(f"Rank {rank}: Write worker exception for {item.video_fn}: {e}")
 
+            # Print throughput periodically (only from main rank, with lock protection)
+            if is_main:
+                with throughput_lock:
+                    current_step = write_ok
+                    if current_step > 0 and current_step >= last_printed_step + throughput_print_interval:
+                        end_time = time.time()
+                        end_step = current_step
+                        step_diff = end_step - start_step
+                        time_diff = end_time - start_time
+                        throughput = 1560*12*step_diff / time_diff if time_diff > 0 else 0
+                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        print(
+                            f"{timestamp}: [processed {current_step}/{total}] "
+                            f"DI_throughput: {throughput:.2f} tokens/s/npu"
+                        )
+                        start_time = end_time
+                        start_step = end_step
+                        last_printed_step = current_step
+
     # Start write workers
     write_threads = []
     for _ in range(args.num_write_workers):
@@ -695,6 +721,15 @@ def main():
         t.join()
 
     pbar.close()
+
+    # Print final throughput on main rank
+    if is_main:
+        total_time = time.time() - start_time
+        if write_ok > 0 and total_time > 0:
+            overall_throughput = write_ok / total_time
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"\n{timestamp}: Done! Total processed {write_ok} videos in {total_time:.1f}s, "
+                  f"overall throughput: {overall_throughput:.2f} videos/s")
 
     print(f"Rank {rank}: Done! Processed {write_ok}/{len(local_data)} videos (pre-skipped {skipped_precheck}, runtime-skipped {skipped}, failed {failed}).")
 
