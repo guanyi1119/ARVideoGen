@@ -1,17 +1,23 @@
 """
-Create LMDB from processed latent files (.npz).
+Create LMDB from processed latent files (.npz or .pt).
 
 Features:
-1. Read all .npz files from directory (supports moxing/obs://)
-2. Write latents and prompts to LMDB
+1. Read all .npz or .pt files from directory (supports moxing/obs://)
+2. Write data to LMDB (latents/prompts for npz, ODE pairs for pt)
 3. Compatible with MultiODERegressionLMDBDataset
 4. Optional sharding into multiple LMDB files
 
 Usage:
-    # Local files
+    # Local files, npz format
     python scripts/create_lmdb_custom_data.py \
         --input_dir processed_data \
         --lmdb_path output.lmdb
+
+    # Local files, pt format (ODE pairs)
+    python scripts/create_lmdb_custom_data.py \
+        --input_dir ode_pairs \
+        --lmdb_path output.lmdb \
+        --input_format pt
 
     # With moxing for remote paths
     python scripts/create_lmdb_custom_data.py \
@@ -59,26 +65,26 @@ def try_import_moxing():
         return False
 
 
-def list_npz_files(input_dir, use_moxing):
-    """List all .npz files in directory, sorted by name."""
+def list_files(input_dir, use_moxing, file_ext):
+    """List all files with given extension in directory, sorted by name."""
     is_remote = use_moxing and (input_dir.startswith('obs://') or input_dir.startswith('s3://'))
 
     if is_remote and mox is not None:
         # List remote files
         all_files = mox.file.list_directory(input_dir, recursive=False)
-        npz_files = [f for f in all_files if f.endswith('.npz')]
-        npz_files.sort()
-        return [os.path.join(input_dir, f) for f in npz_files]
+        files = [f for f in all_files if f.endswith(file_ext)]
+        files.sort()
+        return [os.path.join(input_dir, f) for f in files]
     else:
         # List local files
         path = Path(input_dir)
         if not path.exists():
             raise FileNotFoundError(f"Input directory not found: {input_dir}")
-        npz_files = sorted(list(path.glob("*.npz")))
-        return [str(f) for f in npz_files]
+        files = sorted(list(path.glob(f"*{file_ext}")))
+        return [str(f) for f in files]
 
 
-def load_latent_and_prompt(file_path, use_moxing):
+def load_from_npz(file_path, use_moxing):
     """Load latent and prompt from .npz file."""
     is_remote = use_moxing and (file_path.startswith('obs://') or file_path.startswith('s3://'))
 
@@ -93,15 +99,58 @@ def load_latent_and_prompt(file_path, use_moxing):
 
     latent = data['latent']
     prompt = str(data['prompt'])
-    return latent, prompt
+    return [{'latent': latent, 'prompt': prompt}]
+
+
+def load_from_pt(file_path, use_moxing):
+    """Load data dict from .pt file (ODE pairs format)."""
+    is_remote = use_moxing and (file_path.startswith('obs://') or file_path.startswith('s3://'))
+
+    if is_remote and mox is not None:
+        # Read remote file
+        with mox.file.File(file_path, 'rb') as f:
+            bio = BytesIO(f.read())
+        data_dict = torch.load(bio)
+    else:
+        # Read local file
+        data_dict = torch.load(file_path)
+
+    # Process data dict and return list of samples
+    samples = []
+    num_samples = len(data_dict['prompts'])
+    for i in range(num_samples):
+        sample = {}
+        for key, val in data_dict.items():
+            if key == 'prompts':
+                sample['prompt'] = str(val[i])
+            else:
+                sample[key] = val[i]
+        samples.append(sample)
+    return samples
+
+
+def build_data_dict_from_sample(sample):
+    """Build data dict from sample for LMDB storage."""
+    data_dict = {}
+    for key, val in sample.items():
+        if key == 'prompt':
+            data_dict['prompts'] = np.array([val], dtype=object)
+        elif key == 'latent':
+            data_dict['latents'] = np.expand_dims(val, axis=0)
+        elif key == 'latents':
+            data_dict['latents'] = np.expand_dims(val, axis=0)
+        else:
+            data_dict[key] = np.expand_dims(val, axis=0)
+    return data_dict
 
 
 def main():
     parser = argparse.ArgumentParser(description="Create LMDB from processed latent files")
-    parser.add_argument("--input_dir", type=str, required=True, help="Directory with .npz latent files")
+    parser.add_argument("--input_dir", type=str, required=True, help="Directory with input files")
     parser.add_argument("--lmdb_path", type=str, required=True, help="Path to output LMDB")
     parser.add_argument("--use_moxing", action="store_true", help="Enable moxing for remote file access")
     parser.add_argument("--num_shards", type=int, default=1, help="Number of LMDB shards to split data into (default: 1, no sharding)")
+    parser.add_argument("--input_format", type=str, default="npz", choices=["npz", "pt"], help="Input file format: npz or pt (default: npz)")
     args = parser.parse_args()
 
     # Import moxing if needed
@@ -110,16 +159,17 @@ def main():
             print("Warning: moxing not available, falling back to local file access only")
             args.use_moxing = False
 
-    print(f"Reading latent files from: {args.input_dir}")
+    print(f"Reading {args.input_format} files from: {args.input_dir}")
 
-    # List all npz files
-    npz_files = list_npz_files(args.input_dir, args.use_moxing)
+    # List all input files
+    file_ext = f".{args.input_format}"
+    input_files = list_files(args.input_dir, args.use_moxing, file_ext)
 
-    if not npz_files:
-        print(f"No .npz files found in {args.input_dir}")
+    if not input_files:
+        print(f"No {file_ext} files found in {args.input_dir}")
         return
 
-    print(f"Found {len(npz_files)} latent files")
+    print(f"Found {len(input_files)} input files")
 
     num_shards = max(1, args.num_shards)
     if num_shards > 1:
@@ -154,30 +204,34 @@ def main():
             'local_lmdb_path': local_lmdb_path,
             'env': env,
             'counter': 0,
-            'first_latent': None,
-            'first_prompt': None,
+            'first_sample': None,
             'temp_dir': temp_dir,
         })
 
+    # Select load function based on input format
+    if args.input_format == "npz":
+        load_func = load_from_npz
+    else:
+        load_func = load_from_pt
+
     # Process each file, round-robin into shards
-    for file_idx, file_path in enumerate(tqdm(npz_files, desc="Writing LMDB")):
+    total_samples = 0
+    for file_idx, file_path in enumerate(tqdm(input_files, desc="Writing LMDB")):
         shard_idx = file_idx % num_shards
         shard = shards[shard_idx]
         try:
-            latent, prompt = load_latent_and_prompt(file_path, args.use_moxing)
+            samples = load_func(file_path, args.use_moxing)
 
-            # Keep first sample for shape info
-            if shard['counter'] == 0:
-                shard['first_latent'] = latent
-                shard['first_prompt'] = prompt
+            for sample in samples:
+                # Keep first sample for shape info
+                if shard['counter'] == 0:
+                    shard['first_sample'] = sample
 
-            # Write single entry
-            data_dict = {
-                'latents': np.expand_dims(latent, axis=0),  # (1, T, C, H, W)
-                'prompts': np.array([prompt], dtype=object)
-            }
-            store_arrays_to_lmdb(shard['env'], data_dict, start_index=shard['counter'])
-            shard['counter'] += 1
+                # Build data dict and store
+                data_dict = build_data_dict_from_sample(sample)
+                store_arrays_to_lmdb(shard['env'], data_dict, start_index=shard['counter'])
+                shard['counter'] += 1
+                total_samples += 1
 
         except Exception as e:
             print(f"Failed to process {file_path}: {e}")
@@ -203,10 +257,14 @@ def main():
         else:
             print("Writing shape info...")
         with shard['env'].begin(write=True) as txn:
-            latents_sample = np.expand_dims(shard['first_latent'], axis=0)
-            prompts_sample = np.array([shard['first_prompt']], dtype=object)
+            # Use first sample to get all keys
+            first_sample = shard['first_sample']
 
-            for key, val in [('latents', latents_sample), ('prompts', prompts_sample)]:
+            # Build sample dict with all keys
+            sample_dict = build_data_dict_from_sample(first_sample)
+
+            # Write shape for each key
+            for key, val in sample_dict.items():
                 array_shape = np.array(val.shape)
                 array_shape[0] = counter  # total count in this shard
                 shape_key = f"{key}_shape".encode()
@@ -235,9 +293,9 @@ def main():
     # Summary
     if num_shards > 1:
         per_shard = [s['counter'] for s in shards]
-        print(f"Done! Wrote {total_written} videos across {num_shards} shards: {per_shard}")
+        print(f"Done! Wrote {total_written} samples across {num_shards} shards: {per_shard}")
     else:
-        print(f"Done! Successfully wrote {total_written} videos to LMDB: {args.lmdb_path}")
+        print(f"Done! Successfully wrote {total_written} samples to LMDB: {args.lmdb_path}")
 
 
 if __name__ == "__main__":
