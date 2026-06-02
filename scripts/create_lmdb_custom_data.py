@@ -6,30 +6,34 @@ Features:
 2. Write data to LMDB (latents/prompts for npz, ODE pairs for pt)
 3. Compatible with MultiODERegressionLMDBDataset
 4. Optional sharding into multiple LMDB files
+5. Save data in float16 for smaller LMDB size
 
 Usage:
-    # Local files, npz format
+    # Local files, clean latents (npz format)
     python scripts/create_lmdb_custom_data.py \
         --input_dir processed_data \
-        --lmdb_path output.lmdb
+        --lmdb_path output.lmdb \
+        --data_type clean
 
-    # Local files, pt format (ODE pairs)
+    # Local files, ODE pairs (pt format)
     python scripts/create_lmdb_custom_data.py \
         --input_dir ode_pairs \
         --lmdb_path output.lmdb \
-        --input_format pt
+        --data_type ode
 
     # With moxing for remote paths
     python scripts/create_lmdb_custom_data.py \
         --input_dir obs://bucket/processed_data \
         --lmdb_path obs://bucket/output.lmdb \
-        --use_moxing
+        --use_moxing \
+        --data_type clean
 
     # Shard into multiple LMDB files
     python scripts/create_lmdb_custom_data.py \
         --input_dir processed_data \
         --lmdb_path output.lmdb \
-        --num_shards 4
+        --num_shards 4 \
+        --data_type ode
 """
 import sys
 import os
@@ -127,17 +131,29 @@ def load_from_pt(file_path, use_moxing):
     return samples
 
 
-def build_data_dict_from_sample(sample):
-    """Build data dict from sample for LMDB storage."""
+def build_data_dict_from_sample(sample, data_type=None):
+    """Build data dict from sample for LMDB storage. Convert to float16 if data_type is ode."""
     data_dict = {}
     for key, val in sample.items():
         if key == 'prompt':
             data_dict['prompts'] = np.array([val], dtype=object)
         elif key == 'latent':
+            if isinstance(val, torch.Tensor):
+                val = val.cpu().numpy()
+            if data_type == 'ode' and val.dtype in (np.float32, np.float64):
+                val = val.astype(np.float16)
             data_dict['latents'] = np.expand_dims(val, axis=0)
         elif key == 'latents':
+            if isinstance(val, torch.Tensor):
+                val = val.cpu().numpy()
+            if data_type == 'ode' and val.dtype in (np.float32, np.float64):
+                val = val.astype(np.float16)
             data_dict['latents'] = np.expand_dims(val, axis=0)
         else:
+            if isinstance(val, torch.Tensor):
+                val = val.cpu().numpy()
+            if data_type == 'ode' and val.dtype in (np.float32, np.float64):
+                val = val.astype(np.float16)
             data_dict[key] = np.expand_dims(val, axis=0)
     return data_dict
 
@@ -148,8 +164,14 @@ def main():
     parser.add_argument("--lmdb_path", type=str, required=True, help="Path to output LMDB")
     parser.add_argument("--use_moxing", action="store_true", help="Enable moxing for remote file access")
     parser.add_argument("--num_shards", type=int, default=1, help="Number of LMDB shards to split data into (default: 1, no sharding)")
-    parser.add_argument("--input_format", type=str, default="npz", choices=["npz", "pt"], help="Input file format: npz or pt (default: npz)")
+    parser.add_argument("--data_type", type=str, required=True, choices=["ode", "clean"], help="Data type: ode (uses .pt) or clean (uses .npz)")
     args = parser.parse_args()
+
+    # Map data_type to input_format
+    if args.data_type == "clean":
+        input_format = "npz"
+    else:  # ode
+        input_format = "pt"
 
     # Import moxing if needed
     if args.use_moxing:
@@ -157,10 +179,10 @@ def main():
             print("Warning: moxing not available, falling back to local file access only")
             args.use_moxing = False
 
-    print(f"Reading {args.input_format} files from: {args.input_dir}")
+    print(f"Reading {input_format} files (data_type={args.data_type}) from: {args.input_dir}")
 
     # List all input files
-    file_ext = f".{args.input_format}"
+    file_ext = f".{input_format}"
     input_files = list_files(args.input_dir, args.use_moxing, file_ext)
 
     if not input_files:
@@ -207,7 +229,7 @@ def main():
         })
 
     # Select load function based on input format
-    if args.input_format == "npz":
+    if input_format == "npz":
         load_func = load_from_npz
     else:
         load_func = load_from_pt
@@ -226,7 +248,7 @@ def main():
                     shard['first_sample'] = sample
 
                 # Build data dict and store
-                data_dict = build_data_dict_from_sample(sample)
+                data_dict = build_data_dict_from_sample(sample, data_type=args.data_type)
                 store_arrays_to_lmdb(shard['env'], data_dict, start_index=shard['counter'])
                 shard['counter'] += 1
                 total_samples += 1
@@ -259,7 +281,7 @@ def main():
             first_sample = shard['first_sample']
 
             # Build sample dict with all keys
-            sample_dict = build_data_dict_from_sample(first_sample)
+            sample_dict = build_data_dict_from_sample(first_sample, data_type=args.data_type)
 
             # Write shape for each key
             for key, val in sample_dict.items():
