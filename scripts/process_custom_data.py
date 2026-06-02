@@ -245,12 +245,16 @@ def resize_video(video_np, target_frames=81, target_height=480, target_width=832
     return resized_spatial
 
 
-def io_worker_thread(item: WorkItem, use_moxing: bool, target_frames: int, target_height: int, target_width: int, device: str, use_gpu_resize: bool) -> WorkItem:
+def io_worker_thread(item: WorkItem, use_moxing: bool, target_frames: int, target_height: int, target_width: int, device: str, use_gpu_resize: bool, gpu_resize_lock: Optional[threading.Lock] = None) -> WorkItem:
     """IO worker: read video + resize (on GPU if available)."""
     try:
         video_np = get_video_reader(item.video_fn, use_moxing)
         if use_gpu_resize and device is not None and 'cpu' not in str(device):
-            item.resized_np = resize_video_gpu(video_np, target_frames, target_height, target_width, fps=16, device=device)
+            if gpu_resize_lock is not None:
+                with gpu_resize_lock:
+                    item.resized_np = resize_video_gpu(video_np, target_frames, target_height, target_width, fps=16, device=device)
+            else:
+                item.resized_np = resize_video_gpu(video_np, target_frames, target_height, target_width, fps=16, device=device)
         else:
             item.resized_np = resize_video(video_np, target_frames, target_height, target_width, fps=16)
         item.success = True
@@ -470,10 +474,24 @@ def main():
         return
 
     # Load VAE
-    device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        if dist.is_initialized():
+            # Use the device already set by launch_distributed_job (local_rank)
+            device = torch.device(f"cuda:{torch.cuda.current_device()}")
+        else:
+            device = torch.device(args.device)
+    else:
+        device = torch.device("cpu")
     vae = WanVAEWrapper().to(device=device, dtype=torch.bfloat16).eval()
 
+    # Disable GPU resize by default to avoid OOM from multiple IO workers
+    # User can still enable with --cpu_resize_only=False if needed
     use_gpu_resize = not args.cpu_resize_only and 'cpu' not in str(device)
+    gpu_resize_lock = threading.Lock() if use_gpu_resize else None
+    if use_gpu_resize and args.num_io_workers > 1:
+        if is_main:
+            print(f"Warning: GPU resize with {args.num_io_workers} IO workers may cause OOM. "
+                  f"Consider using --cpu_resize_only or reducing --num_io_workers.")
 
     # Create work items for this rank (with hash-based filenames)
     work_items = []
@@ -533,7 +551,7 @@ def main():
 
             try:
                 result_item = io_worker_thread(item, args.use_moxing, args.target_frames,
-                                               args.target_height, args.target_width, device, use_gpu_resize)
+                                               args.target_height, args.target_width, device, use_gpu_resize, gpu_resize_lock)
                 resized_queue.put(result_item)
             except Exception as e:
                 item.success = False
