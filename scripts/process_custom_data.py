@@ -318,15 +318,10 @@ def save_resized_video(video_np, save_path, fps=16, use_moxing=False):
             for frame in video_np:
                 writer.append_data(frame)
             writer.close()
-            try:
-                mox.file.make_dirs(os.path.dirname(save_path))
-            except Exception:
-                pass
             mox.file.copy(tmp_path, save_path)
         finally:
             os.unlink(tmp_path)
     else:
-        os.makedirs(os.path.dirname(save_path) or '.', exist_ok=True)
         writer = imageio.get_writer(save_path, fps=fps, codec='libx264', output_params=['-pix_fmt', 'yuv420p'])
         for frame in video_np:
             writer.append_data(frame)
@@ -349,14 +344,9 @@ def save_latent_and_prompt(latent_np, prompt, output_path, use_moxing):
         bio = BytesIO()
         np.savez(bio, latent=latent_np, prompt=prompt)
         bio.seek(0)
-        try:
-            mox.file.make_dirs(os.path.dirname(output_path))
-        except Exception:
-            pass
         with mox.file.File(output_path, 'wb') as f:
             f.write(bio.read())
     else:
-        os.makedirs(os.path.dirname(output_path) or '.', exist_ok=True)
         np.savez(output_path, latent=latent_np, prompt=prompt)
 
 
@@ -366,13 +356,7 @@ def write_worker_thread(item: WorkItem, output_dir: str, save_video_dir: Optiona
         # Use hash-based filename
         latent_path = os.path.join(output_dir, f"latent_{item.file_hash}.npz")
 
-        # Skip if already exists
-        if check_file_exists(latent_path, use_moxing):
-            item.skip_existing = True
-            item.success = True
-            return item
-
-        # Save latent
+        # Save latent (no existence check - already pre-checked on rank0)
         save_latent_and_prompt(item.latent_np, item.prompt, latent_path, use_moxing)
 
         # Save video if requested
@@ -380,8 +364,7 @@ def write_worker_thread(item: WorkItem, output_dir: str, save_video_dir: Optiona
             video_basename = os.path.basename(item.video_fn)
             video_name, _ = os.path.splitext(video_basename)
             video_save_path = os.path.join(save_video_dir, f"{video_name}_{item.file_hash}.mp4")
-            if not check_file_exists(video_save_path, use_moxing):
-                save_resized_video(item.resized_np, video_save_path, 16, use_moxing)
+            save_resized_video(item.resized_np, video_save_path, 16, use_moxing)
 
         item.success = True
     except Exception as e:
@@ -461,6 +444,19 @@ def main():
             else:
                 filtered_data.append((video_fn, prompt))
         print(f"Pre-skipped {skipped_precheck} already existing videos, processing {len(filtered_data)} videos")
+
+        # Create output directories upfront on rank0 to avoid concurrent creation issues
+        try:
+            if args.use_moxing and mox is not None:
+                mox.file.make_dirs(args.output_dir)
+                if args.save_video_dir:
+                    mox.file.make_dirs(args.save_video_dir)
+            else:
+                os.makedirs(args.output_dir, exist_ok=True)
+                if args.save_video_dir:
+                    os.makedirs(args.save_video_dir, exist_ok=True)
+        except Exception:
+            pass
     else:
         filtered_data = []
 
@@ -702,10 +698,7 @@ def main():
             try:
                 result_item = write_worker_thread(item, args.output_dir, args.save_video_dir, args.use_moxing)
                 if result_item.success:
-                    if result_item.skip_existing:
-                        skipped += 1
-                    else:
-                        write_ok += 1
+                    write_ok += 1
                 else:
                     failed += 1
                     print(f"Rank {rank}: Write failed for {result_item.video_fn}: {result_item.error_msg}")
