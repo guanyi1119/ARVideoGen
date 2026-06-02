@@ -116,15 +116,13 @@ def load_from_pt(file_path, use_moxing):
         data_dict = torch.load(file_path)
 
     # Process data dict and return list of samples
+    # Format: {prompt: stored_data_tensor}
     samples = []
-    num_samples = len(data_dict['prompts'])
-    for i in range(num_samples):
-        sample = {}
-        for key, val in data_dict.items():
-            if key == 'prompts':
-                sample['prompt'] = str(val[i])
-            else:
-                sample[key] = val[i]
+    for prompt, stored_data in data_dict.items():
+        sample = {
+            'prompt': str(prompt),
+            'latents': stored_data
+        }
         samples.append(sample)
     return samples
 
