@@ -1,3 +1,23 @@
+"""
+Causal Forcing Training Script
+
+Usage:
+    # Basic usage with config file
+    python train_causal_forcing.py --config_path configs/causal_forcing/xxx.yaml
+
+    # Override config parameters from command line
+    python train_causal_forcing.py --config_path configs/causal_forcing/xxx.yaml \
+        learning_rate=1e-4 \
+        batch_size=32 \
+        trainer.diffusion_steps=1000 \
+        model.num_layers=12
+
+    # With other flags
+    python train_causal_forcing.py --config_path configs/causal_forcing/xxx.yaml \
+        --logdir my_exp \
+        --no_save \
+        learning_rate=1e-4
+"""
 import argparse
 import os
 from omegaconf import OmegaConf
@@ -20,6 +40,8 @@ def main():
     parser.add_argument("--wandb-save-dir", type=str, default="")
     parser.add_argument("--disable-wandb", action="store_true")
     parser.add_argument("--tf", action="store_true")
+    # Accept arbitrary overrides in the format key=value
+    parser.add_argument("overrides", nargs="*", help="Override config parameters, e.g. learning_rate=1e-4 batch_size=32")
 
     args = parser.parse_args()
 
@@ -34,6 +56,24 @@ def main():
     config.logdir = os.path.join(output_root, args.logdir)
     config.wandb_save_dir = os.path.join(output_root, args.wandb_save_dir)
     config.disable_logging = args.disable_wandb
+
+    # Apply command line overrides
+    for override in args.overrides:
+        if "=" not in override:
+            continue
+        key, value = override.split("=", 1)
+        try:
+            # Try to parse as number first, fallback to string
+            if "." in value or "e" in value.lower():
+                parsed_value = float(value)
+            elif value.lower() in ("true", "false"):
+                parsed_value = value.lower() == "true"
+            else:
+                parsed_value = int(value)
+        except ValueError:
+            # Keep as string
+            parsed_value = value
+        OmegaConf.update(config, key, parsed_value, force_add=True)
 
     if config.trainer == "diffusion":
         trainer = DiffusionTrainer(config)
