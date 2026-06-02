@@ -433,8 +433,9 @@ def main():
               f"prefetch={args.prefetch}, vae_batch_size={args.vae_batch_size}, "
               f"gpu_resize={not args.cpu_resize_only}")
 
-    # Read all data on main rank
+    # Read all data on main rank and pre-check existing files
     all_data = []
+    filtered_data = []
     if is_main:
         all_data = read_multiple_jsonl(args.jsonl_paths)
         print(f"Total videos across all JSONLs: {len(all_data)}")
@@ -449,28 +450,41 @@ def main():
             all_data = deduplicated
             print(f"Deduplicated to {len(all_data)} videos")
 
-    # Broadcast data to all ranks
+        # Pre-check existing files (only on rank0 to avoid sqlite3 lock issues)
+        skipped_precheck = 0
+        filtered_data = []
+        for video_fn, prompt in all_data:
+            file_hash = get_video_hash(video_fn)
+            latent_path = os.path.join(args.output_dir, f"latent_{file_hash}.npz")
+            if check_file_exists(latent_path, args.use_moxing):
+                skipped_precheck += 1
+            else:
+                filtered_data.append((video_fn, prompt))
+        print(f"Pre-skipped {skipped_precheck} already existing videos, processing {len(filtered_data)} videos")
+    else:
+        filtered_data = []
+
+    # Broadcast filtered data to all ranks
     if dist.is_initialized():
         import pickle
-        data_obj = pickle.dumps(all_data) if is_main else None
+        data_obj = pickle.dumps(filtered_data) if is_main else None
         data_obj = [data_obj]
         dist.broadcast_object_list(data_obj, src=0)
         if not is_main:
-            all_data = pickle.loads(data_obj[0])
+            filtered_data = pickle.loads(data_obj[0])
 
     # Determine this rank's share of work
-    num_total = len(all_data)
+    num_total = len(filtered_data)
     rank_start = rank * (num_total // world_size) + min(rank, num_total % world_size)
     rank_end = rank_start + (num_total // world_size) + (1 if rank < num_total % world_size else 0)
-    local_data = all_data[rank_start:rank_end]
+    local_data = filtered_data[rank_start:rank_end]
 
     print(f"Rank {rank}: processing {len(local_data)} videos (hash-based filenames)")
 
     if len(local_data) == 0:
+        print(f"Rank {rank}: No videos to process.")
         if dist.is_initialized():
             dist.barrier()
-        if is_main:
-            print(f"Done! No videos to process on rank {rank}.")
         return
 
     # Load VAE
@@ -495,7 +509,6 @@ def main():
 
     # Create work items for this rank (with hash-based filenames)
     work_items = []
-    skipped_precheck = 0
     for idx, (video_fn, prompt) in enumerate(local_data):
         item = WorkItem(
             idx=idx,
@@ -503,18 +516,10 @@ def main():
             prompt=prompt,
             file_hash=get_video_hash(video_fn)
         )
-        # Pre-check if already exists to avoid unnecessary IO
-        latent_path = os.path.join(args.output_dir, f"latent_{item.file_hash}.npz")
-        if check_file_exists(latent_path, args.use_moxing):
-            skipped_precheck += 1
-            continue
         work_items.append(item)
 
-    if skipped_precheck > 0:
-        print(f"Rank {rank}: Pre-skipped {skipped_precheck} already existing videos")
-
     if len(work_items) == 0:
-        print(f"Rank {rank}: No videos to process (all skipped).")
+        print(f"Rank {rank}: No videos to process.")
         if dist.is_initialized():
             dist.barrier()
         return
@@ -578,8 +583,6 @@ def main():
     items_encoded = 0
     start_time = time.time()
     start_step = 0
-    throughput_print_interval = max(10, min(100, total // 10))  # Adaptive interval
-    throughput_lock = threading.Lock()
     last_printed_step = 0
 
     def vae_worker():
@@ -632,21 +635,20 @@ def main():
                     items_encoded += len(batch_buffer)
 
                     # Print throughput periodically (only from main rank, with lock protection)
-                    if is_main:
-                        current_step = items_encoded
-                        end_time = time.time()
-                        end_step = current_step
-                        step_diff = end_step - start_step
-                        time_diff = end_time - start_time
-                        throughput = step_diff / time_diff if time_diff > 0 else 0
-                        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        print(
-                            f"{timestamp}: [processed {current_step}/{total}] "
-                            f"DI_throughput: {throughput:.2f} samples/s/npu"
-                        )
-                        start_time = end_time
-                        start_step = end_step
-                        last_printed_step = current_step
+                    current_step = items_encoded
+                    end_time = time.time()
+                    end_step = current_step
+                    step_diff = end_step - start_step
+                    time_diff = end_time - start_time
+                    throughput = step_diff / time_diff if time_diff > 0 else 0
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    print(
+                        f"{timestamp}: [processed {current_step}/{total}] "
+                        f"DI_throughput: {throughput:.2f} samples/s/npu"
+                    )
+                    start_time = end_time
+                    start_step = end_step
+                    last_printed_step = current_step
                 except Exception as e:
                     import traceback
                     print(f"Rank {rank}: VAE encode failed for batch: {e}")
