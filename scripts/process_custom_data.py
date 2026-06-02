@@ -320,16 +320,23 @@ def save_resized_video(video_np, save_path, fps=16, use_moxing=False):
     is_remote = use_moxing and (save_path.startswith('obs://') or save_path.startswith('s3://'))
 
     if is_remote and mox is not None:
-        # Write to BytesIO first, then write to remote with mox.file.File
-        bio = BytesIO()
-        writer = imageio.get_writer(bio, format='ffmpeg', fps=fps, codec='libx264', output_params=['-pix_fmt', 'yuv420p'])
-        for frame in video_np:
-            writer.append_data(frame)
-        writer.close()
-        bio.seek(0)
-        with _mox_lock:
-            with mox.file.File(save_path, 'wb') as f:
-                f.write(bio.read())
+        # Write to temp file first, then copy to remote with mox.file.copy
+        with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as tmp:
+            tmp_path = tmp.name
+
+        try:
+            writer = imageio.get_writer(tmp_path, fps=fps, codec='libx264', output_params=['-pix_fmt', 'yuv420p'])
+            for frame in video_np:
+                writer.append_data(frame)
+            writer.close()
+
+            with _mox_lock:
+                mox.file.copy(tmp_path, save_path)
+        finally:
+            try:
+                os.unlink(tmp_path)
+            except:
+                pass
     else:
         writer = imageio.get_writer(save_path, fps=fps, codec='libx264', output_params=['-pix_fmt', 'yuv420p'])
         for frame in video_np:
