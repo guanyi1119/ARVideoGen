@@ -55,6 +55,11 @@ Usage:
 """
 import sys
 import os
+# Disable moxing cache BEFORE any moxing imports to avoid "database is locked" issues
+os.environ['MOX_FILE_CACHE_ENABLE'] = '0'
+os.environ['MOX_ENABLE_CACHE'] = '0'
+os.environ['MOX_DISABLE_CACHE'] = '1'
+
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(script_dir, '..'))
 sys.path.insert(0, project_root)
