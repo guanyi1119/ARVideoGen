@@ -143,6 +143,8 @@ class MultiODERegressionLMDBDataset(Dataset):
 
         if len(latents.shape) == 4:
             latents = latents[None, ...]
+        if len(latents.shape) == 6:
+            latents = latents[0]
 
         prompts = retrieve_row_from_lmdb(
             self.envs[shard_id],
