@@ -121,7 +121,7 @@ def load_from_pt(file_path, use_moxing):
     for prompt, stored_data in data_dict.items():
         sample = {
             'prompt': str(prompt),
-            'latents': stored_data
+            'latent': stored_data
         }
         samples.append(sample)
     return samples
