@@ -13,7 +13,8 @@ export TASK_QUEUE_ENABLE=1
 python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/models/wan_models/Wan2.1-T2V-1.3B', '/cache/wan_models/Wan2.1-T2V-1.3B')"
 python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/models/wan_models/Wan2.1-T2V-14B', '/cache/wan_models/Wan2.1-T2V-14B')"
 python -c "import moxing as mox; mox.file.copy('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/models/Self-Forcing/vidprom_filtered_extended.txt', '/cache/vidprom_filtered_extended.txt')"
-python -c "import moxing as mox; mox.file.copy('obs://yw-ads-model-training-gy1/model-dev/pixelgeek/video-gen-ar/2026/05/08/d64d9e701c134c5a951425f605fc179e/output/train_outputs/causal_forcing_ode_chunkwise_continue/checkpoint_model_004000/model.pt', '/cache/ode_model.pt')"
+# python -c "import moxing as mox; mox.file.copy('obs://yw-ads-model-training-gy1/model-dev/pixelgeek/video-gen-ar/2026/05/08/d64d9e701c134c5a951425f605fc179e/output/train_outputs/causal_forcing_ode_chunkwise_continue/checkpoint_model_004000/model.pt', '/cache/ode_model.pt')"
+# ode init model should be put here: /cache/ode_model.pt
 
 MASTER_ADDR=$(echo $VC_WORKER_HOSTS | cut -d',' -f1)
 
