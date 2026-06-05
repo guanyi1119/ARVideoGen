@@ -7,13 +7,13 @@ from collections.abc import Mapping
 import pandas as pd
 
 import torch
-from videoalign.vision_process import process_vision_info, process_wanvideo_tensor
+from methods.reward_forcing.videoalign.vision_process import process_vision_info, process_wanvideo_tensor
 
-from videoalign.data import DataConfig
-from videoalign.utils import ModelConfig, PEFTLoraConfig, TrainingConfig
-from videoalign.utils import load_model_from_checkpoint
-from videoalign.train_reward import create_model_and_processor
-from videoalign.prompt_template import build_prompt
+from methods.reward_forcing.videoalign.data import DataConfig
+from methods.reward_forcing.videoalign.utils import ModelConfig, PEFTLoraConfig, TrainingConfig
+from methods.reward_forcing.videoalign.utils import load_model_from_checkpoint
+from methods.reward_forcing.videoalign.train_reward import create_model_and_processor
+from methods.reward_forcing.videoalign.prompt_template import build_prompt
 
 import numpy as np
 from PIL import Image

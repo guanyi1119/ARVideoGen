@@ -17,8 +17,7 @@ def main():
     parser.add_argument("--no_save", action="store_true")
     parser.add_argument("--no_visualize", action="store_true")
     parser.add_argument("--logdir", type=str, default="")
-    parser.add_argument("--wandb-save-dir", type=str, default="")
-    parser.add_argument("--disable-wandb", action="store_true")
+    parser.add_argument("--disable-logging", action="store_true")
 
     args = parser.parse_args()
 
@@ -26,12 +25,11 @@ def main():
     config = load_config(args.config_path, default_config_path=default_config_path)
     config.no_save = args.no_save
     config.no_visualize = args.no_visualize
+    config.disable_logging = args.disable_logging
     config_name = os.path.basename(args.config_path).split(".")[0]
     config.config_name = config_name
     output_root = os.environ.get('OUTPUT_URL', '.')
     config.logdir = os.path.join(output_root, args.logdir)
-    config.wandb_save_dir = os.path.join(output_root, args.wandb_save_dir)
-    config.disable_logging = args.disable_wandb
 
     if config.trainer == "diffusion":
         trainer = DiffusionTrainer(config)

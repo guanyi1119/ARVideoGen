@@ -1,5 +1,6 @@
 import gc
 import logging
+from datetime import datetime
 
 from numpy.random import beta
 
@@ -8,13 +9,13 @@ from core.data.dataset import TextDataset
 from core.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
 from core.misc import (
     set_seed,
-    merge_dict_list
+    merge_dict_list,
+    TensorBoardLogger
 )
 import torch.distributed as dist
 from omegaconf import OmegaConf
 from methods.reward_forcing import CausVid, ReDMD, SiD
 import torch
-import wandb
 import time
 import os
 
@@ -36,7 +37,7 @@ class Trainer:
         self.device = torch.cuda.current_device()
         self.is_main_process = global_rank == 0
         self.causal = config.causal
-        self.disable_wandb = config.disable_wandb
+        self.disable_logging = getattr(config, "disable_logging", False) or getattr(config, "disable_wandb", False)
 
         self.gradient_accumulation_steps = getattr(config, "gradient_accumulation_steps", 1)
         
@@ -53,15 +54,13 @@ class Trainer:
 
         set_seed(config.seed + global_rank)
 
-        if self.is_main_process and not self.disable_wandb:
-            wandb.login(host=config.wandb_host, key=config.wandb_key)
-            wandb.init(
-                config=OmegaConf.to_container(config, resolve=True),
-                name=config.config_name,
-                mode="online",
-                entity=config.wandb_entity,
-                project=config.wandb_project,
-                dir=config.wandb_save_dir
+        if self.is_main_process and not self.disable_logging:
+            tensorboard_dir = os.path.join(self.output_path, "tensorboard")
+            os.makedirs(tensorboard_dir, exist_ok=True)
+            self.writer = TensorBoardLogger(
+                log_dir=tensorboard_dir,
+                config=config,
+                name=getattr(config, "config_name", None)
             )
 
         self.output_path = config.logdir
@@ -327,6 +326,8 @@ class Trainer:
 
     def train(self):
         start_step = self.step
+        self.start_step = 0
+        self.start_time = time.time()
 
         while self.step < self.config.full_training_steps:
             # TRAIN_GENERATOR = self.step % self.config.dfake_gen_update_ratio == 0
@@ -381,26 +382,24 @@ class Trainer:
                 torch.cuda.empty_cache()
 
             # Logging
-            if self.is_main_process:
-                wandb_loss_dict = {}
-                if TRAIN_GENERATOR:
-                    wandb_loss_dict.update(
-                        {
-                            "generator_loss": generator_log_dict["generator_loss"].mean().item(),
-                            "generator_grad_norm": generator_log_dict["generator_grad_norm"].mean().item(),
-                            "dmdtrain_gradient_norm": generator_log_dict["dmdtrain_gradient_norm"].mean().item()
-                        }
-                    )
-
-                wandb_loss_dict.update(
+            log_dict = {}
+            if TRAIN_GENERATOR:
+                log_dict.update(
                     {
-                        "critic_loss": critic_log_dict["critic_loss"].mean().item(),
-                        "critic_grad_norm": critic_log_dict["critic_grad_norm"].mean().item()
+                        "generator_loss": generator_log_dict["generator_loss"].mean().item(),
+                        "generator_grad_norm": generator_log_dict["generator_grad_norm"].mean().item(),
+                        "dmdtrain_gradient_norm": generator_log_dict["dmdtrain_gradient_norm"].mean().item()
                     }
                 )
-
-                if not self.disable_wandb:
-                    wandb.log(wandb_loss_dict, step=self.step)
+            log_dict.update(
+                {
+                    "critic_loss": critic_log_dict["critic_loss"].mean().item(),
+                    "critic_grad_norm": critic_log_dict["critic_grad_norm"].mean().item()
+                }
+            )
+            if self.is_main_process:
+                if not self.disable_logging:
+                    self.writer.log(log_dict, step=self.step)
 
             if self.step % self.config.gc_interval == 0:
                 if dist.get_rank() == 0:
@@ -413,6 +412,26 @@ class Trainer:
                 if self.previous_time is None:
                     self.previous_time = current_time
                 else:
-                    if not self.disable_wandb:
-                        wandb.log({"per iteration time": current_time - self.previous_time}, step=self.step)
+                    if not self.disable_logging:
+                        self.writer.log({"per iteration time": current_time - self.previous_time}, step=self.step)
                     self.previous_time = current_time
+
+            batch_size = len(batch["prompts"])
+            if (self.step + 1) % 1 == 0:
+                end_time = time.time()
+                end_step = self.step + 1
+
+                step_diff = end_step - self.start_step
+                time_diff = end_time - self.start_time
+                seconds_per_iter = time_diff / step_diff
+                throughput = 1560*12*batch_size / seconds_per_iter
+
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                print(
+                    f"{timestamp}: [step {self.step}] "
+                    f"generator_loss: {log_dict.get('generator_loss', 0.0):.4f} "
+                    f"critic_loss: {log_dict['critic_loss']:.4f} "
+                    f"DI_throughput: {throughput:.2f} samples/s/npu"
+                )
+                self.start_time = time.time()
+                self.start_step = end_step
