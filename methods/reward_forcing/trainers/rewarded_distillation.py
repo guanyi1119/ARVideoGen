@@ -38,6 +38,7 @@ class Trainer:
         self.is_main_process = global_rank == 0
         self.causal = config.causal
         self.disable_logging = getattr(config, "disable_logging", False) or getattr(config, "disable_wandb", False)
+        self.output_path = config.logdir
 
         self.gradient_accumulation_steps = getattr(config, "gradient_accumulation_steps", 1)
         
