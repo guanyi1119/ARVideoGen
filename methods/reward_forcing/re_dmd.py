@@ -145,7 +145,7 @@ class ReDMD(RewardForcingModel):
 
         batch_size, num_frame = image_or_video.shape[:2]
 
-        videos = 255.0 * pixels
+        videos = (1 + pixels) / 2.0  # -1~1 to 0~1
 
         reward = self.inferencer.reward_from_frames(
             [videos[0]],

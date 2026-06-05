@@ -310,7 +310,7 @@ def process_wanvideo_tensor(
             [resized_height, resized_width],
             interpolation=InterpolationMode.BICUBIC,
             antialias=True,
-        ).float()
+        ).float().clamp(0.0, 1.0)
     
     return video.float()
 
