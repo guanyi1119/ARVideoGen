@@ -430,7 +430,7 @@ class Trainer:
                     f"{timestamp}: [step {self.step}] "
                     f"generator_loss: {log_dict.get('generator_loss', 0.0):.4f} "
                     f"critic_loss: {log_dict['critic_loss']:.4f} "
-                    f"DI_throughput: {throughput:.2f} samples/s/npu"
+                    f"DI_throughput: {throughput:.2f} tokens/s/npu"
                 )
                 self.start_time = time.time()
                 self.start_step = end_step
