@@ -1,7 +1,7 @@
 import gc
 import logging
 from core.data.dataset import ODERegressionLMDBDataset, cycle
-from methods.self_forcing import ODERegression
+from methods.reward_forcing import DMD
 from collections import defaultdict
 from core.misc import (
     set_seed,
@@ -56,7 +56,7 @@ class Trainer:
         # Step 2: Initialize the model and optimizer
 
         assert config.distribution_loss == "ode", "Only ODE loss is supported for ODE training"
-        self.model = ODERegression(config, device=self.device)
+        self.model = DMD(config, device=self.device)
 
         self.model.generator = fsdp_wrap(
             self.model.generator,

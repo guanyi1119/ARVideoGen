@@ -1,12 +1,12 @@
-from methods.self_forcing.pipelines.self_forcing_training import SelfForcingTrainingPipeline
+from methods.reward_forcing.pipelines.self_forcing_training import SelfForcingTrainingPipeline
 import torch.nn.functional as F
 from typing import Optional, Tuple
 import torch
 
-from methods.base.base_self_forcing import SelfForcingModel
+from methods.base.base_reward_forcing import RewardForcingModel
 
 
-class DMD(SelfForcingModel):
+class DMD(RewardForcingModel):
     def __init__(self, args, device):
         """
         Initialize the DMD (Distribution Matching Distillation) module.

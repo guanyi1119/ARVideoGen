@@ -8,7 +8,7 @@ if DEVICE_TYPE == "npu":
     from torch_npu.contrib import transfer_to_npu
 
 from core.config import load_config
-from methods.reward_forcing.trainers import DiffusionTrainer, GANTrainer, ODETrainer, ScoreDistillationTrainer, RewardedDistillationTrainer
+from methods.reward_forcing.trainers import DiffusionTrainer, ScoreDistillationTrainer, RewardedDistillationTrainer
 
 
 def main():

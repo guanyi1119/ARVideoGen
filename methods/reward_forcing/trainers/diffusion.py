@@ -1,7 +1,7 @@
 import gc
 import logging
 
-from methods.self_forcing import CausalDiffusion
+from methods.reward_forcing import DMD
 from core.data.dataset import ShardingLMDBDataset, cycle
 from core.misc import set_seed, TensorBoardLogger
 import torch.distributed as dist
@@ -52,7 +52,7 @@ class Trainer:
             )
 
         # Step 2: Initialize the model and optimizer
-        self.model = CausalDiffusion(config, device=self.device)
+        self.model = DMD(config, device=self.device)
         self.model.generator = fsdp_wrap(
             self.model.generator,
             sharding_strategy=config.sharding_strategy,

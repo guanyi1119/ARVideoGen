@@ -10,7 +10,7 @@ from core.misc import (
 )
 import torch.distributed as dist
 from omegaconf import OmegaConf
-from methods.self_forcing import GAN
+from methods.reward_forcing import DMD
 import torch
 
 import time
@@ -63,7 +63,7 @@ class Trainer:
             )
 
         # Step 2: Initialize the model and optimizer
-        self.model = GAN(config, device=self.device)
+        self.model = DMD(config, device=self.device)
 
         self.model.generator = fsdp_wrap(
             self.model.generator,

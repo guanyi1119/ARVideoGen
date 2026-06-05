@@ -11,7 +11,7 @@ from core.misc import (
 )
 import torch.distributed as dist
 from omegaconf import OmegaConf
-from model import CausVid, DMD, SiD
+from methods.reward_forcing import DMD, ReDMD
 import torch
 
 import time
@@ -57,12 +57,12 @@ class Trainer:
             )
 
         # Step 2: Initialize the model and optimizer
-        if config.distribution_loss == "causvid":
-            self.model = CausVid(config, device=self.device)
+        if config.distribution_loss == "rewardeddmd":
+            self.model = ReDMD(config, device=self.device)
         elif config.distribution_loss == "dmd":
             self.model = DMD(config, device=self.device)
-        elif config.distribution_loss == "sid":
-            self.model = SiD(config, device=self.device)
+        else:
+            raise ValueError("Invalid distribution matching loss")
         else:
             raise ValueError("Invalid distribution matching loss")
 
