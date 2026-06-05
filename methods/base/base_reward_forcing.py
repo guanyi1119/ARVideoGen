@@ -1,8 +1,9 @@
-# Reward-Forcing version of base model classes
+﻿# Reward-Forcing version of base model classes.
+# Adapted from archive/Reward-Forcing/model/base.py with core imports.
 # Key features:
-#   - BaseModel: shared base class
-#   - RewardForcingModel: SelfForcingModel with VideoVLMRewardInference for reward-guided training
-#   - denoising_step_list/timesteps follow the same convention as base_causal_forcing
+#   - BaseModel: shared base class with VideoVLMRewardInference initialization
+#   - RewardForcingModel: adds denoising_loss_func for reward-guided training
+
 from typing import Tuple
 from einops import rearrange
 from torch import nn
@@ -17,6 +18,8 @@ from methods.reward_forcing.videoalign.wan_inference import VideoVLMRewardInfere
 
 
 class BaseModel(nn.Module):
+    """Base model class with Wan diffusion model initialization and VideoVLMRewardInference."""
+    
     def __init__(self, args, device):
         super().__init__()
         self._initialize_models(args, device)
@@ -31,15 +34,33 @@ class BaseModel(nn.Module):
                 self.denoising_step_list = timesteps[1000 - self.denoising_step_list]
 
     def _initialize_models(self, args, device):
+        # Initialize VideoVLMRewardInference for reward-guided training
+        reward_model_path = getattr(args, "reward_model_path", None) or (f"{args.checkpoint_path}/VideoReward" if hasattr(args, "checkpoint_path") else None)
+        
+        if reward_model_path is not None:
+            self.inferencer = VideoVLMRewardInference(
+                load_from_pretrained=reward_model_path,
+                device=device,
+                dtype=torch.bfloat16 if args.mixed_precision else torch.float32
+            )
+            self.inferencer.model.requires_grad_(False)
+
         self.real_model_name = getattr(args, "real_name", "Wan2.1-T2V-1.3B")
         self.fake_model_name = getattr(args, "fake_name", "Wan2.1-T2V-1.3B")
-        self.generator = WanDiffusionWrapper(**getattr(args, "model_kwargs", {}), is_causal=True)
+
+        self.generator = WanDiffusionWrapper(
+            **getattr(args, "model_kwargs", {}), is_causal=True
+        )
         self.generator.model.requires_grad_(True)
 
-        self.real_score = WanDiffusionWrapper(model_name=self.real_model_name, is_causal=False)
+        self.real_score = WanDiffusionWrapper(
+            model_name=self.real_model_name, is_causal=False
+        )
         self.real_score.model.requires_grad_(False)
 
-        self.fake_score = WanDiffusionWrapper(model_name=self.fake_model_name, is_causal=False)
+        self.fake_score = WanDiffusionWrapper(
+            model_name=self.fake_model_name, is_causal=False
+        )
         self.fake_score.model.requires_grad_(True)
 
         self.text_encoder = WanTextEncoder()
@@ -72,6 +93,7 @@ class BaseModel(nn.Module):
             num_frame_per_block: int,
             uniform_timestep: bool = False
     ) -> torch.Tensor:
+        """Randomly generate a timestep tensor."""
         if uniform_timestep:
             timestep = torch.randint(
                 min_timestep,
@@ -89,7 +111,9 @@ class BaseModel(nn.Module):
                 device=self.device,
                 dtype=torch.long
             )
+            # make the noise level the same within every block
             if self.independent_first_frame:
+                # the first frame is always kept the same
                 timestep_from_second = timestep[:, 1:]
                 tfs_reshaped = timestep_from_second.reshape(
                     timestep_from_second.shape[0], -1, num_frame_per_block)
@@ -110,31 +134,19 @@ class BaseModel(nn.Module):
 
 
 class RewardForcingModel(BaseModel):
+    """RewardForcingModel adds denoising_loss_func to BaseModel."""
+    
     def __init__(self, args, device):
         super().__init__(args, device)
         self.denoising_loss_func = get_denoising_loss(args.denoising_loss_type)()
-
-        # Reward-Forcing specific: initialize reward inference
-        if hasattr(args, "reward_model_path") and args.reward_model_path:
-            self.inferencer = VideoVLMRewardInference(
-                load_from_pretrained=args.reward_model_path,
-                device=device,
-                dtype=self.dtype
-            )
-            self.inferencer.model.requires_grad_(False)
-        else:
-            self.inferencer = None
 
     def _run_generator(
         self,
         image_or_video_shape,
         conditional_dict: dict,
-        initial_latent: torch.Tensor = None
-    ) -> Tuple[torch.Tensor, torch.Tensor, int, int, torch.Tensor]:
-        """
-        Optionally simulate the generator's input from noise using backward simulation
-        and then run the generator for one-step.
-        """
+        initial_latent: torch.tensor = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Run generator with backward simulation."""
         assert getattr(self.args, "backward_simulation", True), "Backward simulation needs to be enabled"
         if initial_latent is not None:
             conditional_dict["initial_latent"] = initial_latent
@@ -200,6 +212,7 @@ class RewardForcingModel(BaseModel):
         noise: torch.Tensor,
         **conditional_dict: dict
     ) -> torch.Tensor:
+        """Run consistency backward simulation."""
         if self.inference_pipeline is None:
             self._initialize_inference_pipeline()
 
@@ -208,6 +221,7 @@ class RewardForcingModel(BaseModel):
         )
 
     def _initialize_inference_pipeline(self):
+        """Initialize self-forcing inference pipeline."""
         self.inference_pipeline = SelfForcingTrainingPipeline(
             denoising_step_list=self.denoising_step_list,
             scheduler=self.scheduler,
@@ -221,6 +235,7 @@ class RewardForcingModel(BaseModel):
         )
 
     def _initialize_inference_pipeline_reward(self):
+        """Initialize reward-forcing inference pipeline."""
         self.inference_pipeline = RewardForcingTrainingPipeline(
             denoising_step_list=self.denoising_step_list,
             scheduler=self.scheduler,
@@ -233,3 +248,4 @@ class RewardForcingModel(BaseModel):
             context_noise=getattr(self.args, "context_noise", 0),
             spatial_self=True
         )
+

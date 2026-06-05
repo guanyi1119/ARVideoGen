@@ -1,4 +1,4 @@
-import gc
+﻿import gc
 import logging
 from datetime import datetime
 
@@ -70,8 +70,6 @@ class Trainer:
             self.model = DMD(config, device=self.device)
         elif config.distribution_loss == "rewardeddmd":
             self.model = ReDMD(config, device=self.device)
-        else:
-            raise ValueError("Invalid distribution matching loss")
         else:
             raise ValueError("Invalid distribution matching loss")
 
@@ -297,21 +295,21 @@ class Trainer:
     def generate_video(self, pipeline, prompts, image=None):
         batch_size = len(prompts)
         if image is not None:
-            image = image.squeeze(0).unsqueeze(0).unsqueeze(2).to(device="cuda", dtype=torch.bfloat16)
+            image = image.squeeze(0).unsqueeze(0).unsqueeze(2).to(device=self.device, dtype=torch.bfloat16)
 
             # Encode the input image as the first latent
-            initial_latent = pipeline.vae.encode_to_latent(image).to(device="cuda", dtype=torch.bfloat16)
+            initial_latent = pipeline.vae.encode_to_latent(image).to(device=self.device, dtype=torch.bfloat16)
             initial_latent = initial_latent.repeat(batch_size, 1, 1, 1, 1)
             sampled_noise = torch.randn(
                 [batch_size, self.model.num_training_frames - 1, 16, 60, 104],
-                device="cuda",
+                device=self.device,
                 dtype=self.dtype
             )
         else:
             initial_latent = None
             sampled_noise = torch.randn(
                 [batch_size, self.model.num_training_frames, 16, 60, 104],
-                device="cuda",
+                device=self.device,
                 dtype=self.dtype
             )
 

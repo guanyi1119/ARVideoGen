@@ -1,4 +1,4 @@
-import gc
+﻿import gc
 import logging
 
 from core.data.dataset import ShardingLMDBDataset, cycle
@@ -323,7 +323,7 @@ class Trainer:
     def generate_video(self, pipeline, prompts, image=None):
         batch_size = len(prompts)
         sampled_noise = torch.randn(
-            [batch_size, 21, 16, 60, 104], device="cuda", dtype=self.dtype
+            [batch_size, 21, 16, 60, 104], device=self.device, dtype=self.dtype
         )
         video, _ = pipeline.inference(
             noise=sampled_noise,
