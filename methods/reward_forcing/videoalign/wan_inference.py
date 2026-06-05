@@ -31,18 +31,21 @@ def load_configs_from_json(config_path):
            config_dict["inference_config"] if "inference_config" in config_dict else None
 
 class VideoVLMRewardInference():
-    def __init__(self, load_from_pretrained, load_from_pretrained_step=-1, device='cuda', dtype=torch.bfloat16):
+    def __init__(self, load_from_pretrained, load_from_pretrained_step=-1, device="cuda", dtype=torch.bfloat16, qwen2_vl_path=None):
         config_path = os.path.join(load_from_pretrained, "model_config.json")
         data_config, _, model_config, peft_lora_config, inference_config = load_configs_from_json(config_path)
         data_config = DataConfig(**data_config)
         model_config = ModelConfig(**model_config)
+        # Override model_name_or_path if qwen2_vl_path is provided
+        if qwen2_vl_path is not None:
+            model_config.model_name_or_path = qwen2_vl_path
         peft_lora_config = PEFTLoraConfig(**peft_lora_config)
 
         training_args = TrainingConfig(
             load_from_pretrained=load_from_pretrained,
             load_from_pretrained_step=load_from_pretrained_step,
             gradient_checkpointing=False,
-            disable_flash_attn2=False,
+            disable_flash_attn2=(os.environ.get("DEVICE_TYPE", "cuda") == "npu"),
             bf16=True if dtype == torch.bfloat16 else False,
             fp16=True if dtype == torch.float16 else False,
             output_dir="",

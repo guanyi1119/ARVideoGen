@@ -36,12 +36,14 @@ class BaseModel(nn.Module):
     def _initialize_models(self, args, device):
         # Initialize VideoVLMRewardInference for reward-guided training
         reward_model_path = getattr(args, "reward_model_path", None) or (f"{args.checkpoint_path}/VideoReward" if hasattr(args, "checkpoint_path") else None)
+        qwen2_vl_path = getattr(args, "qwen2_vl_path", None)
         
         if reward_model_path is not None:
             self.inferencer = VideoVLMRewardInference(
                 load_from_pretrained=reward_model_path,
                 device=device,
-                dtype=torch.bfloat16 if args.mixed_precision else torch.float32
+                dtype=torch.bfloat16 if args.mixed_precision else torch.float32,
+                qwen2_vl_path=qwen2_vl_path
             )
             self.inferencer.model.requires_grad_(False)
 

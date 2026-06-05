@@ -186,7 +186,7 @@ def load_model_from_checkpoint(
     if os.path.exists(full_ckpt):
         model_state_dict = torch.load(full_ckpt, map_location="cpu", weights_only=True)
         # Create a new state_dict to store the modified key-value pairs
-        new_state_dict = {}
+        # new_state_dict = {}
 
         # for key, value in model_state_dict.items():
         #     if key.startswith("base_model.model.model"):
@@ -197,18 +197,18 @@ def load_model_from_checkpoint(
         #         new_state_dict[new_key] = value
         #     else:
         #         new_state_dict[key] = value
-        for key, value in model_state_dict.items():
-            if key.startswith("base_model.model.model"):
-                new_key = "base_model.model.model.language_model" + key[len("base_model.model.model"):]
-                new_state_dict[new_key] = value
-            elif key.startswith("base_model.model.visual"):
-                new_key = "base_model.model.model.visual" + key[len("base_model.model.visual"):]
-                new_state_dict[new_key] = value
-            else:
-                new_state_dict[key] = value
+        # for key, value in model_state_dict.items():
+        #     if key.startswith("base_model.model.model"):
+        #         new_key = "base_model.model.model.language_model" + key[len("base_model.model.model"):]
+        #         new_state_dict[new_key] = value
+        #     elif key.startswith("base_model.model.visual"):
+        #         new_key = "base_model.model.model.visual" + key[len("base_model.model.visual"):]
+        #         new_state_dict[new_key] = value
+        #     else:
+        #         new_state_dict[key] = value
 
         # Load the modified state_dict into the model
-        model.load_state_dict(new_state_dict)
+        model.load_state_dict(model_state_dict)
         # model_state_dict = torch.load(full_ckpt, map_location="cpu")
         # model.load_state_dict(model_state_dict)
     else:
