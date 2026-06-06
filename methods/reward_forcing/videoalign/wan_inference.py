@@ -1,4 +1,4 @@
-import ast
+﻿import ast
 import json
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -45,7 +45,7 @@ class VideoVLMRewardInference():
             load_from_pretrained=load_from_pretrained,
             load_from_pretrained_step=load_from_pretrained_step,
             gradient_checkpointing=False,
-            disable_flash_attn2=(os.environ.get("DEVICE_TYPE", "cuda") == "npu"),
+            disable_flash_attn2=False,  # NPU uses npu_fusion (registered in train_reward); CUDA uses flash_attention_2
             bf16=True if dtype == torch.bfloat16 else False,
             fp16=True if dtype == torch.float16 else False,
             output_dir="",

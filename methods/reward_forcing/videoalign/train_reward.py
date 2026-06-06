@@ -1,4 +1,4 @@
-import ast
+﻿import ast
 import json
 import os
 import pdb
@@ -7,6 +7,9 @@ from dataclasses import asdict
 from functools import partial
 
 import torch
+from methods.reward_forcing.videoalign.npu_attention import register_npu_fusion_attention
+
+register_npu_fusion_attention()
 from datasets import load_dataset, concatenate_datasets
 from peft import LoraConfig, get_peft_model
 from transformers import AutoProcessor, HfArgumentParser
@@ -102,7 +105,10 @@ def create_model_and_processor(
         reward_token=model_config.reward_token,
         special_token_ids=special_token_ids,
         torch_dtype=torch_dtype,
-        attn_implementation="flash_attention_2" if not training_args.disable_flash_attn2 else "sdpa",
+        attn_implementation=(
+            "npu_fusion" if os.environ.get("DEVICE_TYPE", "cuda") == "npu"
+            else ("flash_attention_2" if not training_args.disable_flash_attn2 else "sdpa")
+        ),
         cache_dir=cache_dir,
         **model_kwargs
     )
