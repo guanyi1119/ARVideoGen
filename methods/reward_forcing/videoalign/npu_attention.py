@@ -1,4 +1,4 @@
-﻿import os
+import os
 import math
 
 import torch
@@ -198,6 +198,9 @@ def _make_vision_npu_forward(original_forward):
         for i in range(1, len(cu_seqlens)):
             attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = False
 
+        # npu_fusion_attention expects 2D or 4D mask; squeeze batch dim to 2D.
+        attention_mask = attention_mask.squeeze(0)
+
         # Reshape to [B, num_heads, L, head_dim] for _npu_fusion_attention_forward.
         q = q.transpose(0, 1).unsqueeze(0)
         k = k.transpose(0, 1).unsqueeze(0)
@@ -266,3 +269,4 @@ def patch_qwen2vl_for_npu(model):
         print(f"[NPU] Patched {patched_vision} VisionSdpaAttention modules to use npu_fusion_attention")
 
     _PATCHED = True
+
