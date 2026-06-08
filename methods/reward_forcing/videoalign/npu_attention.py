@@ -248,7 +248,7 @@ def patch_qwen2vl_for_npu(model):
     except ImportError:
         return
 
-    from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLAttention, VisionAttention
+    from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLAttention, VisionSdpaAttention
 
     patched_text = 0
     patched_vision = 0
@@ -257,13 +257,13 @@ def patch_qwen2vl_for_npu(model):
         if isinstance(module, Qwen2VLAttention):
             module.forward = _make_npu_forward(module.forward).__get__(module, Qwen2VLAttention)
             patched_text += 1
-        elif isinstance(module, VisionAttention):
-            module.forward = _make_vision_npu_forward(module.forward).__get__(module, VisionAttention)
+        elif isinstance(module, VisionSdpaAttention):
+            module.forward = _make_vision_npu_forward(module.forward).__get__(module, VisionSdpaAttention)
             patched_vision += 1
 
     if patched_text > 0:
         print(f"[NPU] Patched {patched_text} Qwen2VLAttention modules to use npu_fusion_attention")
     if patched_vision > 0:
-        print(f"[NPU] Patched {patched_vision} VisionAttention modules to use npu_fusion_attention")
+        print(f"[NPU] Patched {patched_vision} VisionSdpaAttention modules to use npu_fusion_attention")
 
     _PATCHED = True
