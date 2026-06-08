@@ -105,7 +105,7 @@ def register_npu_fusion_attention():
     except ImportError:
         return
 
-    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    from transformers.modeling_utils import AttentionInterface
 
-    ALL_ATTENTION_FUNCTIONS.register("npu_fusion", _npu_fusion_attention_forward)
+    AttentionInterface.register("npu_fusion", _npu_fusion_attention_forward)
     _REGISTERED = True
