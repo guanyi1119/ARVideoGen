@@ -21,15 +21,12 @@ def _npu_fusion_attention_forward(
 
     transformers calls this with query/key/value shaped [B, num_heads, L, head_dim]
     (post-GQA in Qwen2-VL). npu_fusion_attention with input_layout="BNSD" accepts
-    that layout directly, so no transposes are needed for the LLM path. After the
-    op we transpose to [B, L, num_heads, head_dim] to match the contract the rest
-    of transformers expects (sdpa_attention_forward also returns the transposed
-    layout).
+    that layout directly. After the op we transpose to [B, L, num_heads, head_dim]
+    to match the contract the rest of transformers expects.
     """
     from torch_npu import npu_fusion_attention
 
-    # GQA: expand kv heads to match q heads when needed (npu_fusion_attention does
-    # not natively support GQA in BNSD layout for this transformers version).
+    # GQA: expand kv heads to match q heads when needed.
     if hasattr(module, "num_key_value_groups") and module.num_key_value_groups > 1:
         n_rep = module.num_key_value_groups
         b, kv_heads, slen, head_dim = key.shape
@@ -44,8 +41,7 @@ def _npu_fusion_attention_forward(
     keep_prob = 1.0 - (dropout if dropout is not None else 0.0)
     head_num = query.shape[1]
 
-    # is_causal handling mirrors sdpa_attention_forward semantics: only treat as
-    # causal when query has more than 1 token and no explicit mask was provided.
+    # is_causal handling mirrors sdpa_attention_forward semantics.
     effective_is_causal = (
         is_causal
         if is_causal is not None
@@ -58,7 +54,6 @@ def _npu_fusion_attention_forward(
     atten_mask = None
     sparse_mode = 0
     if effective_is_causal:
-        # Down-right aligned causal mask via cached upper-triangular mask.
         atten_mask = torch.triu(
             torch.ones([2048, 2048], device=query.device), diagonal=1
         ).bool()
@@ -93,12 +88,10 @@ def _npu_fusion_attention_forward(
 # ---------------------------------------------------------------------------
 
 def _make_npu_forward(original_forward):
-    """Build a replacement forward() for Qwen2VLAttention that uses NPU fusion
-    attention instead of the ALL_ATTENTION_FUNCTIONS dispatch.
+    """Build a replacement forward() for Qwen2VLAttention.
 
-    We replicate the projection + RoPE + KV-cache logic from the original
-    forward, then call _npu_fusion_attention_forward instead of going through
-    ALL_ATTENTION_FUNCTIONS.get_interface().
+    Copies the original forward logic from transformers 4.50.0 Qwen2VLAttention,
+    but replaces the manual matmul+softmax attention with _npu_fusion_attention_forward.
     """
     from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_multimodal_rotary_pos_emb
 
@@ -107,7 +100,7 @@ def _make_npu_forward(original_forward):
         hidden_states: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         position_ids: torch.LongTensor | None = None,
-        past_key_values=None,
+        past_key_value=None,
         output_attentions: bool = False,
         use_cache: bool = False,
         cache_position: torch.LongTensor | None = None,
@@ -126,27 +119,38 @@ def _make_npu_forward(original_forward):
 
         cos, sin = position_embeddings
         query_states, key_states = apply_multimodal_rotary_pos_emb(
-            query_states, key_states, cos, sin, self.config.rope_parameters["mrope_section"]
+            query_states, key_states, cos, sin, self.rope_scaling["mrope_section"]
         )
 
-        if past_key_values is not None:
+        if past_key_value is not None:
             cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
-            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+            key_states, value_states = past_key_value.update(key_states, value_states, self.layer_idx, cache_kwargs)
 
+        # Slice attention_mask to match key length (same as original eager path).
+        causal_mask = None
+        if attention_mask is not None:
+            causal_mask = attention_mask[:, :, :, : key_states.shape[-2]]
+
+        # Replace manual matmul+softmax with NPU fusion attention.
         attn_output, attn_weights = _npu_fusion_attention_forward(
             self,
             query_states,
             key_states,
             value_states,
-            attention_mask,
-            dropout=0.0 if not self.training else self.attention_dropout,
-            scaling=self.scaling,
+            attention_mask=causal_mask,
+            dropout=self.attention_dropout if self.training else 0.0,
+            scaling=1.0 / math.sqrt(self.head_dim),
             **kwargs,
         )
 
-        attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
+        # _npu_fusion_attention_forward returns [B, L, num_heads, head_dim].
+        attn_output = attn_output.reshape(bsz, q_len, -1)
         attn_output = self.o_proj(attn_output)
-        return attn_output, attn_weights
+
+        if not output_attentions:
+            attn_weights = None
+
+        return attn_output, attn_weights, past_key_value
 
     return npu_forward
 
@@ -156,15 +160,10 @@ def _make_npu_forward(original_forward):
 # ---------------------------------------------------------------------------
 
 def _make_vision_npu_forward(original_forward):
-    """Build a replacement forward() for VisionAttention that uses NPU fusion
-    attention instead of the ALL_ATTENTION_FUNCTIONS dispatch.
+    """Build a replacement forward() for VisionAttention.
 
-    VisionAttention differs from Qwen2VLAttention:
-    - Uses self.qkv (single fused projection) instead of q_proj/k_proj/v_proj
-    - Uses apply_rotary_pos_emb_vision instead of apply_multimodal_rotary_pos_emb
-    - Has cu_seqlens for variable-length packed sequences
-    - No KV-cache
-    - Output projection is self.proj instead of self.o_proj
+    Copies the original forward logic from transformers 4.50.0 VisionAttention,
+    but replaces F.scaled_dot_product_attention with _npu_fusion_attention_forward.
     """
     from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_rotary_pos_emb_vision
 
@@ -177,40 +176,48 @@ def _make_vision_npu_forward(original_forward):
         **kwargs,
     ) -> torch.Tensor:
         seq_length = hidden_states.shape[0]
-        query_states, key_states, value_states = (
-            self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+        q, k, v = self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+        if position_embeddings is None:
+            print(
+                "The attention layers in this model are transitioning from computing the RoPE embeddings internally "
+                "through `rotary_pos_emb` (2D tensor of RoPE theta values), to using externally computed "
+                "`position_embeddings` (Tuple of tensors, containing cos and sin). In v4.54 `rotary_pos_emb` will be "
+                "removed and `position_embeddings` will be mandatory."
+            )
+            emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+        else:
+            cos, sin = position_embeddings
+        q, k = apply_rotary_pos_emb_vision(q, k, cos, sin)
+
+        # Build block-diagonal mask from cu_seqlens.
+        # F.scaled_dot_product_attention: True=keep. npu_fusion_attention: True=masked.
+        # So we create a mask where True=masked (within-chunk = False).
+        attention_mask = torch.ones([1, seq_length, seq_length], device=q.device, dtype=torch.bool)
+        for i in range(1, len(cu_seqlens)):
+            attention_mask[..., cu_seqlens[i - 1] : cu_seqlens[i], cu_seqlens[i - 1] : cu_seqlens[i]] = False
+
+        # Reshape to [B, num_heads, L, head_dim] for _npu_fusion_attention_forward.
+        q = q.transpose(0, 1).unsqueeze(0)
+        k = k.transpose(0, 1).unsqueeze(0)
+        v = v.transpose(0, 1).unsqueeze(0)
+
+        # Replace F.scaled_dot_product_attention with NPU fusion attention.
+        attn_output, _ = _npu_fusion_attention_forward(
+            self,
+            q,
+            k,
+            v,
+            attention_mask=attention_mask,
+            dropout=0.0,
+            scaling=self.scaling,
+            is_causal=False,
+            **kwargs,
         )
-        cos, sin = position_embeddings
-        query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
 
-        query_states = query_states.transpose(0, 1).unsqueeze(0)
-        key_states = key_states.transpose(0, 1).unsqueeze(0)
-        value_states = value_states.transpose(0, 1).unsqueeze(0)
-
-        # Always use chunk processing (non-flash path), replacing
-        # ALL_ATTENTION_FUNCTIONS.get_interface() with _npu_fusion_attention_forward.
-        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
-        splits = [
-            torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
-        ]
-
-        attn_outputs = [
-            _npu_fusion_attention_forward(
-                self,
-                q,
-                k,
-                v,
-                attention_mask=None,
-                scaling=self.scaling,
-                dropout=0.0 if not self.training else self.attention_dropout,
-                is_causal=False,
-                **kwargs,
-            )[0]
-            for q, k, v in zip(*splits)
-        ]
-        attn_output = torch.cat(attn_outputs, dim=1)
-
-        attn_output = attn_output.reshape(seq_length, -1).contiguous()
+        # _npu_fusion_attention_forward returns [1, seq_length, num_heads, head_dim].
+        attn_output = attn_output.squeeze(0).reshape(seq_length, -1)
         attn_output = self.proj(attn_output)
         return attn_output
 
@@ -223,7 +230,7 @@ def _make_vision_npu_forward(original_forward):
 
 def patch_qwen2vl_for_npu(model):
     """Monkey-patch all Qwen2VLAttention AND VisionAttention modules in *model*
-    to use NPU fusion attention instead of the default SDPA/flash-attn dispatch.
+    to use NPU fusion attention instead of the default SDPA/matmul dispatch.
 
     Call this AFTER model = Qwen2VLRewardModelBT.from_pretrained(...) with
     attn_implementation="sdpa" (which passes transformers validation).
@@ -241,16 +248,16 @@ def patch_qwen2vl_for_npu(model):
     except ImportError:
         return
 
-    from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLAttention, Qwen2VLSdpaAttention, VisionAttention, VisionSdpaAttention
+    from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLAttention, VisionAttention
 
     patched_text = 0
     patched_vision = 0
 
     for module in model.modules():
-        if isinstance(module, Qwen2VLAttention) or isinstance(module, Qwen2VLSdpaAttention):
+        if isinstance(module, Qwen2VLAttention):
             module.forward = _make_npu_forward(module.forward).__get__(module, Qwen2VLAttention)
             patched_text += 1
-        elif isinstance(module, VisionAttention) or isinstance(module, VisionSdpaAttention):
+        elif isinstance(module, VisionAttention):
             module.forward = _make_vision_npu_forward(module.forward).__get__(module, VisionAttention)
             patched_vision += 1
 
