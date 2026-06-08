@@ -88,6 +88,10 @@ def _npu_fusion_attention_forward(
     return attn_output, None
 
 
+# ---------------------------------------------------------------------------
+# Qwen2VLAttention (LLM text attention) NPU patch
+# ---------------------------------------------------------------------------
+
 def _make_npu_forward(original_forward):
     """Build a replacement forward() for Qwen2VLAttention that uses NPU fusion
     attention instead of the ALL_ATTENTION_FUNCTIONS dispatch.
@@ -147,9 +151,79 @@ def _make_npu_forward(original_forward):
     return npu_forward
 
 
+# ---------------------------------------------------------------------------
+# VisionAttention (visual encoder attention) NPU patch
+# ---------------------------------------------------------------------------
+
+def _make_vision_npu_forward(original_forward):
+    """Build a replacement forward() for VisionAttention that uses NPU fusion
+    attention instead of the ALL_ATTENTION_FUNCTIONS dispatch.
+
+    VisionAttention differs from Qwen2VLAttention:
+    - Uses self.qkv (single fused projection) instead of q_proj/k_proj/v_proj
+    - Uses apply_rotary_pos_emb_vision instead of apply_multimodal_rotary_pos_emb
+    - Has cu_seqlens for variable-length packed sequences
+    - No KV-cache
+    - Output projection is self.proj instead of self.o_proj
+    """
+    from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_rotary_pos_emb_vision
+
+    def vision_npu_forward(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        rotary_pos_emb: torch.Tensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        seq_length = hidden_states.shape[0]
+        query_states, key_states, value_states = (
+            self.qkv(hidden_states).reshape(seq_length, 3, self.num_heads, -1).permute(1, 0, 2, 3).unbind(0)
+        )
+        cos, sin = position_embeddings
+        query_states, key_states = apply_rotary_pos_emb_vision(query_states, key_states, cos, sin)
+
+        query_states = query_states.transpose(0, 1).unsqueeze(0)
+        key_states = key_states.transpose(0, 1).unsqueeze(0)
+        value_states = value_states.transpose(0, 1).unsqueeze(0)
+
+        # Always use chunk processing (non-flash path), replacing
+        # ALL_ATTENTION_FUNCTIONS.get_interface() with _npu_fusion_attention_forward.
+        lengths = cu_seqlens[1:] - cu_seqlens[:-1]
+        splits = [
+            torch.split(tensor, lengths.tolist(), dim=2) for tensor in (query_states, key_states, value_states)
+        ]
+
+        attn_outputs = [
+            _npu_fusion_attention_forward(
+                self,
+                q,
+                k,
+                v,
+                attention_mask=None,
+                scaling=self.scaling,
+                dropout=0.0 if not self.training else self.attention_dropout,
+                is_causal=False,
+                **kwargs,
+            )[0]
+            for q, k, v in zip(*splits)
+        ]
+        attn_output = torch.cat(attn_outputs, dim=1)
+
+        attn_output = attn_output.reshape(seq_length, -1).contiguous()
+        attn_output = self.proj(attn_output)
+        return attn_output
+
+    return vision_npu_forward
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
 def patch_qwen2vl_for_npu(model):
-    """Monkey-patch all Qwen2VLAttention modules in *model* to use NPU fusion
-    attention instead of the default SDPA/flash-attn dispatch.
+    """Monkey-patch all Qwen2VLAttention AND VisionAttention modules in *model*
+    to use NPU fusion attention instead of the default SDPA/flash-attn dispatch.
 
     Call this AFTER model = Qwen2VLRewardModelBT.from_pretrained(...) with
     attn_implementation="sdpa" (which passes transformers validation).
@@ -167,15 +241,22 @@ def patch_qwen2vl_for_npu(model):
     except ImportError:
         return
 
-    from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLAttention
+    from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLAttention, VisionAttention
 
-    patched_count = 0
+    patched_text = 0
+    patched_vision = 0
+
     for module in model.modules():
         if isinstance(module, Qwen2VLAttention):
             module.forward = _make_npu_forward(module.forward).__get__(module, Qwen2VLAttention)
-            patched_count += 1
+            patched_text += 1
+        elif isinstance(module, VisionAttention):
+            module.forward = _make_vision_npu_forward(module.forward).__get__(module, VisionAttention)
+            patched_vision += 1
 
-    if patched_count > 0:
-        print(f"[NPU] Patched {patched_count} Qwen2VLAttention modules to use npu_fusion_attention")
+    if patched_text > 0:
+        print(f"[NPU] Patched {patched_text} Qwen2VLAttention modules to use npu_fusion_attention")
+    if patched_vision > 0:
+        print(f"[NPU] Patched {patched_vision} VisionAttention modules to use npu_fusion_attention")
 
     _PATCHED = True
