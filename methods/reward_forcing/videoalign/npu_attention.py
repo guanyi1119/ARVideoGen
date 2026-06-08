@@ -211,7 +211,6 @@ def _make_vision_npu_forward(original_forward):
             v,
             attention_mask=attention_mask,
             dropout=0.0,
-            scaling=self.scaling,
             is_causal=False,
             **kwargs,
         )
