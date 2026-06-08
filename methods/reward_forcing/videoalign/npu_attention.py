@@ -105,7 +105,9 @@ def register_npu_fusion_attention():
     except ImportError:
         return
 
-    from transformers.modeling_utils import AttentionInterface
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-    AttentionInterface.register("npu_fusion", _npu_fusion_attention_forward)
+    # Use dict-like assignment (ALL_ATTENTION_FUNCTIONS is a GeneralInterface instance supporting __setitem__).
+    # This is equivalent to register() but avoids potential version-specific import issues.
+    ALL_ATTENTION_FUNCTIONS["npu_fusion"] = _npu_fusion_attention_forward
     _REGISTERED = True
