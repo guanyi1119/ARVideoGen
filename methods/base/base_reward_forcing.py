@@ -11,8 +11,12 @@ import torch.distributed as dist
 import torch
 
 from core.loss.loss import get_denoising_loss
-from core.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from core.wan_wrapper import get_wan_wrapper_classes
 from methods.reward_forcing.pipelines.reward_forcing_training import RewardForcingTrainingPipeline
+
+# Reward-Forcing requires the dedicated CausalWanModel variant (EMA sink-token compression on KV cache eviction);
+# select the matching wrapper classes via the factory to keep the rest of the codebase untouched.
+WanTextEncoder, WanVAEWrapper, WanDiffusionWrapper = get_wan_wrapper_classes('reward_forcing')
 from methods.reward_forcing.pipelines.self_forcing_training import SelfForcingTrainingPipeline
 from methods.reward_forcing.videoalign.wan_inference import VideoVLMRewardInference
 
