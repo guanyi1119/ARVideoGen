@@ -241,16 +241,16 @@ def patch_qwen2vl_for_npu(model):
     except ImportError:
         return
 
-    from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLAttention, VisionAttention
+    from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLAttention, Qwen2VLSdpaAttention, VisionAttention, VisionSdpaAttention
 
     patched_text = 0
     patched_vision = 0
 
     for module in model.modules():
-        if isinstance(module, Qwen2VLAttention):
+        if isinstance(module, Qwen2VLAttention) or isinstance(module, Qwen2VLSdpaAttention):
             module.forward = _make_npu_forward(module.forward).__get__(module, Qwen2VLAttention)
             patched_text += 1
-        elif isinstance(module, VisionAttention):
+        elif isinstance(module, VisionAttention) or isinstance(module, VisionSdpaAttention):
             module.forward = _make_vision_npu_forward(module.forward).__get__(module, VisionAttention)
             patched_vision += 1
 
