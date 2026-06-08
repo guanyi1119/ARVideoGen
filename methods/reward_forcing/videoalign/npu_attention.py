@@ -3,7 +3,7 @@ import math
 
 import torch
 
-_REGISTERED = False
+_PATCHED = False
 
 
 def _npu_fusion_attention_forward(
@@ -88,21 +88,76 @@ def _npu_fusion_attention_forward(
     return attn_output, None
 
 
-def register_npu_fusion_attention():
-    """Register the `npu_fusion` attention implementation with transformers.
+def _make_npu_forward(original_forward):
+    """Build a replacement forward() for Qwen2VLAttention that uses NPU fusion
+    attention instead of the ALL_ATTENTION_FUNCTIONS dispatch.
 
-    Safe to call multiple times. No-op when not running on NPU (so CUDA setups
-    are unaffected).
-
-    In transformers 4.50.0, ALL_ATTENTION_FUNCTIONS is an AttentionInterface
-    (subclass of GeneralInterface). The register() classmethod updates
-    cls._global_mapping which is shared across all instances - this is the
-    only correct way to add a new attention implementation. Using __setitem__
-    (i.e. obj["key"] = val) only sets _local_mapping and won't be visible
-    to valid_keys() or get_interface().
+    We replicate the projection + RoPE + KV-cache logic from the original
+    forward, then call _npu_fusion_attention_forward instead of going through
+    ALL_ATTENTION_FUNCTIONS.get_interface().
     """
-    global _REGISTERED
-    if _REGISTERED:
+    from transformers.models.qwen2_vl.modeling_qwen2_vl import apply_multimodal_rotary_pos_emb
+
+    def npu_forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: torch.Tensor | None = None,
+        position_ids: torch.LongTensor | None = None,
+        past_key_values=None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        cache_position: torch.LongTensor | None = None,
+        position_embeddings: tuple[torch.Tensor, torch.Tensor] | None = None,
+        **kwargs,
+    ):
+        bsz, q_len, _ = hidden_states.size()
+
+        query_states = self.q_proj(hidden_states)
+        key_states = self.k_proj(hidden_states)
+        value_states = self.v_proj(hidden_states)
+
+        query_states = query_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        key_states = key_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+        value_states = value_states.view(bsz, q_len, -1, self.head_dim).transpose(1, 2)
+
+        cos, sin = position_embeddings
+        query_states, key_states = apply_multimodal_rotary_pos_emb(
+            query_states, key_states, cos, sin, self.config.rope_parameters["mrope_section"]
+        )
+
+        if past_key_values is not None:
+            cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+            key_states, value_states = past_key_values.update(key_states, value_states, self.layer_idx, cache_kwargs)
+
+        attn_output, attn_weights = _npu_fusion_attention_forward(
+            self,
+            query_states,
+            key_states,
+            value_states,
+            attention_mask,
+            dropout=0.0 if not self.training else self.attention_dropout,
+            scaling=self.scaling,
+            **kwargs,
+        )
+
+        attn_output = attn_output.reshape(bsz, q_len, -1).contiguous()
+        attn_output = self.o_proj(attn_output)
+        return attn_output, attn_weights
+
+    return npu_forward
+
+
+def patch_qwen2vl_for_npu(model):
+    """Monkey-patch all Qwen2VLAttention modules in *model* to use NPU fusion
+    attention instead of the default SDPA/flash-attn dispatch.
+
+    Call this AFTER model = Qwen2VLRewardModelBT.from_pretrained(...) with
+    attn_implementation="sdpa" (which passes transformers validation).
+
+    Safe to call multiple times. No-op when not on NPU.
+    """
+    global _PATCHED
+    if _PATCHED:
         return
     if os.environ.get("DEVICE_TYPE", "cuda") != "npu":
         return
@@ -112,23 +167,15 @@ def register_npu_fusion_attention():
     except ImportError:
         return
 
-    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+    from transformers.models.qwen2_vl.modeling_qwen2_vl import Qwen2VLAttention
 
-    # Primary path: use the register() classmethod (transformers 4.50.0+).
-    # register() is inherited from GeneralInterface and updates
-    # AttentionInterface._global_mapping, which is shared by ALL_ATTENTION_FUNCTIONS
-    # and all other AttentionInterface instances.
-    try:
-        ALL_ATTENTION_FUNCTIONS.register("npu_fusion", _npu_fusion_attention_forward)
-    except AttributeError:
-        # Fallback for older transformers: directly mutate the class-level dict.
-        attention_cls = type(ALL_ATTENTION_FUNCTIONS)
-        if hasattr(attention_cls, "_global_mapping"):
-            attention_cls._global_mapping["npu_fusion"] = _npu_fusion_attention_forward
-        else:
-            raise RuntimeError(
-                "Cannot register npu_fusion attention: unexpected ALL_ATTENTION_FUNCTIONS type "
-                f"{type(ALL_ATTENTION_FUNCTIONS)}"
-            )
+    patched_count = 0
+    for module in model.modules():
+        if isinstance(module, Qwen2VLAttention):
+            module.forward = _make_npu_forward(module.forward).__get__(module, Qwen2VLAttention)
+            patched_count += 1
 
-    _REGISTERED = True
+    if patched_count > 0:
+        print(f"[NPU] Patched {patched_count} Qwen2VLAttention modules to use npu_fusion_attention")
+
+    _PATCHED = True
