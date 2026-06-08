@@ -93,6 +93,13 @@ def register_npu_fusion_attention():
 
     Safe to call multiple times. No-op when not running on NPU (so CUDA setups
     are unaffected).
+
+    In transformers 4.50.0, ALL_ATTENTION_FUNCTIONS is an AttentionInterface
+    (subclass of GeneralInterface). The register() classmethod updates
+    cls._global_mapping which is shared across all instances - this is the
+    only correct way to add a new attention implementation. Using __setitem__
+    (i.e. obj["key"] = val) only sets _local_mapping and won't be visible
+    to valid_keys() or get_interface().
     """
     global _REGISTERED
     if _REGISTERED:
@@ -107,9 +114,21 @@ def register_npu_fusion_attention():
 
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-    # Directly patch into _global_mapping (class-level dict) which is what
-    # AttentionInterface.register() does internally via cls._global_mapping.update().
-    # This is the most reliable approach across different transformers versions as
-    # it bypasses any __setitem__/_local_mapping subtleties.
-    type(ALL_ATTENTION_FUNCTIONS)._global_mapping["npu_fusion"] = _npu_fusion_attention_forward
+    # Primary path: use the register() classmethod (transformers 4.50.0+).
+    # register() is inherited from GeneralInterface and updates
+    # AttentionInterface._global_mapping, which is shared by ALL_ATTENTION_FUNCTIONS
+    # and all other AttentionInterface instances.
+    try:
+        ALL_ATTENTION_FUNCTIONS.register("npu_fusion", _npu_fusion_attention_forward)
+    except AttributeError:
+        # Fallback for older transformers: directly mutate the class-level dict.
+        attention_cls = type(ALL_ATTENTION_FUNCTIONS)
+        if hasattr(attention_cls, "_global_mapping"):
+            attention_cls._global_mapping["npu_fusion"] = _npu_fusion_attention_forward
+        else:
+            raise RuntimeError(
+                "Cannot register npu_fusion attention: unexpected ALL_ATTENTION_FUNCTIONS type "
+                f"{type(ALL_ATTENTION_FUNCTIONS)}"
+            )
+
     _REGISTERED = True
