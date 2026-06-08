@@ -107,7 +107,9 @@ def register_npu_fusion_attention():
 
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
-    # Use dict-like assignment (ALL_ATTENTION_FUNCTIONS is a GeneralInterface instance supporting __setitem__).
-    # This is equivalent to register() but avoids potential version-specific import issues.
-    ALL_ATTENTION_FUNCTIONS["npu_fusion"] = _npu_fusion_attention_forward
+    # Directly patch into _global_mapping (class-level dict) which is what
+    # AttentionInterface.register() does internally via cls._global_mapping.update().
+    # This is the most reliable approach across different transformers versions as
+    # it bypasses any __setitem__/_local_mapping subtleties.
+    type(ALL_ATTENTION_FUNCTIONS)._global_mapping["npu_fusion"] = _npu_fusion_attention_forward
     _REGISTERED = True
