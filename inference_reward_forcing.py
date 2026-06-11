@@ -1,3 +1,4 @@
+import os
 import argparse
 import torch
 DEVICE_TYPE = os.environ.get('DEVICE_TYPE', 'cuda')
@@ -72,8 +73,18 @@ else:
 
 if args.checkpoint_path:
     state_dict = torch.load(args.checkpoint_path, map_location="cpu")
-    pipeline.generator.load_state_dict(state_dict['generator' if not args.use_ema else 'generator_ema'])
-
+    key = 'generator_ema' if args.use_ema else 'generator'
+    gen_sd = state_dict[key]
+    try:
+        pipeline.generator.load_state_dict(gen_sd)
+    except RuntimeError:
+        fixed = {}
+        for k, v in gen_sd.items():
+            if k.startswith("model._fsdp_wrapped_module."):
+                k = k.replace("model._fsdp_wrapped_module.", "model.", 1)
+            fixed[k] = v
+        pipeline.generator.load_state_dict(fixed, strict=False)
+    
 pipeline = pipeline.to(dtype=torch.bfloat16)
 if low_memory:
     DynamicSwapInstaller.install_model(pipeline.text_encoder, device=gpu)
