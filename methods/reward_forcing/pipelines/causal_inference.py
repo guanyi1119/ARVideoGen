@@ -38,6 +38,7 @@ class CausalInferencePipeline(torch.nn.Module):
         self.num_frame_per_block = getattr(args, "num_frame_per_block", 1)
         self.independent_first_frame = args.independent_first_frame
         self.local_attn_size = self.generator.model.local_attn_size
+        self.slice_last_frames = getattr(args, "slice_last_frames", 0)
 
         print(f"KV inference with {self.num_frame_per_block} frames per block")
 
@@ -282,7 +283,7 @@ class CausalInferencePipeline(torch.nn.Module):
         kv_cache1 = []
         if self.local_attn_size != -1:
             # Use the local attention size to compute the KV cache size
-            kv_cache_size = self.local_attn_size * self.frame_seq_length
+            kv_cache_size = self.local_attn_size * self.frame_seq_length + self.slice_last_frames * self.frame_seq_length
         else:
             # Use the default KV cache size
             kv_cache_size = 32760

@@ -8,7 +8,7 @@ if DEVICE_TYPE == "npu":
     from torch_npu.contrib import transfer_to_npu
 
 from core.config import load_config
-from methods.reward_forcing.trainers import DiffusionTrainer, ScoreDistillationTrainer, RewardedDistillationTrainer
+from methods.reward_forcing.trainers import DiffusionTrainer, ScoreDistillationTrainer, RewardedDistillationTrainer, StreamingDistillationTrainer
 
 
 def main():
@@ -41,6 +41,8 @@ def main():
         trainer = ScoreDistillationTrainer(config)
     elif config.trainer == "rewarded_distillation":
         trainer = RewardedDistillationTrainer(config)
+    elif config.trainer == "streaming_distillation":
+        trainer = StreamingDistillationTrainer(config)
     else:
         raise ValueError(f"Unknown trainer type: {config.trainer}")
     trainer.train()
