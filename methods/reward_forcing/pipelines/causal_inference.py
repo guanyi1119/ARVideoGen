@@ -1,7 +1,7 @@
 from typing import List, Optional
 import torch
 
-from core.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from core.wan_wrapper.wan_wrapper_reward_forcing import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 from core.misc.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller, move_model_to_device_with_memory_preservation
 

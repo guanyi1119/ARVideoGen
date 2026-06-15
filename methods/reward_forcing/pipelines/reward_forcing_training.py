@@ -1,5 +1,5 @@
 # same as self forcing training pipeline
-from core.wan_wrapper import WanDiffusionWrapper
+from core.wan_wrapper.wan_wrapper_reward_forcing import WanDiffusionWrapper
 from core.scheduler import SchedulerInterface
 from typing import List, Optional
 import torch

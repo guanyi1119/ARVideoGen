@@ -4,7 +4,7 @@ import torch
 
 from wan.utils.fm_solvers import FlowDPMSolverMultistepScheduler, get_sampling_sigmas, retrieve_timesteps
 from wan.utils.fm_solvers_unipc import FlowUniPCMultistepScheduler
-from core.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from core.wan_wrapper.wan_wrapper_reward_forcing import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 
 class CausalDiffusionInferencePipeline(torch.nn.Module):

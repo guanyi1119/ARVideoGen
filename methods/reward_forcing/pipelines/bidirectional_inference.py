@@ -1,7 +1,7 @@
 from typing import List
 import torch
 
-from core.wan_wrapper import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
+from core.wan_wrapper.wan_wrapper_reward_forcing import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 
 
 class BidirectionalInferencePipeline(torch.nn.Module):

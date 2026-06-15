@@ -298,7 +298,7 @@ class DMD(RewardForcingModel):
 
         # Step 3: Compute the denoising loss for the fake critic
         if self.args.denoising_loss_type == "flow":
-            from core.wan_wrapper import WanDiffusionWrapper
+            from core.wan_wrapper.wan_wrapper_reward_forcing import WanDiffusionWrapper
             flow_pred = WanDiffusionWrapper._convert_x0_to_flow_pred(
                 scheduler=self.scheduler,
                 x0_pred=pred_fake_image.flatten(0, 1),
