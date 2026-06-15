@@ -57,6 +57,16 @@ else:
 def causal_rope_apply(x, grid_sizes, freqs, start_frame=0):
     n, c = x.size(2), x.size(3) // 2
 
+    # If freqs has wrong number of channels (e.g. model config mismatch),
+    # reconstruct it from x's actual head_dim to avoid shape errors.
+    if freqs.shape[1] != c:
+        d = 2 * c
+        freqs = torch.cat([
+            rope_params(1024, d - 4 * (d // 6)),
+            rope_params(1024, 2 * (d // 6)),
+            rope_params(1024, 2 * (d // 6))
+        ], dim=1).to(device=freqs.device, dtype=freqs.dtype)
+
     # split freqs
     freqs = freqs.split([c - 2 * (c // 3), c // 3, c // 3], dim=1)
 
