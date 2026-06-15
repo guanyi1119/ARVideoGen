@@ -966,6 +966,7 @@ class Trainer:
             switch_conditional_dict=switch_conditional_dict,
             switch_frame_index=switch_frame_index,
             temp_max_length=temp_max_length,
+            text_prompts=text_prompts,
         )
         
         self.streaming_active = True
