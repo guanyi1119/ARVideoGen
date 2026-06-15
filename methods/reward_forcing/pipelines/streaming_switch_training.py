@@ -301,7 +301,8 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                 recache_input = frames_to_recache[:, start:end]
                 context_timestep = torch.ones(
                     [batch_size, end - start],
-                    device=torch.int64,
+                    device=device,
+                    dtype=torch.int64,
                 ) * self.context_noise
                 self.generator(
                     noisy_image_or_video=recache_input,
