@@ -245,15 +245,6 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
         return output, denoised_timestep_from, denoised_timestep_to
 
     def _recache_after_switch(self, output, current_start_frame, new_conditional_dict, local_start_frame=None, switch_recache_frames=None):
-        if not self.global_sink:
-            # reset kv cache
-            for block_idx in range(self.num_transformer_blocks):
-                cache = self.kv_cache1[block_idx]
-                cache["k"].zero_()
-                cache["v"].zero_()
-                # Keep absolute cache indices: subsequent calls still use absolute current_start.
-                # Resetting them would desynchronize Reward-Forcing cache addressing.
-            
         # reset cross-attention cache
         for blk in self.crossattn_cache:
             blk["k"].zero_()
@@ -280,40 +271,46 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                 frames_to_recache = output[:, -num_recache_frames:]
             
         batch_size, num_recache_frames, c, h, w = frames_to_recache.shape
+        device = frames_to_recache.device
+        recache_start_frame = current_start_frame - num_recache_frames
+        recache_start_token = recache_start_frame * self.frame_seq_length
         
         if (not dist.is_initialized() or dist.get_rank() == 0) and DEBUG:
             print(f"num_recache_frames: {num_recache_frames}, current_start_frame: {current_start_frame}, local_start_frame: {local_start_frame}")
         
-        # Create an appropriate BlockMask for recomputation
-        device = frames_to_recache.device
+        if not self.global_sink:
+            # reset kv cache to the absolute start of the recache window
+            for block_idx in range(self.num_transformer_blocks):
+                cache = self.kv_cache1[block_idx]
+                cache["k"].zero_()
+                cache["v"].zero_()
+                cache["global_end_index"].fill_(recache_start_token)
+                cache["local_end_index"].zero_()
         
-        # Use the standard blockwise causal mask
-        block_mask = self.generator.model._prepare_blockwise_causal_attn_mask(
-            device=device,
-            num_frames=num_recache_frames,
-            frame_seqlen=self.frame_seq_length,
-            num_frame_per_block=self.num_frame_per_block,
-            local_attn_size=self.switch_recache_frames
-        )
+        if num_recache_frames % self.num_frame_per_block != 0:
+            raise ValueError(
+                f"num_recache_frames ({num_recache_frames}) must be divisible by "
+                f"num_frame_per_block ({self.num_frame_per_block})"
+            )
         
-        # Prepare time steps
-        context_timestep = torch.ones([batch_size, num_recache_frames], 
-                                    device=device, dtype=torch.int64) * self.context_noise
-        
-        # Set the new block_mask
-        self.generator.model.block_mask = block_mask
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"current_start_frame: {current_start_frame}, num_recache_frames: {num_recache_frames}")
         with torch.no_grad():
-            recache_current_start = (current_start_frame - num_recache_frames) * self.frame_seq_length
-            self.generator(
-                noisy_image_or_video=frames_to_recache,
-                conditional_dict=new_conditional_dict,
-                timestep=context_timestep,
-                kv_cache=self.kv_cache1,
-                crossattn_cache=self.crossattn_cache,
-                current_start=recache_current_start,
-            )
+            for start in range(0, num_recache_frames, self.num_frame_per_block):
+                end = start + self.num_frame_per_block
+                recache_input = frames_to_recache[:, start:end]
+                context_timestep = torch.ones(
+                    [batch_size, end - start],
+                    device=torch.int64,
+                ) * self.context_noise
+                self.generator(
+                    noisy_image_or_video=recache_input,
+                    conditional_dict=new_conditional_dict,
+                    timestep=context_timestep,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=(recache_start_frame + start) * self.frame_seq_length,
+                )
 
         # reset cross-attention cache
         for blk in self.crossattn_cache:

@@ -180,10 +180,27 @@ class CausalWanSelfAttention(nn.Module):
         evicted_k = None
         evicted_v = None
         
-        if self.local_attn_size != -1 and (current_end > kv_cache["global_end_index"].item()) and (num_new_tokens + kv_cache["local_end_index"].item() > kv_cache_size):
-            num_evicted_tokens = num_new_tokens + kv_cache["local_end_index"].item() - kv_cache_size
-            num_rolled_tokens = kv_cache["local_end_index"].item() - num_evicted_tokens - total_sink_tokens
-            
+        global_end_index = kv_cache["global_end_index"].item()
+        local_end_before = kv_cache["local_end_index"].item()
+        delta_tokens = current_end - global_end_index
+        overwrite_cache = delta_tokens <= 0
+        
+        if overwrite_cache:
+            local_end_index = local_end_before + delta_tokens
+            local_start_index = local_end_index - num_new_tokens
+            if local_start_index < 0 or local_end_index > kv_cache_size:
+                raise RuntimeError(
+                    f"Invalid KV overwrite range: local_start={local_start_index}, "
+                    f"local_end={local_end_index}, num_new_tokens={num_new_tokens}, "
+                    f"local_end_before={local_end_before}, current_start={current_start}, "
+                    f"current_end={current_end}, global_end_index={global_end_index}"
+                )
+            kv_cache["k"][:, local_start_index:local_end_index] = k
+            kv_cache["v"][:, local_start_index:local_end_index] = v
+        elif self.local_attn_size != -1 and (num_new_tokens + local_end_before > kv_cache_size):
+            num_evicted_tokens = num_new_tokens + local_end_before - kv_cache_size
+            num_rolled_tokens = local_end_before - num_evicted_tokens - total_sink_tokens
+
             evicted_start = total_sink_tokens
             evicted_end = total_sink_tokens + num_evicted_tokens
             evicted_k = kv_cache["k"][:, evicted_start:evicted_end].clone()
@@ -195,13 +212,12 @@ class CausalWanSelfAttention(nn.Module):
             kv_cache["v"][:, total_sink_tokens:total_sink_tokens + num_rolled_tokens] = \
                 kv_cache["v"][:, total_sink_tokens + num_evicted_tokens:total_sink_tokens + num_evicted_tokens + num_rolled_tokens].clone()
             
-            local_end_index = kv_cache["local_end_index"].item() + current_end - \
-                kv_cache["global_end_index"].item() - num_evicted_tokens
+            local_end_index = local_end_before + delta_tokens - num_evicted_tokens
             local_start_index = local_end_index - num_new_tokens
             kv_cache["k"][:, local_start_index:local_end_index] = k
             kv_cache["v"][:, local_start_index:local_end_index] = v
         else:
-            local_end_index = kv_cache["local_end_index"].item() + current_end - kv_cache["global_end_index"].item()
+            local_end_index = local_end_before + delta_tokens
             local_start_index = local_end_index - num_new_tokens
             kv_cache["k"][:, local_start_index:local_end_index] = k
             kv_cache["v"][:, local_start_index:local_end_index] = v
@@ -279,8 +295,9 @@ class CausalWanSelfAttention(nn.Module):
                 v_segment,
             )
 
-        kv_cache["global_end_index"].fill_(current_end)
-        kv_cache["local_end_index"].fill_(local_end_index)
+        if not overwrite_cache:
+            kv_cache["global_end_index"].fill_(current_end)
+            kv_cache["local_end_index"].fill_(local_end_index)
 
         # output
         x = x.flatten(2)
