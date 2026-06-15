@@ -30,7 +30,10 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.global_sink = getattr(args, "global_sink", False)
+        self.global_sink = bool(kwargs.get("global_sink", False))
+        self.switch_recache_frames = int(kwargs.get("slice_last_frames", 21))
+        if self.switch_recache_frames <= 0:
+            self.switch_recache_frames = int(self.local_attn_size) if int(self.local_attn_size) > 0 else 21
 
     def generate_chunk_with_cache(
         self,
@@ -248,8 +251,8 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                 cache = self.kv_cache1[block_idx]
                 cache["k"].zero_()
                 cache["v"].zero_()
-                # cache["global_end_index"].zero_()
-                # cache["local_end_index"].zero_()
+                # Keep absolute cache indices: subsequent calls still use absolute current_start.
+                # Resetting them would desynchronize Reward-Forcing cache addressing.
             
         # reset cross-attention cache
         for blk in self.crossattn_cache:
@@ -261,7 +264,7 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
             return
 
         if switch_recache_frames is not None:
-            frames_to_recache = torch.cat([switch_recache_frames, output], dim=1)[:, -21:, ...]
+            frames_to_recache = torch.cat([switch_recache_frames, output], dim=1)[:, -self.switch_recache_frames:, ...]
             num_recache_frames = frames_to_recache.shape[1]
             if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                 print(f"[SeqTrain-DMDSwitch] Using external switch_recache_frames (previous_frames): {frames_to_recache.shape}")
@@ -269,11 +272,11 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
             # Determine how to fetch frames based on whether local_start_frame is provided
             if local_start_frame is not None:
                 # Chunk mode: output is the current chunk's output; use relative coordinates
-                num_recache_frames = min(local_start_frame, 21)
+                num_recache_frames = min(local_start_frame, self.switch_recache_frames)
                 frames_to_recache = output[:, -num_recache_frames:]
             else:
                 # Full sequence mode: output is the complete sequence; use absolute coordinates
-                num_recache_frames = min(current_start_frame, 21)
+                num_recache_frames = min(current_start_frame, self.switch_recache_frames)
                 frames_to_recache = output[:, -num_recache_frames:]
             
         batch_size, num_recache_frames, c, h, w = frames_to_recache.shape
@@ -290,7 +293,7 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
             num_frames=num_recache_frames,
             frame_seqlen=self.frame_seq_length,
             num_frame_per_block=self.num_frame_per_block,
-            local_attn_size=21
+            local_attn_size=self.switch_recache_frames
         )
         
         # Prepare time steps
@@ -302,13 +305,14 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"current_start_frame: {current_start_frame}, num_recache_frames: {num_recache_frames}")
         with torch.no_grad():
+            recache_current_start = (current_start_frame - num_recache_frames) * self.frame_seq_length
             self.generator(
                 noisy_image_or_video=frames_to_recache,
                 conditional_dict=new_conditional_dict,
                 timestep=context_timestep,
                 kv_cache=self.kv_cache1,
                 crossattn_cache=self.crossattn_cache,
-                current_start=(current_start_frame - num_recache_frames) * self.frame_seq_length,
+                current_start=recache_current_start,
             )
 
         # reset cross-attention cache
