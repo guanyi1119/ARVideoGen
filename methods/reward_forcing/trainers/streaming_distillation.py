@@ -32,8 +32,8 @@ from peft import get_peft_model_state_dict
 import safetensors.torch
 
 from core.misc.memory import gpu, get_cuda_free_memory_gb, log_gpu_memory
-from methods.longlive.pipelines.causal_inference import CausalInferencePipeline
-from methods.longlive.pipelines.switch_causal_inference import SwitchCausalInferencePipeline
+from methods.reward_forcing.pipelines.streaming_causal_inference import StreamingCausalInferencePipeline
+from methods.reward_forcing.pipelines.switch_causal_inference import SwitchCausalInferencePipeline
 from core.misc.debug_option import DEBUG, LOG_GPU_MEMORY, DEBUG_GRADIENT
 import time
 
@@ -1378,7 +1378,7 @@ class Trainer:
                 text_encoder=self.model.text_encoder,
                 vae=self.model.vae)
         else:
-            self.vis_pipeline = CausalInferencePipeline(
+            self.vis_pipeline = StreamingCausalInferencePipeline(
                 args=self.config,
                 device=self.device,
                 generator=self.model.generator,

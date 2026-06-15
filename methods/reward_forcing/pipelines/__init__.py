@@ -3,3 +3,5 @@ from .bidirectional_inference import BidirectionalInferencePipeline
 from .causal_diffusion_inference import CausalDiffusionInferencePipeline
 from .causal_inference import CausalInferencePipeline
 from .self_forcing_training import SelfForcingTrainingPipeline
+from .streaming_causal_inference import StreamingCausalInferencePipeline
+from .switch_causal_inference import SwitchCausalInferencePipeline
