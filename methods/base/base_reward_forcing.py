@@ -1,4 +1,4 @@
-﻿# Reward-Forcing version of base model classes.
+# Reward-Forcing version of base model classes.
 # Adapted from archive/Reward-Forcing/model/base.py with core imports.
 # Key features:
 #   - BaseModel: shared base class with VideoVLMRewardInference initialization

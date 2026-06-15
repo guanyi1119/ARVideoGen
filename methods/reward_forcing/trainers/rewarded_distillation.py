@@ -1,4 +1,4 @@
-﻿import gc
+import gc
 import logging
 from datetime import datetime
 

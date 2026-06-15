@@ -1,4 +1,4 @@
-﻿import gc
+import gc
 import logging
 
 from methods.reward_forcing import DMD

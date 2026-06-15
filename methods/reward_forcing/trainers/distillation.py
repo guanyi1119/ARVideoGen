@@ -1,4 +1,4 @@
-﻿import gc
+import gc
 import logging
 
 from core.data.dataset import ShardingLMDBDataset, cycle

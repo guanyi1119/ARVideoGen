@@ -1,4 +1,4 @@
-﻿import ast
+import ast
 import json
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"

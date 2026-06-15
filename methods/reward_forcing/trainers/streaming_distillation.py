@@ -1295,9 +1295,13 @@ class Trainer:
                 traceback.print_exc()
         finally:
             # Clean up resources
+            if hasattr(self, 'writer') and self.writer is not None:
                 try:
+                    self.writer.close()
                 except Exception as cleanup_e:
                     if self.is_main_process:
+                        print(f"[WARNING] Failed to close TensorBoard writer: {cleanup_e}")
+
 
     def _configure_lora_for_model(self, transformer, model_name):
         """Configure LoRA for a WanDiffusionWrapper model"""

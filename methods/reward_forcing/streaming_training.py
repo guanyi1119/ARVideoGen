@@ -731,7 +731,7 @@ class StreamingTrainingModel:
         denoising_loss_type = getattr(self.base_model.args, 'denoising_loss_type', 'mse')
         if denoising_loss_type == "flow":
             from core.wan_wrapper import get_wan_wrapper_classes
-_, _, WanDiffusionWrapper = get_wan_wrapper_classes('reward_forcing')
+            _, _, WanDiffusionWrapper = get_wan_wrapper_classes('reward_forcing')
             flow_pred = WanDiffusionWrapper._convert_x0_to_flow_pred(
                 scheduler=self.scheduler,
                 x0_pred=pred_fake_image.flatten(0, 1),
