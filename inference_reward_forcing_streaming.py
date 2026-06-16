@@ -46,7 +46,7 @@ if args_cli.num_output_frames is not None:
 elif not hasattr(config, "num_output_frames"):
     config.num_output_frames = getattr(config, "streaming_max_length", 240)
 if args_cli.checkpoint_path is not None:
-    config.generator_ckpt = args_cli.checkpoint_path
+    config.lora_ckpt = args_cli.checkpoint_path
 if args_cli.data_path is not None:
     config.data_path = args_cli.data_path
 if args_cli.output_folder is not None:
@@ -222,7 +222,7 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
             if config.save_with_index:
                 output_path = os.path.join(config.output_folder, f"rank{rank}-{idx}-{seed_idx}_{model_type}.mp4")
             else:
-                output_path = os.path.join(config.output_folder, f"rank{rank}-{prompt[:100]}-{seed_idx}.mp4")
+                output_path = os.path.join(config.output_folder, f"{prompt[:100]}-{seed_idx}.mp4")
             write_video(output_path, video[seed_idx], fps=16)
 
     if getattr(config, "inference_iter", -1) != -1 and i >= config.inference_iter:
