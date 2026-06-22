@@ -12,7 +12,8 @@ export TASK_QUEUE_ENABLE=1
 
 python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/models/wan_models/Wan2.1-T2V-1.3B', '/cache/wan_models/Wan2.1-T2V-1.3B')"
 python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/models/wan_models/Wan2.1-T2V-14B', '/cache/wan_models/Wan2.1-T2V-14B')"
-python -c "import moxing as mox; mox.file.copy('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/models/Self-Forcing/vidprom_filtered_extended.txt', '/cache/vidprom_filtered_extended.txt')"
+# python -c "import moxing as mox; mox.file.copy('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/data/DMDPrompts/vidprom_filtered_extended.txt', '/cache/vidprom_filtered_extended.txt')"
+python -c "import moxing as mox; mox.file.copy('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/data/DMDPrompts/vidprom_filtered_extended_llm_scored.jsonl', '/cache/vidprom_filtered_extended_llm_scored.jsonl')"
 python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/models/VideoReward', '/cache/VideoReward')"
 python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/models/Qwen2-VL-2B-Instruct', '/cache/Qwen2-VL-2B-Instruct')"
 
