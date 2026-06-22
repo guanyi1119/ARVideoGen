@@ -43,6 +43,55 @@ class TextDataset(Dataset):
         return batch
 
 
+class TextScoreDataset(Dataset):
+    """Text prompt dataset that also carries a per-prompt score.
+
+    Reads a JSONL file where each line is an object with at least a
+    ``prompt`` field and a numeric ``score`` field, e.g.
+
+        {"prompt": "...", "score": 0.55}
+
+    Used for reward-forcing style training where the score (e.g. motion
+    dynamism in [0, 1]) is consumed downstream alongside the prompt.
+    Mirrors :class:`TextDataset` but yields an extra ``scores`` field.
+    """
+    def __init__(self, prompt_path, extended_prompt_path=None):
+        self.prompt_list = []
+        self.score_list = []
+        with open(prompt_path, encoding="utf-8") as f:
+            for line_no, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                if "prompt" not in obj or "score" not in obj:
+                    raise ValueError(
+                        f"{prompt_path}:{line_no} missing 'prompt' or 'score' field"
+                    )
+                self.prompt_list.append(obj["prompt"])
+                self.score_list.append(float(obj["score"]))
+
+        if extended_prompt_path is not None:
+            with open(extended_prompt_path, encoding="utf-8") as f:
+                self.extended_prompt_list = [line.rstrip() for line in f]
+            assert len(self.extended_prompt_list) == len(self.prompt_list)
+        else:
+            self.extended_prompt_list = None
+
+    def __len__(self):
+        return len(self.prompt_list)
+
+    def __getitem__(self, idx):
+        batch = {
+            "prompts": self.prompt_list[idx],
+            "scores": torch.tensor(self.score_list[idx], dtype=torch.float32),
+            "idx": idx,
+        }
+        if self.extended_prompt_list is not None:
+            batch["extended_prompts"] = self.extended_prompt_list[idx]
+        return batch
+
+
 class ODERegressionLMDBDataset(Dataset):
     """ODE regression dataset stored in LMDB format.
 

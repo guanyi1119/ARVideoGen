@@ -288,6 +288,7 @@ class StreamingTrainingModel:
         switch_frame_index: Optional[int] = None,
         temp_max_length: Optional[int] = None,
         text_prompts: Optional[List[str]] = None,
+        scores: Optional[torch.Tensor] = None,
     ):
         """Set up a new sequence"""
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
@@ -362,6 +363,7 @@ class StreamingTrainingModel:
             "conditional_dict": conditional_dict,
             "unconditional_dict": unconditional_dict,
             "text_prompts": text_prompts,
+            "scores": scores,
         }
         
         # DMDSwitch related information
@@ -584,6 +586,7 @@ class StreamingTrainingModel:
         
         # Get text prompts from state
         text_prompts = self.state["conditional_info"].get("text_prompts", None)
+        scores = self.state["conditional_info"].get("scores", None)
         beta = getattr(self.config, "beta", 1.0)
         
         # Compute rewarded DMD loss
@@ -596,7 +599,8 @@ class StreamingTrainingModel:
             gradient_mask=gradient_mask,
             denoised_timestep_from=chunk_info["denoised_timestep_from"],
             denoised_timestep_to=chunk_info["denoised_timestep_to"],
-            beta=beta
+            beta=beta,
+            scores=scores,
         )
         
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:

@@ -128,7 +128,8 @@ class ReDMD(RewardForcingModel):
         gradient_mask: Optional[torch.Tensor] = None,
         denoised_timestep_from: int = 0,
         denoised_timestep_to: int = 0,
-        beta: float = 1.0
+        beta: float = 1.0,
+        scores: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute the DMD loss (eq 7 in https://arxiv.org/abs/2311.18828).
@@ -137,6 +138,9 @@ class ReDMD(RewardForcingModel):
             - conditional_dict: a dictionary containing the conditional information (e.g. text embeddings, image embeddings).
             - unconditional_dict: a dictionary containing the unconditional information (e.g. null/negative text embeddings, null/negative image embeddings).
             - gradient_mask: a boolean tensor with the same shape as image_or_video indicating which pixels to compute loss .
+            - scores: optional per-prompt dynamism score in [0, 1] used to blend MQ/VQ rewards.
+              When provided, the reward used in the exp-weight becomes
+              ``score * reward['MQ'] + (1 - score) * reward['VQ']`` instead of ``reward['MQ']``.
         Output:
             - dmd_loss: a scalar tensor representing the DMD loss.
             - dmd_log_dict: a dictionary containing the intermediate tensors for logging.
@@ -152,6 +156,15 @@ class ReDMD(RewardForcingModel):
             [text_prompts[0]],
             use_norm=True,
         ) 
+
+        if scores is not None:
+            if isinstance(scores, torch.Tensor):
+                score_val = scores.flatten()[0].to(reward['MQ'].device, reward['MQ'].dtype)
+            else:
+                score_val = torch.tensor(float(scores), device=reward['MQ'].device, dtype=reward['MQ'].dtype)
+            reward_term = score_val * reward['MQ'] + (1.0 - score_val) * reward['VQ']
+        else:
+            reward_term = reward['MQ']
 
         with torch.no_grad():
             min_timestep = denoised_timestep_to if self.ts_schedule and denoised_timestep_to is not None else self.min_score_timestep
@@ -187,10 +200,10 @@ class ReDMD(RewardForcingModel):
             )
 
         if gradient_mask is not None:
-            rl_dmd_loss = 0.5 * torch.exp(beta * reward['MQ']) * F.mse_loss(original_latent.double(
+            rl_dmd_loss = 0.5 * torch.exp(beta * reward_term) * F.mse_loss(original_latent.double(
             )[gradient_mask], (original_latent.double() - grad.double()).detach()[gradient_mask], reduction="mean")
         else:
-            rl_dmd_loss = 0.5 * torch.exp(beta * reward['MQ']) * F.mse_loss(original_latent.double(
+            rl_dmd_loss = 0.5 * torch.exp(beta * reward_term) * F.mse_loss(original_latent.double(
             ), (original_latent.double() - grad.double()).detach(), reduction="mean")
         return rl_dmd_loss, rl_dmd_log_dict
 
@@ -202,7 +215,8 @@ class ReDMD(RewardForcingModel):
         text_prompts: list,
         clean_latent: torch.Tensor,
         initial_latent: torch.Tensor = None,
-        beta: float = 1.0
+        beta: float = 1.0,
+        scores: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Generate image/videos from noise and compute the DMD loss.
@@ -235,7 +249,8 @@ class ReDMD(RewardForcingModel):
             gradient_mask=gradient_mask,
             denoised_timestep_from=denoised_timestep_from,
             denoised_timestep_to=denoised_timestep_to,
-            beta = beta
+            beta = beta,
+            scores=scores,
         )
 
         return rl_dmd_loss, rl_dmd_log_dict

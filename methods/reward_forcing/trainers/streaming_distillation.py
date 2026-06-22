@@ -6,7 +6,7 @@ import random
 import re
 from pathlib import Path
 
-from core.data.dataset import TextDataset, TwoTextDataset, cycle
+from core.data.dataset import TextDataset, TwoTextDataset, TextScoreDataset, cycle
 from core.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
 from core.misc import (
     set_seed,
@@ -327,6 +327,8 @@ class Trainer:
             dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
         elif self.config.distribution_loss == "dmd_switch":
             dataset = TwoTextDataset(config.data_path, config.switch_prompt_path)
+        elif getattr(config, "use_score", False):
+            dataset = TextScoreDataset(config.data_path)
         else:
             dataset = TextDataset(config.data_path)
         sampler = torch.utils.data.distributed.DistributedSampler(
@@ -882,6 +884,7 @@ class Trainer:
 
         # Prepare conditional information
         text_prompts = batch["prompts"]
+        scores = batch.get("scores", None)
         if self.config.i2v:
             image_latent = batch["ode_latent"][:, -1][:, 0:1, ].to(
                 device=self.device, dtype=self.dtype)
@@ -967,6 +970,7 @@ class Trainer:
             switch_frame_index=switch_frame_index,
             temp_max_length=temp_max_length,
             text_prompts=text_prompts,
+            scores=scores,
         )
         
         self.streaming_active = True

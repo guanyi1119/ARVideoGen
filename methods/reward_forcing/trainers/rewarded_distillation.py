@@ -5,7 +5,7 @@ from datetime import datetime
 from numpy.random import beta
 
 from core.data.dataset import ShardingLMDBDataset, cycle
-from core.data.dataset import TextDataset
+from core.data.dataset import TextDataset, TextScoreDataset
 from core.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
 from core.misc import (
     set_seed,
@@ -129,6 +129,8 @@ class Trainer:
         # Step 3: Initialize the dataloader
         if self.config.i2v:
             dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
+        elif getattr(config, "use_score", False):
+            dataset = TextScoreDataset(config.data_path)
         else:
             dataset = TextDataset(config.data_path)
         sampler = torch.utils.data.distributed.DistributedSampler(
@@ -221,6 +223,7 @@ class Trainer:
 
         # Step 1: Get the next batch of text prompts
         text_prompts = batch["prompts"]
+        scores = batch.get("scores", None)
         if self.config.i2v:
             clean_latent = None
             image_latent = batch["ode_latent"][:, -1][:, 0:1, ].to(
@@ -256,7 +259,8 @@ class Trainer:
                 text_prompts = text_prompts,
                 clean_latent=clean_latent,
                 initial_latent=image_latent if self.config.i2v else None,
-                beta = self.config.beta
+                beta = self.config.beta,
+                scores=scores,
             )
 
             if self.gradient_accumulation_steps > 1:
