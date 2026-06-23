@@ -17,8 +17,12 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader, SequentialSampler
 from torch.utils.data.distributed import DistributedSampler
 
-from methods.reward_forcing.pipelines import CausalInferencePipeline
-from core.data.dataset import TextDataset
+from methods.reward_forcing.pipelines import (
+    CausalInferencePipeline,
+    SwitchCausalInferencePipeline,
+    InteractiveCausalInferencePipeline,
+)
+from core.data.dataset import TextDataset, TwoTextDataset, MultiTextDataset
 from core.misc import set_seed
 from core.misc.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller
 
@@ -27,6 +31,29 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--config_path", type=str, required=True)
 parser.add_argument("--checkpoint_path", type=str, default=None, help="Path to the checkpoint file")
 parser.add_argument("--data_path", type=str, default=None, help="Path to the prompt file")
+parser.add_argument(
+    "--switch_data_path",
+    type=str,
+    default=None,
+    help="Path to the second-segment prompt file. If provided, SwitchCausalInferencePipeline is used.",
+)
+parser.add_argument(
+    "--switch_frame_index",
+    type=int,
+    default=None,
+    help="Frame index at which to switch prompts. Defaults to half of num_output_frames when switch_data_path is set.",
+)
+parser.add_argument(
+    "--multi_prompts",
+    action="store_true",
+    help="If set, data_path must be a JSONL file containing a list of prompts per line. Uses MultiTextDataset + InteractiveCausalInferencePipeline.",
+)
+parser.add_argument(
+    "--switch_frame_indices",
+    type=str,
+    default=None,
+    help="Comma-separated frame indices to switch prompts in multi-prompts mode. Length must equal N_seg - 1. Defaults to evenly spaced.",
+)
 parser.add_argument("--output_folder", type=str, default=None, help="Output folder")
 parser.add_argument("--num_output_frames", type=int, default=None, help="Number of output frames")
 parser.add_argument("--global_sink", type=lambda x: x.lower() == "true", default=True, help="Use global sink (default: True)")
@@ -56,6 +83,27 @@ config.use_ema = args_cli.use_ema
 config.seed = args_cli.seed
 config.num_samples = args_cli.num_samples
 config.save_with_index = args_cli.save_with_index
+config.switch_data_path = args_cli.switch_data_path
+config.multi_prompts = bool(args_cli.multi_prompts)
+use_multi = config.multi_prompts
+use_switch = (not use_multi) and (args_cli.switch_data_path is not None)
+if use_multi:
+    assert config.data_path is not None and config.data_path.endswith(".jsonl"), (
+        "--multi_prompts requires --data_path to point to a .jsonl file"
+    )
+    if args_cli.switch_frame_indices is not None:
+        config.switch_frame_indices = [
+            int(x) for x in args_cli.switch_frame_indices.split(",") if x.strip()
+        ]
+    else:
+        config.switch_frame_indices = None  # computed per-sample below
+elif use_switch:
+    default_switch_frame = config.num_output_frames // 2
+    config.switch_frame_index = (
+        args_cli.switch_frame_index
+        if args_cli.switch_frame_index is not None
+        else default_switch_frame
+    )
 
 # Initialize distributed inference
 if "LOCAL_RANK" in os.environ:
@@ -96,7 +144,22 @@ low_memory = True
 torch.set_grad_enabled(False)
 
 # Initialize pipeline
-pipeline = CausalInferencePipeline(config, device=device)
+if use_multi:
+    if local_rank == 0:
+        print(
+            f"[MultiPrompts] Enabled. data_path={config.data_path}, "
+            f"switch_frame_indices={getattr(config, 'switch_frame_indices', None)}"
+        )
+    pipeline = InteractiveCausalInferencePipeline(config, device=device)
+elif use_switch:
+    if local_rank == 0:
+        print(
+            f"[Switch] Enabled. switch_data_path={config.switch_data_path}, "
+            f"switch_frame_index={config.switch_frame_index}"
+        )
+    pipeline = SwitchCausalInferencePipeline(config, device=device)
+else:
+    pipeline = CausalInferencePipeline(config, device=device)
 
 # Load generator checkpoint
 if getattr(config, "generator_ckpt", None):
@@ -153,8 +216,16 @@ if low_memory:
 pipeline.generator.to(device=device)
 pipeline.vae.to(device=device)
 
-extended_prompt_path = getattr(config, "data_path", None)
-dataset = TextDataset(prompt_path=config.data_path, extended_prompt_path=extended_prompt_path)
+if use_multi:
+    dataset = MultiTextDataset(prompt_path=config.data_path)
+elif use_switch:
+    dataset = TwoTextDataset(
+        prompt_path=config.data_path,
+        switch_prompt_path=config.switch_data_path,
+    )
+else:
+    extended_prompt_path = getattr(config, "data_path", None)
+    dataset = TextDataset(prompt_path=config.data_path, extended_prompt_path=extended_prompt_path)
 num_prompts = len(dataset)
 print(f"Number of prompts: {num_prompts}")
 
@@ -181,24 +252,79 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
 
     all_video = []
 
-    prompt = batch["prompts"][0]
-    extended_prompt = batch["extended_prompts"][0] if "extended_prompts" in batch else None
-    if extended_prompt is not None:
-        prompts = [extended_prompt] * config.num_samples
+    if use_multi:
+        prompts_list_raw = batch["prompts_list"]
+        # DataLoader collates list-of-strings as [[str_per_batch], ...]; batch_size=1
+        prompts_seg = [seg[0] if isinstance(seg, (list, tuple)) else seg for seg in prompts_list_raw]
+        n_seg = len(prompts_seg)
+        assert n_seg >= 2, f"multi_prompts requires at least 2 segments per sample, got {n_seg}"
+
+        if getattr(config, "switch_frame_indices", None):
+            switch_indices = list(config.switch_frame_indices)
+            assert len(switch_indices) == n_seg - 1, (
+                f"switch_frame_indices length ({len(switch_indices)}) must equal n_seg-1 ({n_seg - 1})"
+            )
+        else:
+            step = config.num_output_frames // n_seg
+            switch_indices = [step * (i + 1) for i in range(n_seg - 1)]
+
+        text_prompts_list = [[p] * config.num_samples for p in prompts_seg]
+
+        sampled_noise = torch.randn(
+            [config.num_samples, config.num_output_frames, 16, 60, 104],
+            device=device,
+            dtype=torch.bfloat16,
+        )
+
+        video, latents = pipeline.inference(
+            noise=sampled_noise,
+            text_prompts_list=text_prompts_list,
+            switch_frame_indices=switch_indices,
+            return_latents=True,
+            low_memory=low_memory,
+        )
+        prompt = prompts_seg[0]  # for output naming
+    elif use_switch:
+        prompt = batch["prompts"][0]
+        switch_prompt = batch["switch_prompts"][0]
+        prompts_first = [prompt] * config.num_samples
+        prompts_second = [switch_prompt] * config.num_samples
+
+        sampled_noise = torch.randn(
+            [config.num_samples, config.num_output_frames, 16, 60, 104],
+            device=device,
+            dtype=torch.bfloat16,
+        )
+
+        video, latents = pipeline.inference(
+            noise=sampled_noise,
+            text_prompts_first=prompts_first,
+            text_prompts_second=prompts_second,
+            switch_frame_index=config.switch_frame_index,
+            return_latents=True,
+            low_memory=low_memory,
+        )
     else:
-        prompts = [prompt] * config.num_samples
+        prompt = batch["prompts"][0]
+        extended_prompt = batch["extended_prompts"][0] if "extended_prompts" in batch else None
+        if extended_prompt is not None:
+            prompts = [extended_prompt] * config.num_samples
+        else:
+            prompts = [prompt] * config.num_samples
 
-    sampled_noise = torch.randn(
-        [config.num_samples, config.num_output_frames, 16, 60, 104], device=device, dtype=torch.bfloat16
-    )
+        sampled_noise = torch.randn(
+            [config.num_samples, config.num_output_frames, 16, 60, 104],
+            device=device,
+            dtype=torch.bfloat16,
+        )
 
-    video, latents = pipeline.inference(
-        noise=sampled_noise,
-        text_prompts=prompts,
-        return_latents=True,
-        low_memory=low_memory,
-        profile=False,
-    )
+        video, latents = pipeline.inference(
+            noise=sampled_noise,
+            text_prompts=prompts,
+            return_latents=True,
+            low_memory=low_memory,
+            profile=False,
+        )
     current_video = rearrange(video, "b t c h w -> b t h w c").cpu()
     all_video.append(current_video)
 
@@ -222,7 +348,14 @@ for i, batch_data in tqdm(enumerate(dataloader), disable=(local_rank != 0)):
             if config.save_with_index:
                 output_path = os.path.join(config.output_folder, f"rank{rank}-{idx}-{seed_idx}_{model_type}.mp4")
             else:
-                output_path = os.path.join(config.output_folder, f"{prompt[:100]}-{seed_idx}.mp4")
+                if use_multi:
+                    name = "__SWITCH__".join(s[:40] for s in prompts_seg) + f"-{seed_idx}"
+                elif use_switch:
+                    switch_prompt = batch["switch_prompts"][0]
+                    name = f"{prompt[:60]}__SWITCH__{switch_prompt[:60]}-{seed_idx}"
+                else:
+                    name = f"{prompt[:100]}-{seed_idx}"
+                output_path = os.path.join(config.output_folder, f"{name}.mp4")
             write_video(output_path, video[seed_idx], fps=16)
 
     if getattr(config, "inference_iter", -1) != -1 and i >= config.inference_iter:

@@ -5,3 +5,4 @@ from .causal_inference import CausalInferencePipeline
 from .self_forcing_training import SelfForcingTrainingPipeline
 from .streaming_causal_inference import StreamingCausalInferencePipeline
 from .switch_causal_inference import SwitchCausalInferencePipeline
+from .interactive_causal_inference import InteractiveCausalInferencePipeline
