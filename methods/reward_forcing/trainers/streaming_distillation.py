@@ -19,6 +19,7 @@ from methods.reward_forcing import ReDMD, ReDMDSwitch
 from methods.reward_forcing.streaming_training import StreamingTrainingModel
 import torch
 import time
+from datetime import datetime
 import os
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import (
@@ -1099,6 +1100,8 @@ class Trainer:
 
     def train(self):
         start_step = self.step
+        self.start_step = self.step
+        self.start_time = time.time()
         try:
             while True:
                 # Check if we should train generator on this optimization step
@@ -1277,6 +1280,30 @@ class Trainer:
                         print(f"step {self.step}, per iteration time {iteration_time}, generator_loss {generator_log_dict['generator_loss'].mean().item()}, generator_grad_norm {generator_log_dict['generator_grad_norm'].mean().item()}, dmdtrain_gradient_norm {generator_log_dict['dmdtrain_gradient_norm'].mean().item()}, critic_loss {critic_log_dict['critic_loss'].mean().item()}, critic_grad_norm {critic_log_dict['critic_grad_norm'].mean().item()}")
                     else:
                         print(f"step {self.step}, per iteration time {iteration_time}, critic_loss {critic_log_dict['critic_loss'].mean().item()}, critic_grad_norm {critic_log_dict['critic_grad_norm'].mean().item()}")
+
+                    # Throughput logging (tokens/s/npu), aligned with rewarded_distillation.train
+                    batch_size = getattr(self.config, "batch_size", 1)
+                    end_time = time.time()
+                    end_step = self.step
+                    step_diff = max(end_step - self.start_step, 1)
+                    time_diff = end_time - self.start_time
+                    seconds_per_iter = time_diff / step_diff
+                    throughput = 1560 * 12 * batch_size / max(seconds_per_iter, 1e-6)
+                    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    gen_loss_val = (
+                        generator_log_dict['generator_loss'].mean().item()
+                        if TRAIN_GENERATOR and generator_log_dict else 0.0
+                    )
+                    print(
+                        f"{timestamp}: [step {self.step}] "
+                        f"generator_loss: {gen_loss_val:.4f} "
+                        f"critic_loss: {critic_log_dict['critic_loss'].mean().item():.4f} "
+                        f"DI_throughput: {throughput:.2f} tokens/s/npu"
+                    )
+                    if not self.disable_logging:
+                        self.writer.log({"DI_throughput": throughput}, step=self.step)
+                    self.start_time = time.time()
+                    self.start_step = end_step
 
                 # ---------------------------------------- Visualization ---------------------------------------------------
 
