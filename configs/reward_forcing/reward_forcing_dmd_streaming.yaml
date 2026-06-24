@@ -47,7 +47,7 @@ image_or_video_shape:
 - 60
 - 104
 distribution_loss: dmd_switch
-global_sink: false
+global_sink: true
 trainer: streaming_distillation
 gradient_checkpointing: true
 num_frame_per_block: 3
