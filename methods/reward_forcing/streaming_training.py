@@ -10,6 +10,7 @@
 import time
 import torch
 import torch.distributed as dist
+import random as _random
 from typing import Tuple, Dict, Any, Optional, List
 from einops import rearrange
 
@@ -69,6 +70,12 @@ class StreamingTrainingModel:
         
         # Streaming state
         self.reset_state()  
+
+        # KV cache zeroing augmentation probabilities (applied during generator
+        # rollout only).  When both are 0 the behaviour is identical to the
+        # original implementation.
+        self.sink_kv_cache_zero_prob = float(getattr(config, "sink_kv_cache_zero_prob", 0.0))
+        self.window_kv_cache_zero_prob = float(getattr(config, "window_kv_cache_zero_prob", 0.0))
         
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"[StreamingTrain-Model] streamingTrainingModel initialized:")
@@ -186,24 +193,107 @@ class StreamingTrainingModel:
             print(f"[StreamingTrain-Model] Using original conditional_dict for chunk starting at frame {chunk_start_frame}")
         return cond_info["conditional_dict"]
     
+    def _get_sink_size(self) -> int:
+        """Retrieve sink_size from the underlying causal model."""
+        try:
+            model = self.generator.model
+            blocks = getattr(model, 'blocks', None)
+            if blocks is not None and len(blocks) > 0:
+                attn = getattr(blocks[0], 'self_attn', None)
+                if attn is not None:
+                    return getattr(attn, 'sink_size', 0)
+        except Exception:
+            pass
+        return 0
+
+    def _save_kv_cache(self) -> list:
+        """Deep-copy the full KV cache state so it can be restored later."""
+        saved = []
+        for blk in self.inference_pipeline.kv_cache1:
+            saved.append({
+                "k": blk["k"].clone(),
+                "v": blk["v"].clone(),
+                "global_end_index": blk["global_end_index"].clone(),
+                "local_end_index": blk["local_end_index"].clone(),
+            })
+        return saved
+
+    def _restore_kv_cache(self, saved: list):
+        """Restore KV cache from a previously saved snapshot."""
+        for blk, sb in zip(self.inference_pipeline.kv_cache1, saved):
+            blk["k"].copy_(sb["k"])
+            blk["v"].copy_(sb["v"])
+            blk["global_end_index"].copy_(sb["global_end_index"])
+            blk["local_end_index"].copy_(sb["local_end_index"])
+
+    def _maybe_zero_kv_cache(self, device) -> Dict[str, bool]:
+        """Randomly zero out the sink and/or window portions of the KV cache.
+
+        Returns a dict with ``zero_sink`` and ``zero_window`` flags (synchronised
+        across all ranks).
+        """
+        sink_size = self._get_sink_size()
+        total_sink_tokens = sink_size * self.frame_seq_length
+
+        decisions = torch.zeros(2, device=device, dtype=torch.float32)
+        if dist.is_initialized():
+            if dist.get_rank() == 0:
+                if self.sink_kv_cache_zero_prob > 0:
+                    decisions[0] = _random.random()
+                if self.window_kv_cache_zero_prob > 0:
+                    decisions[1] = _random.random()
+            dist.broadcast(decisions, src=0)
+        else:
+            if self.sink_kv_cache_zero_prob > 0:
+                decisions[0] = _random.random()
+            if self.window_kv_cache_zero_prob > 0:
+                decisions[1] = _random.random()
+
+        zero_sink = decisions[0].item() < self.sink_kv_cache_zero_prob
+        zero_window = decisions[1].item() < self.window_kv_cache_zero_prob
+
+        if not zero_sink and not zero_window:
+            return {"zero_sink": False, "zero_window": False}
+
+        for kv_cache in self.inference_pipeline.kv_cache1:
+            local_end = kv_cache["local_end_index"].item()
+            if zero_sink and total_sink_tokens > 0:
+                kv_cache["k"][:, :total_sink_tokens].zero_()
+                kv_cache["v"][:, :total_sink_tokens].zero_()
+            if zero_window and local_end > total_sink_tokens:
+                kv_cache["k"][:, total_sink_tokens:local_end].zero_()
+                kv_cache["v"][:, total_sink_tokens:local_end].zero_()
+
+        if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+            print(f"[StreamingTrain-Model] KV cache zeroing applied: sink={zero_sink}, window={zero_window}")
+
+        return {"zero_sink": zero_sink, "zero_window": zero_window}
+
     def _generate_chunk(
         self, 
         noise_chunk: torch.Tensor,
         chunk_start_frame: int,
         requires_grad: bool = True,
-    ) -> Tuple[torch.Tensor, Optional[int], Optional[int]]:
+    ) -> Tuple[torch.Tensor, Optional[int], Optional[int], Optional[torch.Tensor]]:
         """
         Generate a single chunk.
+
+        When KV-cache zeroing augmentation is enabled (and fires), a *second*
+        generation pass is performed with a degraded cache.  The zeroed-cache
+        output is returned as the fourth element so that the caller can use it
+        as the ``uncond`` reference in a unified CFG during loss computation.
 
         Args:
             noise_chunk: noise input [batch_size, chunk_frames, C, H, W]
             chunk_start_frame: start frame index of the chunk in the full sequence
-            requires_grad: whether gradients are required
+            requires_grad: whether gradients are required (for the full-cache pass)
 
         Returns:
-            generated_chunk: generated chunk [batch_size, chunk_frames, C, H, W]
+            output_full: generated chunk with full cache [B, F, C, H, W]
             denoised_timestep_from: starting timestep for denoising
             denoised_timestep_to: ending timestep for denoising
+            output_zeroed: generated chunk with zeroed cache (None when zeroing
+              is disabled, not applicable, or the random decision did not fire)
         """
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
             log_gpu_memory(f"StreamingTrain-Model: Before generate chunk {chunk_start_frame}", device=self.device, rank=dist.get_rank() if dist.is_initialized() else 0)
@@ -255,29 +345,61 @@ class StreamingTrainingModel:
         
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
             log_gpu_memory(f"StreamingTrain-Model: Before pipeline.generate_chunk_with_cache", device=self.device, rank=dist.get_rank() if dist.is_initialized() else 0)
-            
-        output, denoised_timestep_from, denoised_timestep_to = self.inference_pipeline.generate_chunk_with_cache(**kwargs)
-        # if DEBUG:
-        #     # Inspect timestep info
-        #     print(f"[DEBUG-SeqModel-GenChunk] denoised_timestep_from: {denoised_timestep_from}")
-        #     print(f"[DEBUG-SeqModel-GenChunk] denoised_timestep_to: {denoised_timestep_to}")
 
-        #     print(f"output shape: {output.shape}")
-        #     with torch.no_grad():
-        #         if self.state["previous_frames"] is not None:
-        #             output_vis = torch.cat([self.state["previous_frames"], output], dim=1)
-        #         else:
-        #             output_vis = output
-        #         video = self.base_model.vae.decode_to_pixel(output_vis, use_cache=False)
-        #         video = (video * 0.5 + 0.5).clamp(0, 1)
-        #         video = video.permute(0, 1, 3, 4, 2).cpu().numpy() * 255.0
-        #         video_tensor = torch.from_numpy(video[0].astype("uint8"))
-        #         from torchvision.io import write_video
-        #         write_video(f"debug_save/output_{chunk_start_frame}_to_{chunk_start_frame+output.shape[1]}_denoise_{denoised_timestep_from}_{denoised_timestep_to}_rank{dist.get_rank()}.mp4", video_tensor, fps=16)
+        # ------------------------------------------------------------------
+        # Unified CFG: dual generation (full cache + zeroed cache).
+        #
+        # 1. Save the pre-generation cache (history before this chunk).
+        # 2. Generate output_full with the full cache (normal, with grad).
+        # 3. Save the post-full cache (history + full-chunk tokens).
+        # 4. Restore the pre-generation cache and zero sink/window.
+        # 5. Generate output_zeroed with the degraded cache (no grad).
+        # 6. Restore the post-full cache so the next chunk sees full history.
+        #
+        # When zeroing is disabled or doesn't fire, output_zeroed is None and
+        # the behaviour is identical to the original single-generation path.
+        # ------------------------------------------------------------------
+        apply_zeroing = (
+            requires_grad  # only for generator training (not critic)
+            and chunk_start_frame > 0  # skip the very first chunk (no history)
+            and (self.sink_kv_cache_zero_prob > 0 or self.window_kv_cache_zero_prob > 0)
+            and self.inference_pipeline.kv_cache1 is not None
+        )
+
+        pre_gen_cache = self._save_kv_cache() if apply_zeroing else None
+
+        output_full, denoised_timestep_from, denoised_timestep_to = self.inference_pipeline.generate_chunk_with_cache(**kwargs)
+
+        output_zeroed = None
+        if pre_gen_cache is not None:
+            # Save post-full cache (history + this chunk's tokens, written by
+            # the context-update pass inside generate_chunk_with_cache).
+            post_full_cache = self._save_kv_cache()
+
+            # Restore to pre-generation state and attempt zeroing.
+            self._restore_kv_cache(pre_gen_cache)
+            zero_info = self._maybe_zero_kv_cache(device=self.device)
+
+            if zero_info["zero_sink"] or zero_info["zero_window"]:
+                # Generate with degraded cache (no gradients — this is a
+                # reference for the uncond CFG path, not the main output).
+                zeroed_kwargs = dict(kwargs)
+                zeroed_kwargs["requires_grad"] = False
+                with torch.no_grad():
+                    output_zeroed, _, _ = self.inference_pipeline.generate_chunk_with_cache(**zeroed_kwargs)
+                output_zeroed = output_zeroed.detach()
+                if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+                    print(f"[StreamingTrain-Model] Zeroed-cache generation produced: shape={output_zeroed.shape}")
+
+            # Restore post-full cache so the next chunk sees the full history
+            # plus the full-cache generation tokens.
+            self._restore_kv_cache(post_full_cache)
+            del pre_gen_cache, post_full_cache
+
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
             log_gpu_memory(f"StreamingTrain-Model: After pipeline.generate_chunk_with_cache", device=self.device, rank=dist.get_rank() if dist.is_initialized() else 0)
 
-        return output, denoised_timestep_from, denoised_timestep_to
+        return output_full, denoised_timestep_from, denoised_timestep_to, output_zeroed
     
     def setup_sequence(
         self,
@@ -491,7 +613,7 @@ class StreamingTrainingModel:
         )
         
         # Generate new frames - note chunk_start_frame should consider overlap
-        generated_new_frames, denoised_timestep_from, denoised_timestep_to = self._generate_chunk(
+        generated_new_frames, denoised_timestep_from, denoised_timestep_to, generated_new_frames_zeroed = self._generate_chunk(
             noise_chunk=noise_chunk,
             chunk_start_frame=current_length,
             requires_grad=requires_grad,
@@ -503,6 +625,18 @@ class StreamingTrainingModel:
             full_chunk = torch.cat([previous_frames, generated_new_frames], dim=1)
         else:
             full_chunk = generated_new_frames
+
+        # Build the zeroed-cache full chunk (if the zeroed generation was produced)
+        full_chunk_zeroed = None
+        if generated_new_frames_zeroed is not None:
+            if previous_frames is not None:
+                full_chunk_zeroed = torch.cat([previous_frames, generated_new_frames_zeroed], dim=1)
+            else:
+                full_chunk_zeroed = generated_new_frames_zeroed
+            # Apply the same first-frame encoding as the full chunk
+            if previous_frames is not None:
+                full_chunk_zeroed = self._process_first_frame_encoding(full_chunk_zeroed)
+            full_chunk_zeroed = full_chunk_zeroed.detach()
         
         # Update state - save the last 21 frames as previous_frames for the next chunk
         # The frames saved here should be those before _process_first_frame_encoding
@@ -546,6 +680,7 @@ class StreamingTrainingModel:
             "current_length": self.state["current_length"],
             "gradient_mask": gradient_mask,  # Mask frames that do not require gradients for loss computation
             "overlap_frames_used": overlap_frames_to_use,
+            "chunk_zeroed": full_chunk_zeroed,  # Zeroed-cache generation for unified CFG (None when not produced)
         }
         if not dist.is_initialized() or dist.get_rank() == 0:
             print(f"[StreamingTrain-Model] current_training_chunk: ({self.state['current_length'] - new_frames_to_generate} -> {self.state['current_length']})/{self.state['temp_max_length']}")
@@ -578,8 +713,14 @@ class StreamingTrainingModel:
         # Fetch gradient_mask to compute loss only on newly generated frames
         gradient_mask = chunk_info.get("gradient_mask", None)
         
+        # Fetch the zeroed-cache chunk (for unified CFG).  None when zeroing
+        # is disabled or the random decision did not fire.
+        chunk_zeroed = chunk_info.get("chunk_zeroed", None)
+        
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"[StreamingTrain-Model] Using conditional_dict and unconditional_dict for loss calculation at frame {chunk_start_frame}")
+            if chunk_zeroed is not None:
+                print(f"[StreamingTrain-Model] Unified CFG: chunk_zeroed shape={chunk_zeroed.shape}")
         # Decode chunk to pixels for reward computation
         with torch.no_grad():
             pixels = self.base_model.vae.decode_to_pixel(chunk).to(self.dtype)
@@ -601,6 +742,7 @@ class StreamingTrainingModel:
             denoised_timestep_to=chunk_info["denoised_timestep_to"],
             beta=beta,
             scores=scores,
+            image_or_video_zeroed=chunk_zeroed,
         )
         
         if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:

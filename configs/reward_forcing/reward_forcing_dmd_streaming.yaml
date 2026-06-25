@@ -90,6 +90,14 @@ streaming_max_length: 240
 streaming_min_new_frame: 18
 train_first_chunk: true
 
+# Unified CFG: probability of zeroing sink / window KV cache regions during
+# the generator rollout.  When zeroing fires, a second generation pass is
+# performed with the degraded cache and used as the uncond reference in the
+# CFG loss computation.  Range: 0.0–1.0 (e.g. 0.3 = 30% chance per chunk).
+# Both default to 0.0 (disabled, original behaviour).
+sink_kv_cache_zero_prob: 0.1
+window_kv_cache_zero_prob: 0.1
+
 last_step_only: false
 
 ## LoRA Configuration

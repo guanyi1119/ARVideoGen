@@ -499,6 +499,12 @@ class Trainer:
         self.max_grad_norm_critic = getattr(config, "max_grad_norm_critic", 10.0)
         self.gradient_accumulation_steps = getattr(config, "gradient_accumulation_steps", 1)
         self.previous_time = None
+
+        # KV cache zeroing augmentation probabilities (applied during generator_loss
+        # which uses unconditional_dict for CFG).  When both are 0 the behaviour is
+        # identical to the original implementation.
+        self.sink_kv_cache_zero_prob = float(getattr(config, "sink_kv_cache_zero_prob", 0.0))
+        self.window_kv_cache_zero_prob = float(getattr(config, "window_kv_cache_zero_prob", 0.0))
         
         # streaming training configuration
         self.streaming_training = getattr(config, "streaming_training", False)
@@ -522,6 +528,8 @@ class Trainer:
                 print(f"Effective batch size: {config.batch_size * self.gradient_accumulation_steps * self.world_size}")
             if self.streaming_training:
                 print(f"streaming training enabled: chunk_size={self.streaming_chunk_size}, max_length={self.streaming_max_length}")
+            if self.sink_kv_cache_zero_prob > 0 or self.window_kv_cache_zero_prob > 0:
+                print(f"KV cache zeroing augmentation: sink_prob={self.sink_kv_cache_zero_prob}, window_prob={self.window_kv_cache_zero_prob}")
             if LOG_GPU_MEMORY:
                 log_gpu_memory("After initialization", device=self.device, rank=dist.get_rank())
 
