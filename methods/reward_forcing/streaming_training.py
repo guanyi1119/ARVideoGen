@@ -388,8 +388,16 @@ class StreamingTrainingModel:
                 with torch.no_grad():
                     output_zeroed, _, _ = self.inference_pipeline.generate_chunk_with_cache(**zeroed_kwargs)
                 output_zeroed = output_zeroed.detach()
-                if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
-                    print(f"[StreamingTrain-Model] Zeroed-cache generation produced: shape={output_zeroed.shape}")
+
+                if not dist.is_initialized() or dist.get_rank() == 0:
+                    print(
+                        f"[StreamingTrain-Model] Unified CFG fired at "
+                        f"chunk_start_frame={chunk_start_frame}: "
+                        f"sink_cache_zeroed={zero_info['zero_sink']}, "
+                        f"window_cache_zeroed={zero_info['zero_window']} → "
+                        f"second generation with degraded cache produced "
+                        f"(shape={output_zeroed.shape}), used as uncond reference"
+                    )
 
             # Restore post-full cache so the next chunk sees the full history
             # plus the full-cache generation tokens.
