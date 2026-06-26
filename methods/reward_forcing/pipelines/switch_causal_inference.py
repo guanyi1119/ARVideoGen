@@ -75,7 +75,10 @@ class SwitchCausalInferencePipeline(StreamingCausalInferencePipeline):
               f"recache_start_frame={recache_start_frame}, current_start_frame={current_start_frame}")
 
         # 3. If not global_sink, zero the KV cache and reset indices to the
-        #    recache window start (same as training).
+        #    recache window start (same as training).  When global_sink is
+        #    True we leave the KV and indices untouched — again matching
+        #    training — because the increased KV cache size (slice_last_frames
+        #    now included) is large enough to absorb the negative delta_tokens.
         if not self.global_sink:
             for block_idx in range(self.num_transformer_blocks):
                 cache = self.kv_cache1[block_idx]
@@ -144,8 +147,10 @@ class SwitchCausalInferencePipeline(StreamingCausalInferencePipeline):
         local_attn_cfg = getattr(self.args.model_kwargs, "local_attn_size", -1)
         kv_policy = ""
         if local_attn_cfg != -1:
-            kv_cache_size = local_attn_cfg * self.frame_seq_length
-            kv_policy = f"int->local, size={local_attn_cfg}"
+            # Match the training KV cache size: local_attn_size + slice_last_frames
+            slice_last = getattr(self.args, "slice_last_frames", 21)
+            kv_cache_size = (local_attn_cfg + slice_last) * self.frame_seq_length
+            kv_policy = f"local, size={local_attn_cfg}, slice_last={slice_last}"
         else:
             kv_cache_size = num_output_frames * self.frame_seq_length
             kv_policy = "global (-1)"
