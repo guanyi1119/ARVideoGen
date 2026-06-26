@@ -188,6 +188,16 @@ class CausalWanSelfAttention(nn.Module):
         if overwrite_cache:
             local_end_index = local_end_before + delta_tokens
             local_start_index = local_end_index - num_new_tokens
+            # Guard: when recaching after a prompt switch, delta_tokens can be
+            # very negative because global_end_index is far ahead of
+            # current_start.  Reset both indices so that subsequent blocks
+            # write sequentially in non-overwrite mode.
+            if local_start_index < 0 or local_end_index > kv_cache_size:
+                total_sink = self.sink_size * frame_seqlen
+                local_start_index = total_sink
+                local_end_index = total_sink + num_new_tokens
+                kv_cache["global_end_index"].fill_(current_start)
+                kv_cache["local_end_index"].fill_(local_end_index)
             if local_start_index < 0 or local_end_index > kv_cache_size:
                 raise RuntimeError(
                     f"Invalid KV overwrite range: local_start={local_start_index}, "
