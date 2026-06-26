@@ -34,7 +34,7 @@ gradient_accumulation_steps: 1
 ema_weight: 0.99
 ema_start_step: 200
 total_batch_size: 64
-log_iters: 50
+log_iters: 500
 max_checkpoints: 3
 max_iters: 3000
 
@@ -52,7 +52,7 @@ trainer: streaming_distillation
 gradient_checkpointing: true
 num_frame_per_block: 3
 load_raw_video: false
-beta: 3.5
+beta: 1.0
 model_kwargs:
   timestep_shift: 5.0
   local_attn_size: 12
