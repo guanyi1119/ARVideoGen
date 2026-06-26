@@ -22,14 +22,26 @@ class SwitchCausalInferencePipeline(StreamingCausalInferencePipeline):
     ):
         super().__init__(args, device, generator=generator, text_encoder=text_encoder, vae=vae)
         self.global_sink = getattr(args, "global_sink", False)
+        # Recache window size: must match training (slice_last_frames, default 21).
+        # Falls back to local_attn_size if slice_last_frames is not set.
+        self.switch_recache_frames = int(getattr(args, "slice_last_frames", 0))
+        if self.switch_recache_frames <= 0:
+            self.switch_recache_frames = int(self.local_attn_size) if int(self.local_attn_size) > 0 else 21
 
     def _recache_after_switch(self, output, current_start_frame, new_conditional_dict):
-        if not self.global_sink:
-            for block_idx in range(self.num_transformer_blocks):
-                cache = self.kv_cache1[block_idx]
-                cache["k"].zero_()
-                cache["v"].zero_()
+        """Rebuild KV cache and cross-attn cache after a prompt switch.
 
+        This mirrors the training implementation in
+        ``StreamingSwitchTrainingPipeline._recache_after_switch``:
+          - Uses ``slice_last_frames`` (21) as the recache window, NOT
+            ``local_attn_size`` (12).
+          - Recaches **block-by-block** (``num_frame_per_block`` frames at a
+            time), so each block's forward sees the previous block's freshly
+            written KV — identical to training.
+          - Does NOT touch ``block_mask`` (the attention function does not use
+            it for the reward-forcing causal model).
+        """
+        # 1. Reset cross-attention cache
         for blk in self.crossattn_cache:
             blk["k"].zero_()
             blk["v"].zero_()
@@ -38,40 +50,61 @@ class SwitchCausalInferencePipeline(StreamingCausalInferencePipeline):
         if current_start_frame == 0:
             return
 
-        num_recache_frames = current_start_frame if self.local_attn_size == -1 else min(self.local_attn_size, current_start_frame)
+        # 2. Determine recache window — use slice_last_frames (matches training)
+        num_recache_frames = min(current_start_frame, self.switch_recache_frames)
         recache_start_frame = current_start_frame - num_recache_frames
+        recache_start_token = recache_start_frame * self.frame_seq_length
+
+        # Ensure divisibility by num_frame_per_block
+        if num_recache_frames % self.num_frame_per_block != 0:
+            # Trim to the nearest multiple
+            num_recache_frames = (num_recache_frames // self.num_frame_per_block) * self.num_frame_per_block
+            if num_recache_frames <= 0:
+                return
+            recache_start_frame = current_start_frame - num_recache_frames
+            recache_start_token = recache_start_frame * self.frame_seq_length
 
         frames_to_recache = output[:, recache_start_frame:current_start_frame]
         if frames_to_recache.device.type == 'cpu':
             target_device = next(self.generator.parameters()).device
             frames_to_recache = frames_to_recache.to(target_device)
+
         batch_size = frames_to_recache.shape[0]
-        print(f"num_recache_frames: {num_recache_frames}, recache_start_frame: {recache_start_frame}, current_start_frame: {current_start_frame}")
-
         device = frames_to_recache.device
-        block_mask = self.generator.model._prepare_blockwise_causal_attn_mask(
-            device=device,
-            num_frames=num_recache_frames,
-            frame_seqlen=self.frame_seq_length,
-            num_frame_per_block=self.num_frame_per_block,
-            local_attn_size=self.local_attn_size
-        )
+        print(f"[switch-recache] num_recache_frames={num_recache_frames}, "
+              f"recache_start_frame={recache_start_frame}, current_start_frame={current_start_frame}")
 
-        context_timestep = torch.ones([batch_size, num_recache_frames],
-                                    device=device, dtype=torch.int64) * self.args.context_noise
+        # 3. If not global_sink, zero the KV cache and reset indices to the
+        #    recache window start (same as training).
+        if not self.global_sink:
+            for block_idx in range(self.num_transformer_blocks):
+                cache = self.kv_cache1[block_idx]
+                cache["k"].zero_()
+                cache["v"].zero_()
+                cache["global_end_index"].fill_(recache_start_token)
+                cache["local_end_index"].zero_()
 
-        self.generator.model.block_mask = block_mask
-
+        # 4. Recache block-by-block (num_frame_per_block frames at a time),
+        #    matching the training implementation exactly.
+        context_timestep_val = self.args.context_noise
         with torch.no_grad():
-            self.generator(
-                noisy_image_or_video=frames_to_recache,
-                conditional_dict=new_conditional_dict,
-                timestep=context_timestep,
-                kv_cache=self.kv_cache1,
-                crossattn_cache=self.crossattn_cache,
-                current_start=recache_start_frame * self.frame_seq_length,
-            )
+            for start in range(0, num_recache_frames, self.num_frame_per_block):
+                end = start + self.num_frame_per_block
+                recache_input = frames_to_recache[:, start:end]
+                context_timestep = torch.ones(
+                    [batch_size, end - start],
+                    device=device, dtype=torch.int64,
+                ) * context_timestep_val
+                self.generator(
+                    noisy_image_or_video=recache_input,
+                    conditional_dict=new_conditional_dict,
+                    timestep=context_timestep,
+                    kv_cache=self.kv_cache1,
+                    crossattn_cache=self.crossattn_cache,
+                    current_start=(recache_start_frame + start) * self.frame_seq_length,
+                )
 
+        # 5. Reset cross-attention cache again after recaching
         for blk in self.crossattn_cache:
             blk["k"].zero_()
             blk["v"].zero_()
