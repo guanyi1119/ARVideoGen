@@ -187,7 +187,8 @@ class StreamingCausalInferencePipeline(CausalInferencePipeline):
             kv_cache_size = kv_cache_size_override
         else:
             if self.local_attn_size != -1:
-                kv_cache_size = self.local_attn_size * self.frame_seq_length
+                slice_last = getattr(self, 'slice_last_frames', 21)
+                kv_cache_size = (self.local_attn_size + slice_last) * self.frame_seq_length
             else:
                 kv_cache_size = 32760
 

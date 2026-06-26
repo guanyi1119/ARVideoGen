@@ -144,11 +144,11 @@ class SwitchCausalInferencePipeline(StreamingCausalInferencePipeline):
             dtype=noise.dtype
         )
 
-        local_attn_cfg = getattr(self.args.model_kwargs, "local_attn_size", -1)
+        local_attn_cfg = self.local_attn_size  # already resolved by __init__
         kv_policy = ""
         if local_attn_cfg != -1:
             # Match the training KV cache size: local_attn_size + slice_last_frames
-            slice_last = getattr(self.args, "slice_last_frames", 21)
+            slice_last = self.slice_last_frames if getattr(self, 'slice_last_frames', 0) > 0 else 21
             kv_cache_size = (local_attn_cfg + slice_last) * self.frame_seq_length
             kv_policy = f"local, size={local_attn_cfg}, slice_last={slice_last}"
         else:
