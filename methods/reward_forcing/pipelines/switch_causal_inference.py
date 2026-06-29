@@ -40,8 +40,16 @@ class SwitchCausalInferencePipeline(StreamingCausalInferencePipeline):
 
             def _frame_decode(latent):
                 # latent: [B, T, C, H, W] → pixels [B, T, 3, H', W'] in [-1, 1]
-                # Convert to [0, 1] for PIL / VLM consumption
+                # In low_memory mode ``output`` lives on CPU while ``self.vae``
+                # lives on GPU/NPU, so we MUST move the latent to the VAE's
+                # device before decoding — mirrors the main inference path
+                # at the end of ``inference()`` which does
+                # ``output.to(noise.device)`` before ``decode_to_pixel``.
+                vae_device = next(self.vae.parameters()).device
+                if latent.device != vae_device:
+                    latent = latent.to(vae_device)
                 pixels = self.vae.decode_to_pixel(latent, use_cache=False)
+                # Convert to [0, 1] for PIL / VLM consumption
                 return (pixels * 0.5 + 0.5).clamp(0.0, 1.0)
 
             self._teleport_hook = build_teleport_switch_hook(

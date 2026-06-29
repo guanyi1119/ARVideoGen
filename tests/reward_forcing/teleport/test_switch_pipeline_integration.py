@@ -145,3 +145,49 @@ def test_build_teleport_switch_hook_import():
     assert "build_teleport_switch_hook" in source, (
         "Expected 'build_teleport_switch_hook' reference in source"
     )
+
+
+# ---------------------------------------------------------------------------
+# 8. _frame_decode must align latent device with VAE device
+# ---------------------------------------------------------------------------
+
+
+def test_frame_decode_aligns_latent_device():
+    """Regression test for the cpu/npu device mismatch bug.
+
+    The ``_frame_decode`` closure runs ``self.vae.decode_to_pixel(latent)``.
+    When ``low_memory=True`` the ``output`` tensor lives on CPU while the VAE
+    lives on GPU/NPU, so the closure MUST move ``latent`` to the VAE's device
+    before calling ``decode_to_pixel`` — otherwise PyTorch raises
+    "Expected all tensors to be on the same device, but found at least two
+    devices, cpu and npu:0".
+
+    We check this structurally by reading the source and asserting that
+    ``decode_to_pixel`` is preceded (in the closure body) by a ``.to(`` call
+    that references the VAE device.
+    """
+    source = open(_SRC, encoding="utf-8").read()
+
+    # Locate the _frame_decode closure body.
+    closure_start = source.index("def _frame_decode")
+    closure_end = source.index("self._teleport_hook = build_teleport_switch_hook")
+    closure_body = source[closure_start:closure_end]
+
+    # Must contain a .to(...) call before decode_to_pixel.
+    decode_pos = closure_body.index("decode_to_pixel")
+    pre_decode = closure_body[:decode_pos]
+
+    assert ".to(" in pre_decode, (
+        "_frame_decode must call .to(vae_device) before "
+        "self.vae.decode_to_pixel — otherwise CPU latent + GPU/NPU VAE will "
+        "raise a device mismatch error. Current closure body:\n"
+        + closure_body
+    )
+
+    # Must reference vae.parameters or vae.device to derive target device.
+    assert "self.vae.parameters" in closure_body or "self.vae.device" in closure_body, (
+        "_frame_decode must derive the target device from self.vae "
+        "(via parameters() or .device) so it adapts to wherever the VAE "
+        "actually lives. Current closure body:\n"
+        + closure_body
+    )
