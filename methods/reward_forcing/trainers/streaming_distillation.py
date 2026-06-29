@@ -1358,7 +1358,7 @@ class Trainer:
         
         # Define the specific modules we want to apply LoRA to
         if model_name == 'generator':
-            adapter_target_modules = ['CausalWanAttentionBlock']
+            adapter_target_modules = ['CausalWanAttentionBlock', 'CausalWanAttentionBlock3Sink']
         elif model_name == 'fake_score':
             adapter_target_modules = ['WanAttentionBlock']
         else:
