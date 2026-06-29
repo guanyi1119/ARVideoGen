@@ -15,8 +15,9 @@ from core.misc import (
 )
 import torch.distributed as dist
 from omegaconf import OmegaConf
-from methods.reward_forcing import ReDMD, ReDMDSwitch
+from methods.reward_forcing import ReDMD, ReDMDSwitch, ReDMD3Sink, ReDMDSwitch3Sink
 from methods.reward_forcing.streaming_training import StreamingTrainingModel
+from methods.reward_forcing.streaming_training_3sink import StreamingTrainingModel3Sink
 import torch
 import time
 from datetime import datetime
@@ -82,6 +83,10 @@ class Trainer:
             self.model = ReDMD(config, device=self.device)
         elif config.distribution_loss == "dmd_switch":
             self.model = ReDMDSwitch(config, device=self.device)
+        elif config.distribution_loss == "dmd_3sink":
+            self.model = ReDMD3Sink(config, device=self.device)
+        elif config.distribution_loss == "dmd_switch_3sink":
+            self.model = ReDMDSwitch3Sink(config, device=self.device)
         else:
             raise ValueError("Invalid distribution matching loss")
 
@@ -513,7 +518,10 @@ class Trainer:
         
         # Create streaming training model if enabled
         if self.streaming_training:
-            self.streaming_model = StreamingTrainingModel(self.model, config)
+            if isinstance(self.model, (ReDMD3Sink, ReDMDSwitch3Sink)):
+                self.streaming_model = StreamingTrainingModel3Sink(self.model, config)
+            else:
+                self.streaming_model = StreamingTrainingModel(self.model, config)
             if self.is_main_process:
                 print(f"streaming training enabled: chunk_size={self.streaming_chunk_size}, max_length={self.streaming_max_length}")
         else:
