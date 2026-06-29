@@ -1,0 +1,147 @@
+"""Integration sanity checks for hook injection in switch_causal_inference.py.
+
+Uses ``ast`` to parse the source file and verify structural invariants —
+**never imports** ``SwitchCausalInferencePipeline`` (would trigger CUDA).
+"""
+
+import ast
+import os
+
+
+_PROJECT_ROOT = os.path.normpath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..")
+)
+_SRC = os.path.join(
+    _PROJECT_ROOT,
+    "methods",
+    "reward_forcing",
+    "pipelines",
+    "switch_causal_inference.py",
+)
+
+
+def _parse() -> ast.Module:
+    with open(_SRC, encoding="utf-8") as f:
+        return ast.parse(f.read(), filename=_SRC)
+
+
+# ---------------------------------------------------------------------------
+# 1. Hook attribute present
+# ---------------------------------------------------------------------------
+
+
+def test_hook_attribute_exists():
+    """Source must reference ``self._teleport_hook``."""
+    source = open(_SRC, encoding="utf-8").read()
+    assert "self._teleport_hook" in source, (
+        "Expected 'self._teleport_hook' in switch_causal_inference.py"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2. torch.no_grad guard present
+# ---------------------------------------------------------------------------
+
+
+def test_torch_no_grad_guard():
+    """The maybe_rewrite call must be wrapped in ``with torch.no_grad():``."""
+    source = open(_SRC, encoding="utf-8").read()
+
+    # Verify the source contains both strings
+    assert "with torch.no_grad():" in source, (
+        "Expected 'with torch.no_grad():' guard around hook call"
+    )
+    assert "self._teleport_hook.maybe_rewrite" in source, (
+        "Expected 'self._teleport_hook.maybe_rewrite' call"
+    )
+
+    # Structural check: verify they appear in the right order
+    nograd_pos = source.index("with torch.no_grad():")
+    maybe_rewrite_pos = source.index("self._teleport_hook.maybe_rewrite")
+    assert nograd_pos < maybe_rewrite_pos, (
+        "torch.no_grad() must appear before maybe_rewrite call"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 3. cond_second assigned before _recache_after_switch
+# ---------------------------------------------------------------------------
+
+
+def test_cond_second_assigned_before_recache():
+    """cond_second must be assigned (by hook or fallback) before _recache_after_switch."""
+    source = open(_SRC, encoding="utf-8").read()
+
+    # After the hook block, cond_second must be assigned before _recache
+    recache_pos = source.index("self._recache_after_switch")
+    hook_pos = source.index("self._teleport_hook.maybe_rewrite")
+
+    # Between maybe_rewrite and _recache_after_switch, there should be a
+    # fallback cond_second assignment
+    between = source[hook_pos:recache_pos]
+    assert "cond_second" in between, (
+        "cond_second must be assigned between hook call and _recache_after_switch"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 4. OmegaConf import present
+# ---------------------------------------------------------------------------
+
+
+def test_omegaconf_import():
+    """Source must import OmegaConf for config access."""
+    tree = _parse()
+    imports = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+    ]
+    found = False
+    for imp in imports:
+        if isinstance(imp, ast.ImportFrom):
+            if imp.module == "omegaconf":
+                names = [alias.name for alias in imp.names]
+                if "OmegaConf" in names:
+                    found = True
+                    break
+    assert found, "Expected 'from omegaconf import OmegaConf' in source"
+
+
+# ---------------------------------------------------------------------------
+# 5. OmegaConf.select usage for config access
+# ---------------------------------------------------------------------------
+
+
+def test_omegaconf_select_usage():
+    """Config access must use OmegaConf.select for DictConfig compatibility."""
+    source = open(_SRC, encoding="utf-8").read()
+    assert "OmegaConf.select" in source, (
+        "Expected OmegaConf.select for config access (DictConfig-safe)"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 6. cond_second = None (deferred encoding)
+# ---------------------------------------------------------------------------
+
+
+def test_cond_second_deferred():
+    """cond_second must be initialised as None (lazy encode)."""
+    source = open(_SRC, encoding="utf-8").read()
+    assert "cond_second = None" in source, (
+        "Expected 'cond_second = None' for deferred encoding"
+    )
+
+
+# ---------------------------------------------------------------------------
+# 7. build_teleport_switch_hook import
+# ---------------------------------------------------------------------------
+
+
+def test_build_teleport_switch_hook_import():
+    """Source must import build_teleport_switch_hook (possibly lazy)."""
+    source = open(_SRC, encoding="utf-8").read()
+    assert "build_teleport_switch_hook" in source, (
+        "Expected 'build_teleport_switch_hook' reference in source"
+    )

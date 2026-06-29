@@ -114,6 +114,23 @@ window_kv_cache_zero_prob: 0.1
 
 last_step_only: false
 
+# ---------------------------------------------------------------------------
+# Teleport mitigation / prompt_rewrite — pluggable VLM-based prompt rewrite at
+# the switch boundary.  Default OFF: when ``enabled: false`` (or this block is
+# absent), the pipeline is byte-for-byte equivalent to the unmodified main
+# branch.  See methods/reward_forcing/teleport/ for the implementation.
+# ---------------------------------------------------------------------------
+teleport:
+  prompt_rewrite:
+    enabled: false                       # master switch; false = no-op
+    vlm:
+      type: qwen_vl_3b                   # qwen_vl_3b | qwen_vl | disabled
+      model_path: Qwen/Qwen2.5-VL-3B-Instruct
+      device: cuda
+      max_new_tokens: 256
+    rewriter:
+      mode: conservative                 # off | conservative | aggressive
+
 ## LoRA Configuration
 adapter:
   type: "lora"

@@ -41,7 +41,10 @@ class InteractiveCausalInferencePipeline(SwitchCausalInferencePipeline):
 
         if DEBUG:
             print(f"[InteractiveInference] num_segments={len(text_prompts_list)}, switch_at={switch_frame_indices}")
-        cond_list = [self.text_encoder(text_prompts=p) for p in text_prompts_list]
+        # Segment 0: encode immediately (needed for first segment generation).
+        # Segments 1+: defer encoding to switch point so hook can rewrite prompts.
+        cond_list: List = [self.text_encoder(text_prompts=text_prompts_list[0])]
+        cond_list.extend([None] * (len(text_prompts_list) - 1))
 
         if low_memory:
             gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5
@@ -96,6 +99,16 @@ class InteractiveCausalInferencePipeline(SwitchCausalInferencePipeline):
         for current_num_frames in all_num_frames:
             if next_switch_pos is not None and current_start_frame >= next_switch_pos:
                 segment_idx += 1
+                # === prompt_rewrite teleport hook (no-op if disabled) ===
+                if self._teleport_hook is not None:
+                    with torch.no_grad():
+                        cond_list[segment_idx] = self._teleport_hook.maybe_rewrite(
+                            output, current_start_frame, text_prompts_list[segment_idx]
+                        )
+                if cond_list[segment_idx] is None:
+                    # hook disabled or returned None → encode original prompt
+                    cond_list[segment_idx] = self.text_encoder(text_prompts=text_prompts_list[segment_idx])
+                # === end hook ===
                 self._recache_after_switch(output, current_start_frame, cond_list[segment_idx])
                 print(f"[InteractiveInference] switch to segment {segment_idx} at frame {current_start_frame}")
                 next_switch_pos = (

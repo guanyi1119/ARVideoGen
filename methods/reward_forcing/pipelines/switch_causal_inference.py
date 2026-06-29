@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 from typing import List, Optional
 import torch
+from omegaconf import OmegaConf
 
 from core.wan_wrapper.wan_wrapper_reward_forcing import WanDiffusionWrapper, WanTextEncoder, WanVAEWrapper
 from core.misc.memory import gpu, get_cuda_free_memory_gb, move_model_to_device_with_memory_preservation
@@ -27,6 +28,27 @@ class SwitchCausalInferencePipeline(StreamingCausalInferencePipeline):
         self.switch_recache_frames = int(getattr(args, "slice_last_frames", 0))
         if self.switch_recache_frames <= 0:
             self.switch_recache_frames = int(self.local_attn_size) if int(self.local_attn_size) > 0 else 21
+
+        # ---- Teleport mitigation / prompt_rewrite hook — optional, off by default ----
+        prompt_rewrite_cfg = OmegaConf.select(args, "teleport.prompt_rewrite")
+        self._teleport_hook = None
+        if prompt_rewrite_cfg is not None:
+            from methods.reward_forcing.teleport import build_teleport_switch_hook
+
+            def _text_encode(prompts):
+                return self.text_encoder(text_prompts=prompts)
+
+            def _frame_decode(latent):
+                # latent: [B, T, C, H, W] → pixels [B, T, 3, H', W'] in [-1, 1]
+                # Convert to [0, 1] for PIL / VLM consumption
+                pixels = self.vae.decode_to_pixel(latent, use_cache=False)
+                return (pixels * 0.5 + 0.5).clamp(0.0, 1.0)
+
+            self._teleport_hook = build_teleport_switch_hook(
+                prompt_rewrite_cfg,
+                text_encoder_fn=_text_encode,
+                frame_decoder_fn=_frame_decode,
+            )
 
     def _recache_after_switch(self, output, current_start_frame, new_conditional_dict):
         """Rebuild KV cache and cross-attn cache after a prompt switch.
@@ -129,7 +151,10 @@ class SwitchCausalInferencePipeline(StreamingCausalInferencePipeline):
         num_blocks = num_output_frames // self.num_frame_per_block
 
         cond_first = self.text_encoder(text_prompts=text_prompts_first)
-        cond_second = self.text_encoder(text_prompts=text_prompts_second)
+        # cond_second encoding deferred to switch trigger point:
+        # if hook is enabled and needs to rewrite, it re-encodes the
+        # rewritten prompt; otherwise the original prompt is encoded below.
+        cond_second = None  # placeholder, encoded just-in-time
 
         if low_memory:
             gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5
@@ -179,6 +204,16 @@ class SwitchCausalInferencePipeline(StreamingCausalInferencePipeline):
         using_second = False
         for current_num_frames in all_num_frames:
             if (not using_second) and (current_start_frame >= switch_frame_index):
+                # === prompt_rewrite teleport hook (no-op if disabled) ===
+                if self._teleport_hook is not None:
+                    with torch.no_grad():
+                        cond_second = self._teleport_hook.maybe_rewrite(
+                            output, current_start_frame, text_prompts_second
+                        )
+                if cond_second is None:
+                    # hook disabled or returned None → encode original prompt
+                    cond_second = self.text_encoder(text_prompts=text_prompts_second)
+                # === end hook ===
                 self._recache_after_switch(output, current_start_frame, cond_second)
                 cond_in_use = cond_second
                 using_second = True
