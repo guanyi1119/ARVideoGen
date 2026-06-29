@@ -148,14 +148,16 @@ class TeleportSwitchHook:
         current_start_frame: int,
         text_prompts_second: List[str],
     ) -> ConditionalDict:
-        """Guarded implementation — all tensor ops run under ``torch.no_grad()``."""
+        """Guarded implementation — all tensor ops run under ``torch.no_grad()``.
 
-        # 1. VLM unavailable → encode original prompt
-        if not self.vlm.is_available():
-            logger.debug("TeleportSwitchHook: VLM not available, skipping rewrite.")
-            return self.text_encoder_fn(text_prompts_second)
+        Note: we deliberately do NOT pre-check ``self.vlm.is_available()`` here
+        because the VLM is lazy-loaded on the first ``check_visibility`` call.
+        If the load fails (e.g. model file missing), ``check_visibility`` raises
+        and the outer ``maybe_rewrite`` ``try/except`` falls back to encoding the
+        original prompt.
+        """
 
-        # 2. No history yet (first frame block) → nothing to analyse
+        # 1. No history yet (first frame block) → nothing to analyse
         if current_start_frame <= 0:
             logger.debug(
                 "TeleportSwitchHook: current_start_frame=%d, no history to "
@@ -164,7 +166,7 @@ class TeleportSwitchHook:
             )
             return self.text_encoder_fn(text_prompts_second)
 
-        # 3. Extract the last frame from accumulated latents
+        # 2. Extract the last frame from accumulated latents
         #    output_latent: [B, F_so_far, C, H, W]
         #    Take frame at index current_start_frame-1 (single frame)
         single_frame_latent = output_latent[
@@ -176,7 +178,7 @@ class TeleportSwitchHook:
         # Take first batch item and first frame → [3, H', W']
         frame_rgb = pixels[0, 0]  # [3, H', W']
 
-        # 4. Extract entities from the prompt
+        # 3. Extract entities from the prompt
         prompt_str = text_prompts_second[0]
         entities = self.entity_extractor_fn(prompt_str)
 
@@ -187,13 +189,13 @@ class TeleportSwitchHook:
             )
             return self.text_encoder_fn(text_prompts_second)
 
-        # 5. VLM visibility check
+        # 4. VLM visibility check
         visibility = self.vlm.check_visibility(frame_rgb, entities)
 
-        # 6. Rewrite prompt
+        # 5. Rewrite prompt
         rewritten = self.rewriter.rewrite(prompt_str, visibility)
 
-        # 7. Re-encode (broadcast to batch)
+        # 6. Re-encode (broadcast to batch)
         return self.text_encoder_fn([rewritten] * len(text_prompts_second))
 
 

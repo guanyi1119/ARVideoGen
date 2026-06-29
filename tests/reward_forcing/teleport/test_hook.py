@@ -1,7 +1,7 @@
 """Unit tests for TeleportSwitchHook — all VLM / rewriter calls mocked, no GPU."""
 
 from typing import Dict, List
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -12,6 +12,7 @@ from methods.reward_forcing.teleport.hook import (
     build_teleport_switch_hook,
 )
 from methods.reward_forcing.teleport.rewriter import PromptRewriter
+from methods.reward_forcing.teleport.vlm import QwenTeleportVLM
 
 
 # ---------------------------------------------------------------------------
@@ -264,3 +265,84 @@ class TestDefaultEntityExtract:
     def test_deduplication(self):
         result = _default_entity_extract("dog dog dog")
         assert result == ["dog"]
+
+
+# ---------------------------------------------------------------------------
+# 8. test_maybe_rewrite_lazy_load_bug
+# ---------------------------------------------------------------------------
+
+
+class TestMaybeRewriteLazyLoadBug:
+    """Regression test for the is_available()-as-gate bug.
+
+    Before the fix: ``maybe_rewrite`` short-circuits on the FIRST call because
+    ``is_available()`` returns False until ``check_visibility`` triggers
+    ``_load_model`` — but ``check_visibility`` is never reached because of the
+    short-circuit.  The result: lazy-load never happens, rewrite never fires.
+
+    After the fix: ``maybe_rewrite`` does NOT call ``is_available()`` as a gate.
+    It calls ``check_visibility`` directly, which triggers the lazy load.
+    """
+
+    def test_first_call_does_not_short_circuit_on_is_available(self):
+        from methods.reward_forcing.teleport.vlm import QwenTeleportVLM
+
+        # Use a real QwenTeleportVLM (not a Mock) so we exercise the
+        # lazy-load contract.  Replace _call_vlm to avoid actually loading.
+        vlm = QwenTeleportVLM(model_path="/tmp/fake", device="cpu")
+        # Sanity: pre-call, expander is None and is_available is False.
+        assert vlm._expander is None
+        assert vlm.is_available() is False
+
+        # Patch _call_vlm so check_visibility can run end-to-end.
+        # We do NOT patch is_available — that's exactly what we're
+        # regression-testing.
+        calls = []
+
+        def fake_call_vlm(self, frame_rgb, entity_list):
+            calls.append(("call_vlm", entity_list))
+            return '{"visible": ["dog"], "absent": [], "partial": []}'
+
+        # Also patch _load_model: we want to verify it WAS attempted,
+        # but we don't want the real Qwen load.
+        load_attempts = []
+
+        def fake_load_model(self):
+            load_attempts.append("load")
+            # Simulate successful load by setting _expander to a sentinel.
+            self._expander = object()
+
+        rewriter = _make_mock_rewriter()
+        rewriter.rewrite.return_value = "REWRITTEN_PROMPT"
+        text_enc = _make_mock_text_encoder()
+        frame_dec = _make_mock_frame_decoder()
+
+        with patch.object(QwenTeleportVLM, "_call_vlm", fake_call_vlm), \
+             patch.object(QwenTeleportVLM, "_load_model", fake_load_model):
+            hook = TeleportSwitchHook(
+                vlm=vlm,
+                rewriter=rewriter,
+                text_encoder_fn=text_enc,
+                frame_decoder_fn=frame_dec,
+                entity_extractor_fn=lambda p: ["dog"],
+            )
+            output_latent = torch.zeros(1, 21, 16, 40, 40)
+            hook.maybe_rewrite(output_latent, 21, ["A dog runs"])
+
+        # The lazy-load MUST have been attempted on the first call.
+        assert len(load_attempts) == 1, (
+            f"_load_model was NOT called on first maybe_rewrite — "
+            f"this is the is_available()-as-gate bug. "
+            f"load_attempts={load_attempts}"
+        )
+        # check_visibility's underlying _call_vlm MUST have run.
+        assert len(calls) == 1, (
+            f"_call_vlm was NOT called — short-circuit bug. calls={calls}"
+        )
+        # text_encoder MUST have received the REWRITTEN prompt, not the
+        # original.
+        encoded = text_enc.call_args[0][0]
+        assert encoded[0] == "REWRITTEN_PROMPT", (
+            f"text_encoder received original prompt instead of rewritten — "
+            f"hook short-circuited. encoded={encoded!r}"
+        )
