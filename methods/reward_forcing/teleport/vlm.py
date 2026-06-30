@@ -207,8 +207,32 @@ class QwenTeleportVLM(TeleportVLM):
     ) -> Dict[str, Any]:
         """See ``TeleportVLM.analyze``."""
         self._load_model()
+
+        from ._debug import tdprint, is_teleport_debug
+
+        if is_teleport_debug():
+            tdprint(
+                f"analyze() prompt_hint={prompt_hint_entities!r} "
+                f"frame_shape={tuple(frame_rgb.shape)} "
+                f"frame_minmax=({frame_rgb.min().item():.3f}, "
+                f"{frame_rgb.max().item():.3f})"
+            )
+
         raw = self._call_vlm_analyze(frame_rgb, prompt_hint_entities)
-        return self._parse_analyze_response(raw, prompt_hint_entities)
+
+        if is_teleport_debug():
+            # 截断超长输出，避免刷屏
+            truncated = (
+                raw if len(raw) <= 800 else raw[:800] + f"... [{len(raw) - 800} more chars]"
+            )
+            tdprint(f"analyze() raw_response={truncated!r}")
+
+        parsed = self._parse_analyze_response(raw, prompt_hint_entities)
+
+        if is_teleport_debug():
+            tdprint(f"analyze() parsed={parsed!r}")
+
+        return parsed
 
     # ------------------------------------------------------------------
     # VLM call (testable mock points)

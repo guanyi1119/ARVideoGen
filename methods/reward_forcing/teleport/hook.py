@@ -156,6 +156,14 @@ class TeleportSwitchHook:
                 "original prompt encoding.",
                 exc_info=True,
             )
+            from ._debug import tdprint, is_teleport_debug
+
+            if is_teleport_debug():
+                import traceback
+
+                tdprint(
+                    f"maybe_rewrite() FELL BACK due to exception:\n{traceback.format_exc()}"
+                )
             return self.text_encoder_fn(text_prompts_second)
 
     # ------------------------------------------------------------------
@@ -211,16 +219,31 @@ class TeleportSwitchHook:
             {"visible": [], "absent": [], "partial": []},
         )
 
+        from ._debug import tdprint, is_teleport_debug
+
+        if is_teleport_debug():
+            tdprint(
+                f"maybe_rewrite() current_start_frame={current_start_frame} "
+                f"original_prompt={prompt_str!r}"
+            )
+            tdprint(f"maybe_rewrite() prompt_hint={prompt_hint!r} in_frame={in_frame!r}")
+            tdprint(f"maybe_rewrite() visibility={visibility!r}")
+
         # Empty universe → nothing to talk about → skip rewrite
         if not in_frame and not prompt_hint:
             logger.debug(
                 "TeleportSwitchHook: empty entity universe (frame ∪ prompt), "
                 "skipping rewrite."
             )
+            if is_teleport_debug():
+                tdprint("maybe_rewrite() empty universe → falling back to original prompt")
             return self.text_encoder_fn(text_prompts_second)
 
         # 5. Rewrite prompt
         rewritten = self.rewriter.rewrite(prompt_str, visibility)
+
+        if is_teleport_debug():
+            tdprint(f"maybe_rewrite() rewritten_prompt={rewritten!r}")
 
         # 6. Re-encode (broadcast to batch)
         return self.text_encoder_fn([rewritten] * len(text_prompts_second))
