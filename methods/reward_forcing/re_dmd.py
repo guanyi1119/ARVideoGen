@@ -50,6 +50,36 @@ class ReDMD(RewardForcingModel):
         else:
             self.scheduler.alphas_cumprod = None
 
+        # === T10: teleport tel_det_regular hook (mutex-gated: off | reweight | aux_loss) ===
+        from methods.reward_forcing.teleport import (
+            build_teleport_detector,
+            build_reweighter,
+            build_aux_loss,
+        )
+        teleport_cfg = getattr(args, "teleport", None)
+        tel_det_regular_cfg = getattr(teleport_cfg, "tel_det_regular", None) if teleport_cfg is not None else None
+        self._teleport_mode = "off"
+        self._teleport_detector = None
+        self._teleport_reweighter = None
+        self._teleport_aux_loss = None
+        self._teleport_aux_beta = 1.0
+        if tel_det_regular_cfg is not None:
+            self._teleport_mode = getattr(tel_det_regular_cfg, "mode", "off")
+            if self._teleport_mode == "reweight":
+                self._teleport_detector = build_teleport_detector(getattr(tel_det_regular_cfg, "detector", None))
+                self._teleport_reweighter = build_reweighter(getattr(tel_det_regular_cfg, "reweighter", None))
+            elif self._teleport_mode == "aux_loss":
+                self._teleport_detector = build_teleport_detector(getattr(tel_det_regular_cfg, "detector", None))
+                self._teleport_aux_loss = build_aux_loss(getattr(tel_det_regular_cfg, "aux_loss", None))
+                self._teleport_aux_beta = getattr(tel_det_regular_cfg, "aux_beta", 1.0)
+            elif self._teleport_mode != "off":
+                raise ValueError(f"Unknown teleport.tel_det_regular.mode: {self._teleport_mode!r}")
+
+        # Mutex assertion (defensive)
+        assert (self._teleport_reweighter is None) or (self._teleport_aux_loss is None), (
+            "Mutex violation: reweighter and aux_loss cannot both be active."
+        )
+
     def _compute_kl_grad(
         self, noisy_image_or_video: torch.Tensor,
         estimated_clean_image_or_video: torch.Tensor,
@@ -182,6 +212,28 @@ class ReDMD(RewardForcingModel):
         else:
             reward_term = reward['MQ']
 
+        # === T10: teleport score map computation ===
+        teleport_weight_map = None
+        teleport_aux_loss_val = None
+        teleport_log = {}
+        if self._teleport_mode == "reweight" and self._teleport_detector is not None:
+            with torch.no_grad():
+                # detector input: pixels in [0,1], shape [B,T,3,H,W]
+                # `videos` is already (1+pixels)/2.0 in [0,1] shape [B,T,3,H,W]
+                student_score = self._teleport_detector.score(videos).detach()
+            teleport_weight_map = self._teleport_reweighter.compute_weight(
+                student_score,
+                teacher_score=None,  # teacher path is tel_det_regular+ optional extension
+            )
+            teleport_log["teleport_score_mean"] = student_score.mean().detach()
+            teleport_log["teleport_weight_mean"] = teleport_weight_map.mean().detach()
+        elif self._teleport_mode == "aux_loss" and self._teleport_detector is not None:
+            # grad-attached path for aux_loss
+            student_score_grad = self._teleport_detector.score(videos)
+            teleport_aux_loss_val = self._teleport_aux_loss(student_score_grad)
+            teleport_log["teleport_score_mean"] = student_score_grad.mean().detach()
+            teleport_log["teleport_aux_loss"] = teleport_aux_loss_val.detach()
+
         with torch.no_grad():
             min_timestep = denoised_timestep_to if self.ts_schedule and denoised_timestep_to is not None else self.min_score_timestep
             max_timestep = denoised_timestep_from if self.ts_schedule_max and denoised_timestep_from is not None else self.num_train_timestep
@@ -228,11 +280,38 @@ class ReDMD(RewardForcingModel):
             )
 
         if gradient_mask is not None:
-            rl_dmd_loss = 0.5 * torch.exp(beta * reward_term) * F.mse_loss(original_latent.double(
-            )[gradient_mask], (original_latent.double() - grad.double()).detach()[gradient_mask], reduction="mean")
+            if teleport_weight_map is not None:
+                # weight is [B, F, 1, H, W], original_latent is [B, F, C, H, W]
+                w = teleport_weight_map.to(original_latent.dtype).to(original_latent.device)
+                sq = (original_latent.double() - (original_latent.double() - grad.double()).detach()) ** 2
+                weighted_sq = w.double() * sq
+                mse = weighted_sq[gradient_mask].mean()
+            else:
+                mse = F.mse_loss(
+                    original_latent.double()[gradient_mask],
+                    (original_latent.double() - grad.double()).detach()[gradient_mask],
+                    reduction="mean",
+                )
+            rl_dmd_loss = 0.5 * torch.exp(beta * reward_term) * mse
         else:
-            rl_dmd_loss = 0.5 * torch.exp(beta * reward_term) * F.mse_loss(original_latent.double(
-            ), (original_latent.double() - grad.double()).detach(), reduction="mean")
+            if teleport_weight_map is not None:
+                w = teleport_weight_map.to(original_latent.dtype).to(original_latent.device)
+                sq = (original_latent.double() - (original_latent.double() - grad.double()).detach()) ** 2
+                weighted_sq = w.double() * sq
+                mse = weighted_sq.mean()
+            else:
+                mse = F.mse_loss(
+                    original_latent.double(),
+                    (original_latent.double() - grad.double()).detach(),
+                    reduction="mean",
+                )
+            rl_dmd_loss = 0.5 * torch.exp(beta * reward_term) * mse
+
+        # Aux loss adds AFTER the multiplicative reward structure
+        if teleport_aux_loss_val is not None:
+            rl_dmd_loss = rl_dmd_loss + self._teleport_aux_beta * teleport_aux_loss_val
+
+        rl_dmd_log_dict.update(teleport_log)
         return rl_dmd_loss, rl_dmd_log_dict
 
     def generator_loss(

@@ -41,7 +41,7 @@ _REWRITE_TEMPLATES: Dict[str, Dict[str, str]] = {
     },
     "aggressive": {
         # Emphasises re-entry rules to guide the diffusion model toward
-        # edge-aware entrance (Stage 2 edge-aware regex will exploit this).
+        # edge-aware entrance (tel_det_regular edge-aware regex will exploit this).
         "absent_suffix": (
             "{entities} have completely left the scene and must not reappear "
             "suddenly. If they return, they must enter naturally from the "
