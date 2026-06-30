@@ -191,3 +191,39 @@ def test_frame_decode_aligns_latent_device():
         "actually lives. Current closure body:\n"
         + closure_body
     )
+
+
+# ---------------------------------------------------------------------------
+# 9. per_chunk gate present in else branch
+# ---------------------------------------------------------------------------
+
+
+def test_per_chunk_gate_in_else_branch():
+    """The else branch must reference ``self._teleport_hook.per_chunk`` to
+    trigger per-chunk rewriting when configured."""
+    source = open(_SRC, encoding="utf-8").read()
+    assert "self._teleport_hook.per_chunk" in source, (
+        "Expected 'self._teleport_hook.per_chunk' reference for per-chunk "
+        "rewrite gate in switch_causal_inference.py"
+    )
+
+    # The per-chunk hook call must NOT trigger _recache_after_switch
+    # (recache is only for prompt-identity switching, not per-chunk refresh).
+    # Verify by checking the per_chunk reference is OUTSIDE the
+    # _recache_after_switch invocation context.
+    per_chunk_pos = source.index("self._teleport_hook.per_chunk")
+    # Find the next _recache_after_switch occurrence AFTER the per_chunk gate.
+    next_recache = source.find("self._recache_after_switch", per_chunk_pos)
+    # If there is one, it must be a fresh switch entry (i.e. surrounded by
+    # the using_second/segment_idx switch trigger block), NOT inside the
+    # per-chunk branch.  A weak structural check: between the per_chunk
+    # reference and the next recache there must be the closing of the
+    # per-chunk block (we expect at least one "if (not using_second)" or
+    # equivalent OR end-of-loop iteration).  Pragmatic: assert no recache
+    # within 800 chars after per_chunk reference.
+    if next_recache != -1:
+        distance = next_recache - per_chunk_pos
+        assert distance > 200 or distance < 0, (
+            "_recache_after_switch appears too close to per_chunk reference — "
+            "per-chunk rewrite must NOT trigger recache."
+        )

@@ -131,3 +131,22 @@ def test_no_omegaconf_redundant_import():
                     "interactive_causal_inference.py should NOT import OmegaConf — "
                     "hook is inherited from SwitchCausalInferencePipeline parent class"
                 )
+
+
+# ---------------------------------------------------------------------------
+# 7. per_chunk gate present and guarded by segment_idx >= 1
+# ---------------------------------------------------------------------------
+
+
+def test_per_chunk_gate_with_segment_guard():
+    """Interactive pipeline's else branch must check
+    ``self._teleport_hook.per_chunk`` AND ``segment_idx >= 1`` so the
+    first segment never triggers per-chunk rewriting."""
+    source = open(_SRC, encoding="utf-8").read()
+    assert "self._teleport_hook.per_chunk" in source, (
+        "Expected 'self._teleport_hook.per_chunk' in interactive_causal_inference.py"
+    )
+    assert "segment_idx >= 1" in source, (
+        "Expected 'segment_idx >= 1' guard so per-chunk rewriting only "
+        "happens after the first prompt switch"
+    )

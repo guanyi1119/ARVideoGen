@@ -123,6 +123,7 @@ last_step_only: false
 teleport:
   prompt_rewrite:
     enabled: false                       # master switch; false = no-op
+    trigger: switch                      # switch (default) | chunk
     vlm:
       type: qwen_vl_3b                   # qwen_vl_3b | qwen_vl | disabled
       model_path: Qwen/Qwen2.5-VL-3B-Instruct

@@ -99,7 +99,7 @@ class InteractiveCausalInferencePipeline(SwitchCausalInferencePipeline):
         for current_num_frames in all_num_frames:
             if next_switch_pos is not None and current_start_frame >= next_switch_pos:
                 segment_idx += 1
-                # === prompt_rewrite teleport hook (no-op if disabled) ===
+                # === prompt_rewrite teleport hook at switch boundary (no-op if disabled) ===
                 if self._teleport_hook is not None:
                     with torch.no_grad():
                         cond_list[segment_idx] = self._teleport_hook.maybe_rewrite(
@@ -108,7 +108,7 @@ class InteractiveCausalInferencePipeline(SwitchCausalInferencePipeline):
                 if cond_list[segment_idx] is None:
                     # hook disabled or returned None → encode original prompt
                     cond_list[segment_idx] = self.text_encoder(text_prompts=text_prompts_list[segment_idx])
-                # === end hook ===
+                # === end switch-boundary hook ===
                 self._recache_after_switch(output, current_start_frame, cond_list[segment_idx])
                 print(f"[InteractiveInference] switch to segment {segment_idx} at frame {current_start_frame}")
                 next_switch_pos = (
@@ -116,6 +116,20 @@ class InteractiveCausalInferencePipeline(SwitchCausalInferencePipeline):
                     if segment_idx < len(switch_frame_indices)
                     else None
                 )
+            else:
+                # === per-chunk prompt_rewrite (active only when trigger=chunk and past first switch) ===
+                if (
+                    self._teleport_hook is not None
+                    and self._teleport_hook.per_chunk
+                    and segment_idx >= 1
+                ):
+                    with torch.no_grad():
+                        refreshed = self._teleport_hook.maybe_rewrite(
+                            output, current_start_frame, text_prompts_list[segment_idx]
+                        )
+                    if refreshed is not None:
+                        cond_list[segment_idx] = refreshed
+                # === end per-chunk hook ===
             cond_in_use = cond_list[segment_idx]
 
             noisy_input = noise[:, current_start_frame : current_start_frame + current_num_frames]

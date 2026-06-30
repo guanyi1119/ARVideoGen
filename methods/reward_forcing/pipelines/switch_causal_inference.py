@@ -212,7 +212,7 @@ class SwitchCausalInferencePipeline(StreamingCausalInferencePipeline):
         using_second = False
         for current_num_frames in all_num_frames:
             if (not using_second) and (current_start_frame >= switch_frame_index):
-                # === prompt_rewrite teleport hook (no-op if disabled) ===
+                # === prompt_rewrite teleport hook at switch boundary (no-op if disabled) ===
                 if self._teleport_hook is not None:
                     with torch.no_grad():
                         cond_second = self._teleport_hook.maybe_rewrite(
@@ -221,14 +221,30 @@ class SwitchCausalInferencePipeline(StreamingCausalInferencePipeline):
                 if cond_second is None:
                     # hook disabled or returned None → encode original prompt
                     cond_second = self.text_encoder(text_prompts=text_prompts_second)
-                # === end hook ===
+                # === end switch-boundary hook ===
                 self._recache_after_switch(output, current_start_frame, cond_second)
                 cond_in_use = cond_second
                 using_second = True
                 print("switch_frame_index", switch_frame_index)
                 print("current_start_frame", current_start_frame)
             else:
-                cond_in_use = cond_second if using_second else cond_first
+                if using_second:
+                    cond_in_use = cond_second
+                    # === per-chunk prompt_rewrite (active only when trigger=chunk) ===
+                    if (
+                        self._teleport_hook is not None
+                        and self._teleport_hook.per_chunk
+                    ):
+                        with torch.no_grad():
+                            refreshed = self._teleport_hook.maybe_rewrite(
+                                output, current_start_frame, text_prompts_second
+                            )
+                        if refreshed is not None:
+                            cond_second = refreshed     # 持续替换，下个 chunk 用最新的
+                            cond_in_use = refreshed
+                    # === end per-chunk hook ===
+                else:
+                    cond_in_use = cond_first
 
             noisy_input = noise[:, current_start_frame - num_input_frames : current_start_frame + current_num_frames - num_input_frames]
 

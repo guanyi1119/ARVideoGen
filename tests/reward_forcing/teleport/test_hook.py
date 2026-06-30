@@ -346,3 +346,73 @@ class TestMaybeRewriteLazyLoadBug:
             f"text_encoder received original prompt instead of rewritten — "
             f"hook short-circuited. encoded={encoded!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# 9. test_trigger_field
+# ---------------------------------------------------------------------------
+
+
+class TestTriggerField:
+    """trigger='switch'/'chunk' parsing and per_chunk property."""
+
+    def test_default_trigger_is_switch(self):
+        """Default trigger='switch' → per_chunk False."""
+        hook = _make_hook()
+        assert hook.per_chunk is False
+
+    def test_trigger_chunk_sets_per_chunk_true(self):
+        """trigger='chunk' → per_chunk True."""
+        hook = TeleportSwitchHook(
+            vlm=_make_mock_vlm(),
+            rewriter=_make_mock_rewriter(),
+            text_encoder_fn=_make_mock_text_encoder(),
+            frame_decoder_fn=_make_mock_frame_decoder(),
+            trigger="chunk",
+        )
+        assert hook.per_chunk is True
+
+    def test_trigger_switch_explicit(self):
+        """trigger='switch' → per_chunk False."""
+        hook = TeleportSwitchHook(
+            vlm=_make_mock_vlm(),
+            rewriter=_make_mock_rewriter(),
+            text_encoder_fn=_make_mock_text_encoder(),
+            frame_decoder_fn=_make_mock_frame_decoder(),
+            trigger="switch",
+        )
+        assert hook.per_chunk is False
+
+    def test_trigger_unknown_raises(self):
+        """Unknown trigger → ValueError."""
+        with pytest.raises(ValueError, match="Unknown trigger"):
+            TeleportSwitchHook(
+                vlm=_make_mock_vlm(),
+                rewriter=_make_mock_rewriter(),
+                text_encoder_fn=_make_mock_text_encoder(),
+                frame_decoder_fn=_make_mock_frame_decoder(),
+                trigger="every_frame",
+            )
+
+    def test_factory_propagates_trigger_chunk(self):
+        """build_teleport_switch_hook reads trigger from cfg and propagates."""
+        cfg = {
+            "enabled": True,
+            "trigger": "chunk",
+            "vlm": {"type": "qwen_vl_3b", "model_path": "/tmp/fake"},
+            "rewriter": {"mode": "conservative"},
+        }
+        hook = build_teleport_switch_hook(cfg, Mock(), Mock())
+        assert hook is not None
+        assert hook.per_chunk is True
+
+    def test_factory_default_trigger_switch_backward_compat(self):
+        """build_teleport_switch_hook without trigger field defaults to switch."""
+        cfg = {
+            "enabled": True,
+            "vlm": {"type": "qwen_vl_3b", "model_path": "/tmp/fake"},
+            "rewriter": {"mode": "conservative"},
+        }
+        hook = build_teleport_switch_hook(cfg, Mock(), Mock())
+        assert hook is not None
+        assert hook.per_chunk is False

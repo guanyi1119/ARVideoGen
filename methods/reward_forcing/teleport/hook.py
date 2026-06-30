@@ -90,12 +90,32 @@ class TeleportSwitchHook:
         text_encoder_fn: Callable[[List[str]], ConditionalDict],
         frame_decoder_fn: Callable[[torch.Tensor], torch.Tensor],
         entity_extractor_fn: Optional[Callable[[str], List[str]]] = None,
+        trigger: str = "switch",
     ) -> None:
+        if trigger not in ("switch", "chunk"):
+            raise ValueError(
+                f"Unknown trigger {trigger!r}. "
+                "Supported: ['switch', 'chunk']"
+            )
+        self._trigger = trigger
         self.vlm = vlm
         self.rewriter = rewriter
         self.text_encoder_fn = text_encoder_fn
         self.frame_decoder_fn = frame_decoder_fn
         self.entity_extractor_fn = entity_extractor_fn or _default_entity_extract
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def per_chunk(self) -> bool:
+        """Whether maybe_rewrite should be invoked on every chunk boundary
+        (in addition to the switch boundary).
+
+        True when ``trigger == "chunk"``; False when ``trigger == "switch"``.
+        """
+        return self._trigger == "chunk"
 
     # ------------------------------------------------------------------
     # Public API
@@ -244,10 +264,13 @@ def build_teleport_switch_hook(
         )
         return None
 
+    trigger = cfg.get("trigger", "switch")
+
     return TeleportSwitchHook(
         vlm=vlm,
         rewriter=rewriter,
         text_encoder_fn=text_encoder_fn,
         frame_decoder_fn=frame_decoder_fn,
         entity_extractor_fn=None,  # placeholder; T16 provides real impl
+        trigger=trigger,
     )
