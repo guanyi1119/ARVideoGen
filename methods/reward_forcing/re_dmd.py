@@ -65,6 +65,8 @@ class ReDMD(RewardForcingModel):
         self._teleport_aux_beta = 1.0
         if tel_det_regular_cfg is not None:
             self._teleport_mode = getattr(tel_det_regular_cfg, "mode", "off")
+            if not self._teleport_mode:
+                self._teleport_mode = "off"
             if self._teleport_mode == "reweight":
                 self._teleport_detector = build_teleport_detector(getattr(tel_det_regular_cfg, "detector", None))
                 self._teleport_reweighter = build_reweighter(getattr(tel_det_regular_cfg, "reweighter", None))
