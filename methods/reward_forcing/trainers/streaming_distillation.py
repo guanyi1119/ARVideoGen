@@ -6,7 +6,7 @@ import random
 import re
 from pathlib import Path
 
-from core.data.dataset import TextDataset, TwoTextDataset, TextScoreDataset, cycle
+from core.data.dataset import TextDataset, TwoTextDataset, TextScoreDataset, TwoTextScoreDataset, cycle
 from core.distributed import EMA_FSDP, fsdp_wrap, fsdp_state_dict, launch_distributed_job
 from core.misc import (
     set_seed,
@@ -332,7 +332,10 @@ class Trainer:
         if self.config.i2v:
             dataset = ShardingLMDBDataset(config.data_path, max_pair=int(1e8))
         elif self.config.distribution_loss == "dmd_switch":
-            dataset = TwoTextDataset(config.data_path, config.switch_prompt_path)
+            if getattr(config, "use_score", False):
+                dataset = TwoTextScoreDataset(config.data_path, config.switch_prompt_path)
+            else:
+                dataset = TwoTextDataset(config.data_path, config.switch_prompt_path)
         elif getattr(config, "use_score", False):
             dataset = TextScoreDataset(config.data_path)
         else:
@@ -359,7 +362,10 @@ class Trainer:
             if self.config.i2v:
                 val_dataset = ShardingLMDBDataset(val_data_path, max_pair=int(1e8))
             elif self.config.distribution_loss == "dmd_switch":
-                val_dataset = TwoTextDataset(val_data_path, config.val_switch_prompt_path)
+                if getattr(config, "use_score", False):
+                    val_dataset = TwoTextScoreDataset(val_data_path, config.val_switch_prompt_path)
+                else:
+                    val_dataset = TwoTextDataset(val_data_path, config.val_switch_prompt_path)
             else:
                 val_dataset = TextDataset(val_data_path)
 

@@ -92,6 +92,61 @@ class TextScoreDataset(Dataset):
         return batch
 
 
+class TwoTextScoreDataset(Dataset):
+    """Two-prompt dataset with per-prompt score for switch streaming training.
+
+    Reads a JSONL file where each line is an object with at least a
+    ``prompt`` field and a numeric ``score`` field, e.g.
+
+        {"prompt": "...", "score": 0.55}
+
+    and a separate plain-text file with one switch-prompt per line
+    (matching the number of entries in the JSONL file).
+
+    Used for reward-forcing switch streaming training where the score
+    (e.g. motion dynamism in [0, 1]) is consumed downstream to blend
+    reward terms alongside the two prompts.
+
+    Mirrors :class:`TextScoreDataset` for the main prompt and
+    :class:`TwoTextDataset` for the switch prompt.
+    """
+
+    def __init__(self, prompt_path: str, switch_prompt_path: str):
+        self.prompt_list = []
+        self.score_list = []
+        with open(prompt_path, encoding="utf-8") as f:
+            for line_no, line in enumerate(f, start=1):
+                line = line.strip()
+                if not line:
+                    continue
+                obj = json.loads(line)
+                if "prompt" not in obj or "score" not in obj:
+                    raise ValueError(
+                        f"{prompt_path}:{line_no} missing 'prompt' or 'score' field"
+                    )
+                self.prompt_list.append(obj["prompt"])
+                self.score_list.append(float(obj["score"]))
+
+        with open(switch_prompt_path, encoding="utf-8") as f:
+            self.switch_prompt_list = [line.rstrip() for line in f]
+
+        assert len(self.switch_prompt_list) == len(self.prompt_list), (
+            "The two prompt files must contain the same number of entries so that "
+            "each first-segment prompt is paired with exactly one second-segment prompt."
+        )
+
+    def __len__(self):
+        return len(self.prompt_list)
+
+    def __getitem__(self, idx):
+        return {
+            "prompts": self.prompt_list[idx],
+            "scores": torch.tensor(self.score_list[idx], dtype=torch.float32),
+            "switch_prompts": self.switch_prompt_list[idx],
+            "idx": idx,
+        }
+
+
 class ODERegressionLMDBDataset(Dataset):
     """ODE regression dataset stored in LMDB format.
 
