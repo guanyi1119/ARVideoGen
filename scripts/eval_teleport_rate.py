@@ -4,10 +4,23 @@ CLI:
     python scripts/eval_teleport_rate.py --video_dir outputs/sampleA --output report.json
 
 The script is deterministic (no random sampling) and uses the no-RAFT detector
-backend so it runs on CPU.  GPU is auto-detected when available.
+backend so it runs on CPU.  GPU/NPU is auto-detected when available.
+
+NPU support: set environment variable ``DEVICE_TYPE=npu`` before running.
 """
 
 from __future__ import annotations
+
+# ---------------------------------------------------------------------------
+# NPU device transfer (must happen before any torch.cuda call).
+# Mirrors train_reward_forcing.py: check DEVICE_TYPE env var, import
+# torch_npu.contrib.transfer_to_npu which patches torch.cuda.* -> NPU.
+# ---------------------------------------------------------------------------
+import os as _os
+
+_DEVICE_TYPE = _os.environ.get("DEVICE_TYPE", "cuda")
+if _DEVICE_TYPE == "npu":
+    from torch_npu.contrib import transfer_to_npu  # noqa: F401
 
 # ---------------------------------------------------------------------------
 # CPU-only guard: stub methods.reward_forcing to prevent CUDA import cascade
@@ -142,7 +155,16 @@ def evaluate_directory(
 
     # Resolve device
     if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if _DEVICE_TYPE == "npu" and torch.cuda.is_available():
+            device = "cuda"  # transfer_to_npu maps cuda -> npu
+        elif torch.cuda.is_available():
+            device = "cuda"
+        else:
+            device = "cpu"
+    elif device == "npu":
+        if _DEVICE_TYPE != "npu":
+            raise ValueError("--device npu requires environment variable DEVICE_TYPE=npu")
+        device = "cuda"  # transfer_to_npu maps cuda -> npu
 
     # Build detector
     detector_type = "optical_flow" if use_raft else "optical_flow_no_raft"
@@ -220,8 +242,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--device",
         default="auto",
-        choices=["auto", "cpu", "cuda"],
-        help="Device to run detector on (default: auto).",
+        choices=["auto", "cpu", "cuda", "npu"],
+        help="Device to run detector on (default: auto). For NPU, set DEVICE_TYPE=npu env var.",
     )
     parser.add_argument(
         "--use_raft",
