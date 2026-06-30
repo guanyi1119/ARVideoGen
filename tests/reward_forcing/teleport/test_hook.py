@@ -27,7 +27,10 @@ def _make_mock_vlm(available=True):
     """Return a mock TeleportVLM whose is_available() returns *available*."""
     vlm = Mock()
     vlm.is_available.return_value = available
-    vlm.check_visibility.return_value = {"visible": [], "absent": [], "partial": []}
+    vlm.analyze.return_value = {
+        "in_frame": [],
+        "visibility": {"visible": [], "absent": [], "partial": []},
+    }
     return vlm
 
 
@@ -147,7 +150,7 @@ class TestMaybeRewriteZeroFrame:
         result = hook.maybe_rewrite(output_latent, 0, FAKE_PROMPTS)
 
         # VLM should NOT be called
-        vlm.check_visibility.assert_not_called()
+        vlm.analyze.assert_not_called()
         # text_encoder should be called with original prompts
         text_enc.assert_called_once_with(FAKE_PROMPTS)
         assert result is not None
@@ -164,10 +167,13 @@ class TestMaybeRewriteNormalPath:
     def test_normal_path(self):
         text_enc = _make_mock_text_encoder()
         vlm = _make_mock_vlm()
-        vlm.check_visibility.return_value = {
-            "visible": [],
-            "absent": ["dog"],
-            "partial": [],
+        vlm.analyze.return_value = {
+            "in_frame": [],
+            "visibility": {
+                "visible": [],
+                "absent": ["dog"],
+                "partial": [],
+            },
         }
         rewriter = _make_mock_rewriter()
         rewriter.rewrite.return_value = "A dog runs in the park. Note: dog is absent."
@@ -180,8 +186,8 @@ class TestMaybeRewriteNormalPath:
         result = hook.maybe_rewrite(output_latent, 21, FAKE_PROMPTS)
 
         # VLM was called with a frame tensor and entity list
-        vlm.check_visibility.assert_called_once()
-        call_args = vlm.check_visibility.call_args[0]
+        vlm.analyze.assert_called_once()
+        call_args = vlm.analyze.call_args[0]
         frame_arg = call_args[0]  # should be [3, H, W]
         entity_arg = call_args[1]
         assert isinstance(frame_arg, torch.Tensor)
@@ -225,7 +231,7 @@ class TestMaybeRewriteExceptionRecovers:
     def test_vlm_exception(self):
         text_enc = _make_mock_text_encoder()
         vlm = _make_mock_vlm()
-        vlm.check_visibility.side_effect = RuntimeError("VLM crash")
+        vlm.analyze.side_effect = RuntimeError("VLM crash")
 
         hook = _make_hook(vlm=vlm, text_encoder_fn=text_enc)
 
@@ -299,9 +305,10 @@ class TestMaybeRewriteLazyLoadBug:
         # regression-testing.
         calls = []
 
-        def fake_call_vlm(self, frame_rgb, entity_list):
-            calls.append(("call_vlm", entity_list))
-            return '{"visible": ["dog"], "absent": [], "partial": []}'
+        def fake_call_vlm_analyze(self, frame_rgb, prompt_hint):
+            calls.append(("call_vlm_analyze", prompt_hint))
+            return ('{"in_frame": ["dog"], '
+                    '"visibility": {"visible": ["dog"], "absent": [], "partial": []}}')
 
         # Also patch _load_model: we want to verify it WAS attempted,
         # but we don't want the real Qwen load.
@@ -317,7 +324,7 @@ class TestMaybeRewriteLazyLoadBug:
         text_enc = _make_mock_text_encoder()
         frame_dec = _make_mock_frame_decoder()
 
-        with patch.object(QwenTeleportVLM, "_call_vlm", fake_call_vlm), \
+        with patch.object(QwenTeleportVLM, "_call_vlm_analyze", fake_call_vlm_analyze), \
              patch.object(QwenTeleportVLM, "_load_model", fake_load_model):
             hook = TeleportSwitchHook(
                 vlm=vlm,
@@ -416,3 +423,95 @@ class TestTriggerField:
         hook = build_teleport_switch_hook(cfg, Mock(), Mock())
         assert hook is not None
         assert hook.per_chunk is False
+
+
+# ---------------------------------------------------------------------------
+# 10. test_entity_source_union
+# ---------------------------------------------------------------------------
+
+
+class TestEntitySourceUnion:
+    """analyze() is called once with prompt-hint; rewrite uses returned visibility."""
+
+    def test_analyze_called_with_prompt_hint(self):
+        text_enc = _make_mock_text_encoder()
+        vlm = _make_mock_vlm()
+        vlm.analyze.return_value = {
+            "in_frame": ["car"],
+            "visibility": {
+                "visible": ["car"],
+                "absent": ["dog"],
+                "partial": [],
+            },
+        }
+        rewriter = _make_mock_rewriter()
+        rewriter.rewrite.return_value = "REWRITTEN"
+
+        hook = _make_hook(
+            vlm=vlm, rewriter=rewriter, text_encoder_fn=text_enc,
+            entity_extractor_fn=lambda p: ["dog"],  # naive prompt hint
+        )
+        output_latent = torch.zeros(1, 21, 16, 40, 40)
+        hook.maybe_rewrite(output_latent, 21, ["A dog runs"])
+
+        # analyze was called exactly once with prompt hint
+        vlm.analyze.assert_called_once()
+        call_args = vlm.analyze.call_args[0]
+        assert call_args[1] == ["dog"]  # prompt_hint
+        # check_visibility must NOT be called (we're using analyze)
+        vlm.check_visibility.assert_not_called()
+        # rewriter received the visibility from analyze
+        rewriter.rewrite.assert_called_once()
+        vis_arg = rewriter.rewrite.call_args[0][1]
+        assert vis_arg == {
+            "visible": ["car"],
+            "absent": ["dog"],
+            "partial": [],
+        }
+
+    def test_empty_universe_skips_rewrite(self):
+        """When in_frame=[] AND prompt_hint=[] → skip rewrite, use original."""
+        text_enc = _make_mock_text_encoder()
+        vlm = _make_mock_vlm()
+        vlm.analyze.return_value = {
+            "in_frame": [],
+            "visibility": {"visible": [], "absent": [], "partial": []},
+        }
+        rewriter = _make_mock_rewriter()
+
+        hook = _make_hook(
+            vlm=vlm, rewriter=rewriter, text_encoder_fn=text_enc,
+            entity_extractor_fn=lambda p: [],  # empty prompt hint
+        )
+        output_latent = torch.zeros(1, 21, 16, 40, 40)
+        hook.maybe_rewrite(output_latent, 21, ["A blank scene"])
+
+        # analyze was called (frame was decoded), but rewriter was NOT
+        vlm.analyze.assert_called_once()
+        rewriter.rewrite.assert_not_called()
+        # text_encoder was called with original prompts
+        text_enc.assert_called_once_with(["A blank scene"])
+
+    def test_frame_entities_rescue_empty_prompt_hint(self):
+        """prompt_hint=[] but in_frame=[X] → still rewrite using frame entities."""
+        text_enc = _make_mock_text_encoder()
+        vlm = _make_mock_vlm()
+        vlm.analyze.return_value = {
+            "in_frame": ["dog"],
+            "visibility": {"visible": ["dog"], "absent": [], "partial": []},
+        }
+        rewriter = _make_mock_rewriter()
+        rewriter.rewrite.return_value = "REWRITTEN_FROM_FRAME"
+
+        hook = _make_hook(
+            vlm=vlm, rewriter=rewriter, text_encoder_fn=text_enc,
+            entity_extractor_fn=lambda p: [],  # empty prompt hint
+        )
+        output_latent = torch.zeros(1, 21, 16, 40, 40)
+        hook.maybe_rewrite(output_latent, 21, ["???"])
+
+        # rewriter IS called because in_frame is non-empty
+        rewriter.rewrite.assert_called_once()
+        text_enc.assert_called_once()
+        encoded = text_enc.call_args[0][0]
+        assert encoded[0] == "REWRITTEN_FROM_FRAME"

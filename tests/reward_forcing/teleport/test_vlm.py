@@ -149,3 +149,108 @@ class TestEdgeCases:
         _patch_call_vlm(vlm, monkeypatch, "no braces here at all")
         result = vlm.check_visibility(FAKE_FRAME, ["dog"])
         assert result == {"visible": [], "absent": [], "partial": []}
+
+
+# ---------------------------------------------------------------------------
+# analyze() tests — open-vocab + visibility in one VLM call
+# ---------------------------------------------------------------------------
+
+
+class TestAnalyze:
+    """analyze() open-vocab + visibility in one VLM call."""
+
+    def test_analyze_valid_response(self, monkeypatch):
+        vlm = _make_vlm()
+        raw = (
+            '{"in_frame": ["dog", "tree"], '
+            '"visibility": {"visible": ["dog"], "absent": ["cat"], '
+            '"partial": ["tree"]}}'
+        )
+        # Patch _call_vlm_analyze + _load_model
+        monkeypatch.setattr(vlm, "_call_vlm_analyze", lambda f, h: raw)
+        monkeypatch.setattr(vlm, "_load_model", lambda: None)
+        monkeypatch.setattr(vlm, "_expander", True)
+
+        result = vlm.analyze(FAKE_FRAME, ["cat"])
+        assert result["in_frame"] == ["dog", "tree"]
+        assert result["visibility"]["visible"] == ["dog"]
+        assert result["visibility"]["absent"] == ["cat"]
+        assert result["visibility"]["partial"] == ["tree"]
+
+    def test_analyze_invalid_json_fails_safe(self, monkeypatch):
+        vlm = _make_vlm()
+        monkeypatch.setattr(vlm, "_call_vlm_analyze", lambda f, h: "garbage")
+        monkeypatch.setattr(vlm, "_load_model", lambda: None)
+        monkeypatch.setattr(vlm, "_expander", True)
+
+        result = vlm.analyze(FAKE_FRAME, ["dog"])
+        assert result == {
+            "in_frame": [],
+            "visibility": {"visible": [], "absent": [], "partial": []},
+        }
+
+    def test_analyze_missing_in_frame_key_fails_safe(self, monkeypatch):
+        vlm = _make_vlm()
+        raw = '{"visibility": {"visible":["dog"], "absent":[], "partial":[]}}'
+        monkeypatch.setattr(vlm, "_call_vlm_analyze", lambda f, h: raw)
+        monkeypatch.setattr(vlm, "_load_model", lambda: None)
+        monkeypatch.setattr(vlm, "_expander", True)
+
+        result = vlm.analyze(FAKE_FRAME, ["dog"])
+        assert result["in_frame"] == []
+        assert result["visibility"] == {"visible": [], "absent": [], "partial": []}
+
+    def test_analyze_visibility_oov_filtered_by_union(self, monkeypatch):
+        """Entities NOT in (in_frame ∪ prompt_hint) must be filtered out."""
+        vlm = _make_vlm()
+        # in_frame contains "dog"; prompt_hint contains "cat";
+        # visibility includes "horse" which is OOV → must be filtered.
+        raw = (
+            '{"in_frame": ["dog"], '
+            '"visibility": {"visible": ["dog", "horse"], '
+            '"absent": ["cat"], "partial": []}}'
+        )
+        monkeypatch.setattr(vlm, "_call_vlm_analyze", lambda f, h: raw)
+        monkeypatch.setattr(vlm, "_load_model", lambda: None)
+        monkeypatch.setattr(vlm, "_expander", True)
+
+        result = vlm.analyze(FAKE_FRAME, ["cat"])
+        assert result["in_frame"] == ["dog"]
+        assert "horse" not in result["visibility"]["visible"]
+        assert result["visibility"]["visible"] == ["dog"]
+        assert result["visibility"]["absent"] == ["cat"]
+
+    def test_analyze_in_frame_open_vocab_not_filtered(self, monkeypatch):
+        """in_frame is open-vocabulary; entities NOT in prompt_hint are kept."""
+        vlm = _make_vlm()
+        raw = (
+            '{"in_frame": ["dog", "completely_novel_thing"], '
+            '"visibility": {"visible": ["dog", "completely_novel_thing"], '
+            '"absent": [], "partial": []}}'
+        )
+        monkeypatch.setattr(vlm, "_call_vlm_analyze", lambda f, h: raw)
+        monkeypatch.setattr(vlm, "_load_model", lambda: None)
+        monkeypatch.setattr(vlm, "_expander", True)
+
+        result = vlm.analyze(FAKE_FRAME, [])  # empty prompt hint
+        # in_frame open-vocab → both kept
+        assert set(result["in_frame"]) == {"dog", "completely_novel_thing"}
+        # visibility universe = in_frame ∪ prompt_hint = in_frame only,
+        # so both visibility entries are in-universe → kept
+        assert set(result["visibility"]["visible"]) == {"dog", "completely_novel_thing"}
+
+    def test_analyze_extra_text_around_json(self, monkeypatch):
+        vlm = _make_vlm()
+        raw = (
+            'Sure! Here is the result: '
+            '{"in_frame": ["dog"], '
+            '"visibility": {"visible": ["dog"], "absent": [], "partial": []}} '
+            'I hope this helps.'
+        )
+        monkeypatch.setattr(vlm, "_call_vlm_analyze", lambda f, h: raw)
+        monkeypatch.setattr(vlm, "_load_model", lambda: None)
+        monkeypatch.setattr(vlm, "_expander", True)
+
+        result = vlm.analyze(FAKE_FRAME, [])
+        assert result["in_frame"] == ["dog"]
+        assert result["visibility"]["visible"] == ["dog"]

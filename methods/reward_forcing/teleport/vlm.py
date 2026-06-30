@@ -12,7 +12,7 @@ import json
 import logging
 import re
 from abc import ABC, abstractmethod
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 import torch
 from PIL import Image
@@ -47,6 +47,42 @@ class TeleportVLM(ABC):
             - Entities NOT in *entity_list* (hallucinated by the VLM) are **filtered out**.
             - If parsing fails for any reason the method returns three empty lists
               (fail-safe, never raises).
+        """
+        ...
+
+    @abstractmethod
+    def analyze(
+        self,
+        frame_rgb: torch.Tensor,
+        prompt_hint_entities: List[str],
+    ) -> Dict[str, Any]:
+        """Open-vocabulary entity listing + closed-set visibility classification
+        in a SINGLE VLM call.
+
+        Parameters:
+            frame_rgb: shape [3, H, W] or [1, 3, H, W], values in [0, 1].
+            prompt_hint_entities:
+                Entities mentioned in the prompt the model should ADDITIONALLY
+                classify (even if absent from the frame).  The VLM is told
+                to cover the **union** of in_frame + prompt_hint.
+
+        Returns:
+            {
+                "in_frame": List[str],                # what VLM saw (open-vocab)
+                "visibility": {
+                    "visible": List[str],
+                    "absent":  List[str],
+                    "partial": List[str],
+                },
+            }
+            - in_frame ⊆ visibility["visible"] ∪ visibility["partial"]
+              (semantic contract; entities filtered out of vocab will not violate)
+            - keys of visibility cover the UNION of in_frame and prompt_hint_entities
+            - Out-of-vocab handling: in_frame is unconstrained (open-vocab);
+              visibility entities NOT in (in_frame ∪ prompt_hint_entities) are
+              filtered (same policy as check_visibility).
+            - Fail-safe: on any parse failure returns
+              ``{"in_frame": [], "visibility": {"visible":[], "absent":[], "partial":[]}}``.
         """
         ...
 
@@ -88,6 +124,27 @@ class QwenTeleportVLM(TeleportVLM):
         '"partial": [<entity names>]}\n\n'
         "Every entity from the list must appear in exactly one of the three "
         "arrays. Do not invent entities that are not in the list."
+    )
+
+    _ANALYZE_SYSTEM_PROMPT: str = (
+        "You are an open-vocabulary object analyzer.  Do TWO things in ONE response:\n\n"
+        "STEP 1 — List every distinct, concrete entity (object, animal, person, "
+        "vehicle, named scene element) that you can SEE in the image.  Use short "
+        "common nouns (e.g. 'dog', 'red car'), no articles, lower-case.  Ignore "
+        "abstract attributes and background style.\n\n"
+        "STEP 2 — The user message includes a list of entities mentioned in the "
+        "next caption (prompt_hint).  Considering the UNION of what you saw "
+        "(STEP 1) AND prompt_hint, classify each entity as:\n"
+        "  - 'visible': clearly visible in the image\n"
+        "  - 'absent':  not visible at all\n"
+        "  - 'partial': only partially visible (cropped at the edge, heavily occluded)\n\n"
+        "Respond with ONLY a JSON object matching this exact schema, with no "
+        "additional text, no markdown, no code fences:\n"
+        '{"in_frame": [<entity names>], '
+        '"visibility": {"visible": [...], "absent": [...], "partial": [...]}}\n\n'
+        "Every entity in the UNION (STEP 1 result ∪ prompt_hint) must appear "
+        "in exactly one of the three visibility arrays.  Do not invent entities "
+        "outside the union."
     )
 
     def __init__(
@@ -143,9 +200,41 @@ class QwenTeleportVLM(TeleportVLM):
         raw_response = self._call_vlm(frame_rgb, entity_list)
         return self._parse_response(raw_response, entity_list)
 
+    def analyze(
+        self,
+        frame_rgb: torch.Tensor,
+        prompt_hint_entities: List[str],
+    ) -> Dict[str, Any]:
+        """See ``TeleportVLM.analyze``."""
+        self._load_model()
+        raw = self._call_vlm_analyze(frame_rgb, prompt_hint_entities)
+        return self._parse_analyze_response(raw, prompt_hint_entities)
+
     # ------------------------------------------------------------------
-    # VLM call (testable mock point)
+    # VLM call (testable mock points)
     # ------------------------------------------------------------------
+
+    def _call_vlm_analyze(
+        self,
+        frame_rgb: torch.Tensor,
+        prompt_hint_entities: List[str],
+    ) -> str:
+        """Convert frame → PIL, call VLM with analyze system prompt, return raw text.
+
+        This is the **primary monkey-patch point** for unit tests of analyze().
+        """
+        pil_image = self._tensor_to_pil(frame_rgb)
+        user_prompt = (
+            f"prompt_hint: {prompt_hint_entities}. "
+            "Run STEP 1 (in_frame open-vocab listing) and STEP 2 "
+            "(visibility classification over in_frame ∪ prompt_hint)."
+        )
+        result = self._expander.extend_with_img(
+            prompt=user_prompt,
+            system_prompt=self._ANALYZE_SYSTEM_PROMPT,
+            image=pil_image,
+        )
+        return result.prompt
 
     def _call_vlm(
         self, frame_rgb: torch.Tensor, entity_list: List[str]
@@ -247,6 +336,85 @@ class QwenTeleportVLM(TeleportVLM):
             filtered[key] = clean
 
         return filtered
+
+    @staticmethod
+    def _parse_analyze_response(
+        raw_response: str,
+        prompt_hint_entities: List[str],
+    ) -> Dict[str, Any]:
+        """Fail-safe parser for analyze() responses.
+
+        Strategy mirrors _parse_response:
+          1. Extract first {...} block
+          2. json.loads with try/except → fail-safe empty
+          3. Schema validation: top dict has 'in_frame' (list) and 'visibility'
+             (dict with 'visible'/'absent'/'partial' lists)
+          4. in_frame is open-vocab → no filtering
+          5. visibility entities filtered to union(in_frame ∪ prompt_hint_entities)
+          6. logging.warning for any out-of-vocab filtering
+        """
+        empty: Dict[str, Any] = {
+            "in_frame": [],
+            "visibility": {"visible": [], "absent": [], "partial": []},
+        }
+        # Step 1-2: extract + parse
+        match = re.search(r"\{.*\}", raw_response, re.DOTALL)
+        if not match:
+            logger.warning(
+                "TeleportVLM.analyze: no JSON block in response: %s",
+                raw_response[:200],
+            )
+            return empty
+        try:
+            parsed = json.loads(match.group(0))
+        except json.JSONDecodeError:
+            logger.warning(
+                "TeleportVLM.analyze: JSON decode failed for: %s",
+                match.group(0)[:200],
+            )
+            return empty
+
+        # Step 3: schema validation
+        if not isinstance(parsed, dict):
+            return empty
+        if not isinstance(parsed.get("in_frame"), list):
+            logger.warning("TeleportVLM.analyze: missing/invalid 'in_frame'")
+            return empty
+        vis = parsed.get("visibility")
+        if not isinstance(vis, dict):
+            logger.warning("TeleportVLM.analyze: missing/invalid 'visibility'")
+            return empty
+        for key in ("visible", "absent", "partial"):
+            if not isinstance(vis.get(key), list):
+                logger.warning(
+                    "TeleportVLM.analyze: missing/invalid visibility key '%s'", key
+                )
+                return empty
+
+        # Step 4: in_frame open-vocab, but enforce string + non-empty
+        in_frame = [
+            str(e) for e in parsed["in_frame"] if isinstance(e, str) and e.strip()
+        ]
+
+        # Step 5: visibility filtering — union of in_frame ∪ prompt_hint
+        universe = set(in_frame) | set(prompt_hint_entities)
+        filtered_vis: Dict[str, List[str]] = {}
+        for key in ("visible", "absent", "partial"):
+            raw_list = vis[key]
+            clean = [e for e in raw_list if isinstance(e, str) and e in universe]
+            removed = [
+                e for e in raw_list if not isinstance(e, str) or e not in universe
+            ]
+            if removed:
+                logger.warning(
+                    "TeleportVLM.analyze: filtered out-of-union entities "
+                    "from '%s': %s",
+                    key,
+                    removed,
+                )
+            filtered_vis[key] = clean
+
+        return {"in_frame": in_frame, "visibility": filtered_vis}
 
 
 def build_teleport_vlm(cfg: Optional[dict]) -> Optional[TeleportVLM]:

@@ -78,9 +78,10 @@ class TeleportSwitchHook:
             ``Callable(latent_BFCHW) -> rgb_BTCHW`` in **[0, 1]** — injected
             by the pipeline (decodes a VAE latent to pixel space).
         entity_extractor_fn:
-            Optional ``Callable(str) -> List[str]``.  When ``None`` (default)
-            the built-in ``_default_entity_extract`` is used — a placeholder
-            that should be replaced by the Stage C-light extractor (T16).
+            Optional ``Callable(str) -> List[str]``.  Used as a **prompt-side hint**
+            only; the VLM's open-vocabulary listing on the frame is the primary
+            source of truth.  When ``None`` (default) the built-in
+            ``_default_entity_extract`` is used.
     """
 
     def __init__(
@@ -198,19 +199,25 @@ class TeleportSwitchHook:
         # Take first batch item and first frame → [3, H', W']
         frame_rgb = pixels[0, 0]  # [3, H', W']
 
-        # 3. Extract entities from the prompt
+        # 3. Extract entities from the prompt (naive prompt-hint)
         prompt_str = text_prompts_second[0]
-        entities = self.entity_extractor_fn(prompt_str)
+        prompt_hint = self.entity_extractor_fn(prompt_str)
 
-        if not entities:
+        # 4. VLM analyze: open-vocab in_frame + visibility over (in_frame ∪ prompt_hint)
+        result = self.vlm.analyze(frame_rgb, prompt_hint)
+        in_frame = result.get("in_frame", [])
+        visibility = result.get(
+            "visibility",
+            {"visible": [], "absent": [], "partial": []},
+        )
+
+        # Empty universe → nothing to talk about → skip rewrite
+        if not in_frame and not prompt_hint:
             logger.debug(
-                "TeleportSwitchHook: no entities extracted from prompt, "
+                "TeleportSwitchHook: empty entity universe (frame ∪ prompt), "
                 "skipping rewrite."
             )
             return self.text_encoder_fn(text_prompts_second)
-
-        # 4. VLM visibility check
-        visibility = self.vlm.check_visibility(frame_rgb, entities)
 
         # 5. Rewrite prompt
         rewritten = self.rewriter.rewrite(prompt_str, visibility)
