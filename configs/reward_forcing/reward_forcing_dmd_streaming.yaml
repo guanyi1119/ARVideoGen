@@ -53,7 +53,7 @@ trainer: streaming_distillation
 gradient_checkpointing: true
 num_frame_per_block: 3
 load_raw_video: false
-beta: 1.0
+beta: 3.5
 model_kwargs:
   timestep_shift: 5.0
   local_attn_size: 12
@@ -65,7 +65,7 @@ vis_ema: false
 vis_video_lengths:
 - 240
 val_batch_size: 1
-val_data_path: /cache/vidprom_filtered_extended.txt
+data_path: /cache/vidprom_filtered_extended_llm_scored.jsonl
 val_switch_prompt_path: /cache/vidprom_filtered_extended_switch.txt
 
 slice_last_frames: 21
