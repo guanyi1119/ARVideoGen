@@ -41,6 +41,9 @@ class InteractiveCausalInferencePipeline(SwitchCausalInferencePipeline):
 
         if DEBUG:
             print(f"[InteractiveInference] num_segments={len(text_prompts_list)}, switch_at={switch_frame_indices}")
+        # Reset teleport registry at the start of every inference call
+        if self._teleport_hook is not None and hasattr(self._teleport_hook, "reset"):
+            self._teleport_hook.reset()
         # Segment 0: encode immediately (needed for first segment generation).
         # Segments 1+: defer encoding to switch point so hook can rewrite prompts.
         cond_list: List = [self.text_encoder(text_prompts=text_prompts_list[0])]

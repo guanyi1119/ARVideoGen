@@ -158,6 +158,10 @@ class SwitchCausalInferencePipeline(StreamingCausalInferencePipeline):
         assert num_output_frames % self.num_frame_per_block == 0
         num_blocks = num_output_frames // self.num_frame_per_block
 
+        # Reset teleport registry at the start of every inference call
+        if self._teleport_hook is not None and hasattr(self._teleport_hook, "reset"):
+            self._teleport_hook.reset()
+
         cond_first = self.text_encoder(text_prompts=text_prompts_first)
         # cond_second encoding deferred to switch trigger point:
         # if hook is enabled and needs to rewrite, it re-encodes the

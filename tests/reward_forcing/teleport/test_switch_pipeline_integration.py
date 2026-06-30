@@ -227,3 +227,18 @@ def test_per_chunk_gate_in_else_branch():
             "_recache_after_switch appears too close to per_chunk reference — "
             "per-chunk rewrite must NOT trigger recache."
         )
+
+
+# ---------------------------------------------------------------------------
+# 10. inference() resets hook registry
+# ---------------------------------------------------------------------------
+
+
+def test_inference_resets_hook_registry():
+    """inference() must call self._teleport_hook.reset() at startup so
+    registry state doesn't bleed across separate inference calls."""
+    source = open(_SRC, encoding="utf-8").read()
+    assert "self._teleport_hook.reset()" in source, (
+        "Expected 'self._teleport_hook.reset()' in switch_causal_inference.py "
+        "to wipe registry state at the start of every inference call"
+    )

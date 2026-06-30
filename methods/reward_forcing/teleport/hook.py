@@ -14,6 +14,7 @@ from typing import Callable, Dict, List, Optional
 
 import torch
 
+from .registry import EntityRegistry
 from .rewriter import PromptRewriter, build_prompt_rewriter
 from .vlm import TeleportVLM, build_teleport_vlm
 
@@ -91,6 +92,8 @@ class TeleportSwitchHook:
         text_encoder_fn: Callable[[List[str]], ConditionalDict],
         frame_decoder_fn: Callable[[torch.Tensor], torch.Tensor],
         entity_extractor_fn: Optional[Callable[[str], List[str]]] = None,
+        entity_registry: Optional[EntityRegistry] = None,
+        registry_enabled: bool = True,
         trigger: str = "switch",
     ) -> None:
         if trigger not in ("switch", "chunk"):
@@ -104,6 +107,15 @@ class TeleportSwitchHook:
         self.text_encoder_fn = text_encoder_fn
         self.frame_decoder_fn = frame_decoder_fn
         self.entity_extractor_fn = entity_extractor_fn or _default_entity_extract
+
+        # EntityRegistry — cross-chunk persistent state machine
+        if registry_enabled:
+            if entity_registry is not None:
+                self._registry = entity_registry
+            else:
+                self._registry = EntityRegistry()
+        else:
+            self._registry = None
 
     # ------------------------------------------------------------------
     # Properties
@@ -121,6 +133,11 @@ class TeleportSwitchHook:
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
+
+    def reset(self) -> None:
+        """Reset registry state.  Called at the start of every ``inference()``."""
+        if self._registry is not None:
+            self._registry.reset()
 
     def maybe_rewrite(
         self,
@@ -214,10 +231,33 @@ class TeleportSwitchHook:
         # 4. VLM analyze: open-vocab in_frame + visibility over (in_frame ∪ prompt_hint)
         result = self.vlm.analyze(frame_rgb, prompt_hint)
         in_frame = result.get("in_frame", [])
-        visibility = result.get(
+        chunk_visibility = result.get(
             "visibility",
             {"visible": [], "absent": [], "partial": []},
         )
+
+        # === Registry update (cross-chunk persistent state) ===
+        if self._registry is not None:
+            # Step 1: register new prompt-hint entities as NEVER_SEEN
+            self._registry.register_prompt_entities(prompt_hint)
+            # Step 2: update transitions from this chunk's VLM observation
+            self._registry.update_from_observation(
+                visible=chunk_visibility.get("visible", []),
+                absent=chunk_visibility.get("absent", []),
+                partial=chunk_visibility.get("partial", []),
+            )
+
+        # === Build effective visibility for rewriter ===
+        # absent: persistent (from registry); visible/partial: still passed for any
+        # rewriter strategy that uses them (current rewriter only reads absent + partial)
+        if self._registry is not None:
+            effective_visibility = {
+                "visible": self._registry.get_visible(),
+                "absent": self._registry.get_absent(),
+                "partial": chunk_visibility.get("partial", []),
+            }
+        else:
+            effective_visibility = chunk_visibility
 
         from ._debug import tdprint, is_teleport_debug
 
@@ -227,20 +267,25 @@ class TeleportSwitchHook:
                 f"original_prompt={prompt_str!r}"
             )
             tdprint(f"maybe_rewrite() prompt_hint={prompt_hint!r} in_frame={in_frame!r}")
-            tdprint(f"maybe_rewrite() visibility={visibility!r}")
+            tdprint(f"maybe_rewrite() chunk_visibility={chunk_visibility!r}")
+            if self._registry is not None:
+                tdprint(f"maybe_rewrite() registry={self._registry.snapshot()!r}")
+            tdprint(f"maybe_rewrite() effective_visibility={effective_visibility!r}")
 
-        # Empty universe → nothing to talk about → skip rewrite
-        if not in_frame and not prompt_hint:
-            logger.debug(
-                "TeleportSwitchHook: empty entity universe (frame ∪ prompt), "
-                "skipping rewrite."
-            )
+        # Skip rewrite when there's nothing to act on
+        # (no entities tracked AND no live VLM signal)
+        if (
+            not effective_visibility["absent"]
+            and not effective_visibility["partial"]
+            and not in_frame
+            and not prompt_hint
+        ):
             if is_teleport_debug():
                 tdprint("maybe_rewrite() empty universe → falling back to original prompt")
             return self.text_encoder_fn(text_prompts_second)
 
         # 5. Rewrite prompt
-        rewritten = self.rewriter.rewrite(prompt_str, visibility)
+        rewritten = self.rewriter.rewrite(prompt_str, effective_visibility)
 
         if is_teleport_debug():
             tdprint(f"maybe_rewrite() rewritten_prompt={rewritten!r}")
@@ -295,6 +340,7 @@ def build_teleport_switch_hook(
         return None
 
     trigger = cfg.get("trigger", "switch")
+    registry_enabled = cfg.get("registry_enabled", True)
 
     return TeleportSwitchHook(
         vlm=vlm,
@@ -302,5 +348,6 @@ def build_teleport_switch_hook(
         text_encoder_fn=text_encoder_fn,
         frame_decoder_fn=frame_decoder_fn,
         entity_extractor_fn=None,  # placeholder; T16 provides real impl
+        registry_enabled=registry_enabled,
         trigger=trigger,
     )

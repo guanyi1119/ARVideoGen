@@ -1,8 +1,10 @@
 from .hook import TeleportSwitchHook, build_teleport_switch_hook
+from .registry import EntityRegistry
 from .rewriter import PromptRewriter, build_prompt_rewriter
 from .vlm import TeleportVLM, QwenTeleportVLM, build_teleport_vlm
 
 __all__ = [
+    "EntityRegistry",
     "PromptRewriter",
     "QwenTeleportVLM",
     "TeleportSwitchHook",

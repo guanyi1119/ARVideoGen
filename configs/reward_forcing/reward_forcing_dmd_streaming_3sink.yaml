@@ -124,6 +124,7 @@ teleport:
   prompt_rewrite:
     enabled: false                       # master switch; false = no-op
     trigger: switch                      # switch (default) | chunk
+    registry_enabled: true               # cross-chunk entity state machine
     vlm:
       type: qwen_vl_3b                   # qwen_vl_3b | qwen_vl | disabled
       model_path: Qwen/Qwen2.5-VL-3B-Instruct

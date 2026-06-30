@@ -60,6 +60,7 @@ def _make_hook(
     text_encoder_fn=None,
     frame_decoder_fn=None,
     entity_extractor_fn=None,
+    with_registry: bool = False,
 ):
     """Convenience builder with sensible defaults."""
     return TeleportSwitchHook(
@@ -68,6 +69,7 @@ def _make_hook(
         text_encoder_fn=text_encoder_fn or _make_mock_text_encoder(),
         frame_decoder_fn=frame_decoder_fn or _make_mock_frame_decoder(),
         entity_extractor_fn=entity_extractor_fn,
+        registry_enabled=with_registry,
     )
 
 
@@ -515,3 +517,135 @@ class TestEntitySourceUnion:
         text_enc.assert_called_once()
         encoded = text_enc.call_args[0][0]
         assert encoded[0] == "REWRITTEN_FROM_FRAME"
+
+
+# ---------------------------------------------------------------------------
+# 11. TestRegistryIntegration
+# ---------------------------------------------------------------------------
+
+
+class TestRegistryIntegration:
+    """maybe_rewrite uses registry to persist absent across chunks."""
+
+    def test_registry_locks_after_visible_to_absent(self):
+        from methods.reward_forcing.teleport.registry import EntityRegistry
+        registry = EntityRegistry()
+
+        text_enc = _make_mock_text_encoder()
+        vlm = _make_mock_vlm()
+        rewriter = _make_mock_rewriter()
+        rewriter.rewrite.side_effect = lambda p, v: f"REWRITTEN_absent={v['absent']}"
+
+        hook = TeleportSwitchHook(
+            vlm=vlm,
+            rewriter=rewriter,
+            text_encoder_fn=text_enc,
+            frame_decoder_fn=_make_mock_frame_decoder(),
+            entity_extractor_fn=lambda p: ["dog"],
+            entity_registry=registry,
+        )
+        output_latent = torch.zeros(1, 21, 16, 40, 40)
+
+        # Verify hook was constructed with the injected registry
+        assert hook._registry is not None, "hook._registry is None!"
+        assert hook._registry is registry, (
+            f"hook._registry is not the injected registry: "
+            f"{type(hook._registry)} vs {type(registry)}"
+        )
+
+        # Chunk 1: VLM sees dog
+        vlm.analyze.return_value = {
+            "in_frame": ["dog"],
+            "visibility": {"visible": ["dog"], "absent": [], "partial": []},
+        }
+        hook.maybe_rewrite(output_latent, 21, ["A dog runs"])
+        assert registry.snapshot()["dog"] == "visible"
+
+        # Chunk 2: VLM says dog absent → locked
+        vlm.analyze.return_value = {
+            "in_frame": [],
+            "visibility": {"visible": [], "absent": ["dog"], "partial": []},
+        }
+        hook.maybe_rewrite(output_latent, 42, ["A dog runs"])
+        assert registry.snapshot()["dog"] == "absent"
+        # rewriter should have been called with absent=['dog']
+        last_call_v = rewriter.rewrite.call_args[0][1]
+        assert last_call_v["absent"] == ["dog"]
+
+        # Chunk 3: VLM says dog visible again — registry must keep absent
+        vlm.analyze.return_value = {
+            "in_frame": ["dog"],
+            "visibility": {"visible": ["dog"], "absent": [], "partial": []},
+        }
+        hook.maybe_rewrite(output_latent, 63, ["A dog runs"])
+        assert registry.snapshot()["dog"] == "absent"
+        last_call_v = rewriter.rewrite.call_args[0][1]
+        assert last_call_v["absent"] == ["dog"]  # still suppressed
+
+    def test_reset_clears_registry(self):
+        from methods.reward_forcing.teleport.registry import EntityRegistry
+        registry = EntityRegistry()
+
+        vlm = _make_mock_vlm()
+        rewriter = _make_mock_rewriter()
+        hook = TeleportSwitchHook(
+            vlm=vlm,
+            rewriter=rewriter,
+            text_encoder_fn=_make_mock_text_encoder(),
+            frame_decoder_fn=_make_mock_frame_decoder(),
+            entity_extractor_fn=lambda p: ["dog"],
+            entity_registry=registry,
+        )
+        vlm.analyze.return_value = {
+            "in_frame": ["dog"],
+            "visibility": {"visible": ["dog"], "absent": [], "partial": []},
+        }
+        output_latent = torch.zeros(1, 21, 16, 40, 40)
+        hook.maybe_rewrite(output_latent, 21, ["A dog runs"])
+        assert len(registry) == 1
+
+        hook.reset()
+        assert len(registry) == 0
+
+    def test_registry_default_constructed(self):
+        """When entity_registry=None (default), hook builds its own."""
+        hook = _make_hook(with_registry=True)
+        # By default a registry is auto-constructed
+        assert hook._registry is not None
+
+    def test_registry_disabled_via_factory_flag(self):
+        """build_teleport_switch_hook with registry_enabled=False → no registry."""
+        cfg = {
+            "enabled": True,
+            "registry_enabled": False,
+            "vlm": {"type": "qwen_vl_3b", "model_path": "/tmp/fake"},
+            "rewriter": {"mode": "conservative"},
+        }
+        hook = build_teleport_switch_hook(cfg, Mock(), Mock())
+        assert hook is not None
+        assert hook._registry is None
+
+    def test_open_vocab_in_frame_not_tracked(self):
+        """VLM sees 'tree' but it's not in prompt_hint → not in registry."""
+        from methods.reward_forcing.teleport.registry import EntityRegistry
+        registry = EntityRegistry()
+        vlm = _make_mock_vlm()
+        vlm.analyze.return_value = {
+            "in_frame": ["dog", "tree"],
+            "visibility": {
+                "visible": ["dog", "tree"], "absent": [], "partial": [],
+            },
+        }
+        hook = TeleportSwitchHook(
+            vlm=vlm,
+            rewriter=_make_mock_rewriter(),
+            text_encoder_fn=_make_mock_text_encoder(),
+            frame_decoder_fn=_make_mock_frame_decoder(),
+            entity_extractor_fn=lambda p: ["dog"],  # prompt only mentions dog
+            entity_registry=registry,
+        )
+        output_latent = torch.zeros(1, 21, 16, 40, 40)
+        hook.maybe_rewrite(output_latent, 21, ["A dog runs"])
+        # tree should not enter registry
+        assert "tree" not in registry.snapshot()
+        assert registry.snapshot() == {"dog": "visible"}
