@@ -25,6 +25,9 @@ from methods.reward_forcing.pipelines.streaming_causal_inference_3sink import (
 from methods.reward_forcing.pipelines.switch_causal_inference_3sink import (
     SwitchCausalInferencePipeline3Sink as SwitchCausalInferencePipeline,
 )
+from methods.reward_forcing.pipelines.interactive_causal_inference_3sink import (
+    InteractiveCausalInferencePipeline3Sink as InteractiveCausalInferencePipeline,
+)
 from core.data.dataset import TextDataset, TwoTextDataset, MultiTextDataset
 from core.misc import set_seed
 from core.misc.memory import gpu, get_cuda_free_memory_gb, DynamicSwapInstaller
@@ -140,8 +143,8 @@ else:
     config.distributed = False
     print(f"Single GPU mode on device {device}")
 
-print(f"Free VRAM {get_cuda_free_memory_gb(device)} GB")
-low_memory = get_cuda_free_memory_gb(device) < 40
+print(f"Free VRAM {get_cuda_free_memory_gb(gpu)} GB")
+low_memory = get_cuda_free_memory_gb(gpu) < 40
 low_memory = True
 
 torch.set_grad_enabled(False)
@@ -153,7 +156,7 @@ if use_multi:
             f"[MultiPrompts] Enabled. data_path={config.data_path}, "
             f"switch_frame_indices={getattr(config, 'switch_frame_indices', None)}"
         )
-    pipeline = CausalInferencePipeline(config, device=device)
+    pipeline = InteractiveCausalInferencePipeline(config, device=device)
 elif use_switch:
     if local_rank == 0:
         print(

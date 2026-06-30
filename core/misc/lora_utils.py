@@ -33,7 +33,7 @@ def configure_lora_for_model(transformer, model_name, lora_config, is_main_proce
     
     # Define the specific modules we want to apply LoRA to
     if model_name == 'generator':
-        adapter_target_modules = ['CausalWanAttentionBlock']
+        adapter_target_modules = ['CausalWanAttentionBlock', 'CausalWanAttentionBlock3Sink']
     elif model_name == 'fake_score':
         adapter_target_modules = ['WanAttentionBlock']
     else:
