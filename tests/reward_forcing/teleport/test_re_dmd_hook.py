@@ -17,6 +17,7 @@ import pytest
 import torch
 from unittest.mock import MagicMock
 
+from methods.reward_forcing.teleport._mode import normalize_teleport_mode
 from methods.reward_forcing.teleport import (
     build_teleport_detector,
     build_reweighter,
@@ -57,6 +58,7 @@ def _make_simple_omegaconf(d: dict):
 
 def _make_teleport_tel_det_regular_cfg(mode: str = "off", **overrides):
     """Build a tel_det_regular config dict for a given mode."""
+    norm_mode = normalize_teleport_mode(mode)
     base = {
         "mode": mode,
         "detector": {
@@ -68,14 +70,14 @@ def _make_teleport_tel_det_regular_cfg(mode: str = "off", **overrides):
         },
     }
 
-    if mode == "reweight":
+    if norm_mode == "reweight":
         base["reweighter"] = {
             "type": "absolute",
             "alpha": 5.0,
             "latent_h": 40,
             "latent_w": 72,
         }
-    elif mode == "aux_loss":
+    elif norm_mode == "aux_loss":
         base["aux_loss"] = {
             "type": "masked_mean",
             "tau": 0.3,
@@ -103,7 +105,8 @@ def _init_teleport_hooks(obj, tel_det_regular_cfg):
 
     if tel_det_regular_cfg is not None:
         cfg = _make_simple_omegaconf(tel_det_regular_cfg) if isinstance(tel_det_regular_cfg, dict) else tel_det_regular_cfg
-        obj._teleport_mode = getattr(cfg, "mode", "off")
+        raw_mode = getattr(cfg, "mode", "off")
+        obj._teleport_mode = normalize_teleport_mode(raw_mode)
         if obj._teleport_mode == "reweight":
             obj._teleport_detector = build_teleport_detector(getattr(cfg, "detector", None))
             obj._teleport_reweighter = build_reweighter(getattr(cfg, "reweighter", None))
@@ -152,6 +155,39 @@ class TestInitHookConstruction:
         assert model_off._teleport_detector is None
         assert model_off._teleport_reweighter is None
         assert model_off._teleport_aux_loss is None
+
+    def test_mode_bool_false_treated_as_off(self):
+        """mode=False (YAML unquoted 'off') initializes with all hooks None."""
+        cfg = _make_teleport_tel_det_regular_cfg(mode=False)
+        model = MockReDMD(tel_det_regular_cfg=cfg)
+        assert model._teleport_mode == "off"
+        assert model._teleport_detector is None
+        assert model._teleport_reweighter is None
+        assert model._teleport_aux_loss is None
+
+    def test_mode_whitespace_normalized_to_off(self):
+        """mode=' OFF ' (with whitespace/case) normalizes to 'off'."""
+        cfg = _make_teleport_tel_det_regular_cfg(mode=" OFF ")
+        model = MockReDMD(tel_det_regular_cfg=cfg)
+        assert model._teleport_mode == "off"
+        assert model._teleport_detector is None
+
+    def test_mode_true_raises_value_error(self):
+        """mode=True raises ValueError (no accidental enablement)."""
+        cfg = _make_teleport_tel_det_regular_cfg(mode=True)
+        with pytest.raises(ValueError, match="Unknown teleport.tel_det_regular.mode"):
+            MockReDMD(tel_det_regular_cfg=cfg)
+
+    def test_normalize_teleport_mode_unit(self):
+        """Direct unit tests for normalize_teleport_mode."""
+        assert normalize_teleport_mode(None) == "off"
+        assert normalize_teleport_mode(False) == "off"
+        assert normalize_teleport_mode("off") == "off"
+        assert normalize_teleport_mode(" OFF ") == "off"
+        assert normalize_teleport_mode("Off") == "off"
+        assert normalize_teleport_mode("reweight") == "reweight"
+        assert normalize_teleport_mode("aux_loss") == "aux_loss"
+        assert normalize_teleport_mode(True) == "true"  # will fail validation
 
     def test_mode_reweight_initializes_reweighter(self):
         """mode=reweight with absolute reweighter initializes detector + reweighter."""

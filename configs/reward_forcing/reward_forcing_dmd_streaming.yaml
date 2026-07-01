@@ -122,7 +122,7 @@ teleport:
 
   # === T10: tel_det_regular teleport mitigation (mutex-gated, default off) ===
   tel_det_regular:
-    mode: off                            # off | reweight | aux_loss (mutex)
+    mode: "off"                          # off | reweight | aux_loss (mutex)
     detector:
       type: optical_flow_no_raft
       downsample_factor: 4
