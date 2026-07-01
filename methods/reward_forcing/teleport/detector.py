@@ -555,9 +555,13 @@ class MultiFrameFlowDetector(TeleportDetector):
                 # which is adj_flows[t-1], adj_flows[t-2], ..., adj_flows[t-tau]
                 per_frame_flows = [adj_flows[t - 1 - i] for i in range(tau)]
                 flow = self._compose_flows(per_frame_flows)
+                del per_frame_flows  # release references
 
             warped = OpticalFlowTeleportDetector._warp_frame(frame_src, flow)
             residual = (frame_dst - warped).abs().mean(dim=1)  # [B, new_h, new_w]
+
+            # Release intermediate tensors
+            del flow, warped
 
             if need_upsample:
                 residual = F.interpolate(
@@ -568,6 +572,12 @@ class MultiFrameFlowDetector(TeleportDetector):
                 ).squeeze(1)
 
             results.append(residual)
+
+            # For chained mode: free adj_flows entries that are no longer needed.
+            # adj_flows[t-tau] is last used when processing frame t (as the oldest
+            # flow in the window). After this, no future frame will reference it.
+            if self._mode == "chained" and t - tau < len(adj_flows):
+                adj_flows[t - tau] = None
 
         # Free pre-computed flows to release memory before stacking
         del adj_flows

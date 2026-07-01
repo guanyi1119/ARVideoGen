@@ -109,7 +109,10 @@ def compute_teleport_rate(
     Returns:
         Dict with keys ``teleport_rate``, ``frame_count``, ``event_count``.
     """
-    score_map = detector.score(rgb).detach()  # [1, T, 1, H', W']
+    # no_grad is critical: without it, RAFT forward passes inside score()
+    # retain computation graphs, causing OOM on long videos (240+ frames).
+    with torch.no_grad():
+        score_map = detector.score(rgb)  # [1, T, 1, H', W']
     T = rgb.shape[1]
 
     # Per-frame fraction of spatial positions exceeding the threshold
