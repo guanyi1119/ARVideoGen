@@ -521,6 +521,17 @@ class MultiFrameFlowDetector(TeleportDetector):
             rgb_raft = rgb
             new_h, new_w = H, W
 
+        # --- Pre-compute all adjacent-frame flows ONCE ---
+        # adj_flows[i] = RAFT(frame i, frame i+1), for i = 0..T-2
+        # This is T-1 RAFT calls total, same as direct mode.
+        adj_flows: list[torch.Tensor] = []
+        for i in range(T - 1):
+            flow_i = self._flow_model(rgb_raft[:, i], rgb_raft[:, i + 1])
+            if isinstance(flow_i, list):
+                flow_i = flow_i[-1]
+            adj_flows.append(flow_i)
+
+        # --- Compute residual per frame ---
         results: list[torch.Tensor] = []
         for t in range(T):
             if t < tau:
@@ -533,19 +544,16 @@ class MultiFrameFlowDetector(TeleportDetector):
             frame_dst = rgb_raft[:, t]         # [B, 3, new_h, new_w]
 
             if self._mode == "direct":
+                # Single RAFT call between t-tau and t (not in cache, compute directly)
                 flow = self._flow_model(frame_src, frame_dst)
                 if isinstance(flow, list):
                     flow = flow[-1]
-            else:  # chained
-                per_frame_flows: list[torch.Tensor] = []
-                for i in range(tau):
-                    f_prev = rgb_raft[:, t - i - 1]
-                    f_curr = rgb_raft[:, t - i]
-                    flow_i = self._flow_model(f_prev, f_curr)
-                    if isinstance(flow_i, list):
-                        flow_i = flow_i[-1]
-                    per_frame_flows.append(flow_i)
-                # per_frame_flows[0] = RAFT(t-1, t), ..., [tau-1] = RAFT(t-tau, t-tau+1)
+            else:  # chained: reuse pre-computed adjacent flows
+                # adj_flows[t-tau] = RAFT(t-tau, t-tau+1)
+                # adj_flows[t-1]   = RAFT(t-1, t)
+                # We need flows in order: [RAFT(t-1,t), RAFT(t-2,t-1), ..., RAFT(t-tau,t-tau+1)]
+                # which is adj_flows[t-1], adj_flows[t-2], ..., adj_flows[t-tau]
+                per_frame_flows = [adj_flows[t - 1 - i] for i in range(tau)]
                 flow = self._compose_flows(per_frame_flows)
 
             warped = OpticalFlowTeleportDetector._warp_frame(frame_src, flow)
@@ -560,6 +568,9 @@ class MultiFrameFlowDetector(TeleportDetector):
                 ).squeeze(1)
 
             results.append(residual)
+
+        # Free pre-computed flows to release memory before stacking
+        del adj_flows
 
         return torch.stack(results, dim=1)  # [B, T, H, W]
 
