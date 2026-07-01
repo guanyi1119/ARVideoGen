@@ -164,7 +164,9 @@ class OpticalFlowTeleportDetector(TeleportDetector):
         else:
             model = raft_small(weights=Raft_Small_Weights.DEFAULT)
 
-        self._flow_model = model
+        # Move model to the same device as input tensors will be on.
+        # When transfer_to_npu is active, "cuda" maps to NPU.
+        self._flow_model = model.to("cuda" if torch.cuda.is_available() else "cpu")
 
     def _compute_frame_diff(self, rgb: torch.Tensor) -> torch.Tensor:
         """Compute per-frame channel-mean absolute difference.
