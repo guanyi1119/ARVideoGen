@@ -1,4 +1,5 @@
 from .detector import (
+    MultiFrameFlowDetector,
     OpticalFlowTeleportDetector,
     TeleportDetector,
     build_teleport_detector,
@@ -25,6 +26,7 @@ from methods.reward_forcing.teleport.aux_loss import (
 
 __all__ = [
     "EntityRegistry",
+    "MultiFrameFlowDetector",
     "OpticalFlowTeleportDetector",
     "PromptRewriter",
     "QwenTeleportVLM",

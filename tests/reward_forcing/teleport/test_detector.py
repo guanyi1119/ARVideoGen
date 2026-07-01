@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from methods.reward_forcing.teleport.detector import (
+    MultiFrameFlowDetector,
     OpticalFlowTeleportDetector,
     TeleportDetector,
     build_teleport_detector,
@@ -218,3 +219,235 @@ class TestConfig:
         det.score(rgb1)  # 32x32 after ds → cache key (32, 32, ...)
         det.score(rgb2)  # 16x16 after ds → cache key (16, 16, ...)
         assert len(det._centeredness_cache) == 2
+
+
+# ---------------------------------------------------------------------------
+# MultiFrameFlowDetector tests
+# ---------------------------------------------------------------------------
+
+
+class TestMultiFrameFactory:
+    def test_factory_multi_frame_chained(self):
+        det = build_teleport_detector({
+            "type": "multi_frame_chained",
+            "flow_backend": "none",
+            "tau": 3,
+        })
+        assert isinstance(det, MultiFrameFlowDetector)
+        assert det._mode == "chained"
+        assert det._tau == 3
+
+    def test_factory_multi_frame_direct(self):
+        det = build_teleport_detector({
+            "type": "multi_frame_direct",
+            "flow_backend": "none",
+            "tau": 7,
+        })
+        assert isinstance(det, MultiFrameFlowDetector)
+        assert det._mode == "direct"
+        assert det._tau == 7
+
+    def test_factory_multi_frame_alias(self):
+        det = build_teleport_detector({
+            "type": "multi_frame",
+            "flow_backend": "none",
+        })
+        assert isinstance(det, MultiFrameFlowDetector)
+        assert det._mode == "chained"
+
+    def test_factory_multi_frame_default_tau(self):
+        det = build_teleport_detector({
+            "type": "multi_frame",
+            "flow_backend": "none",
+        })
+        assert det._tau == 5
+
+
+class TestMultiFrameShape:
+    def test_output_shape(self):
+        det = MultiFrameFlowDetector(
+            tau=3, flow_backend="none", downsample_factor=4,
+        )
+        rgb = torch.zeros(1, 8, 3, 64, 64)
+        out = det.score(rgb)
+        assert out.shape == (1, 8, 1, 16, 16)
+
+    def test_output_shape_no_downsample(self):
+        det = MultiFrameFlowDetector(
+            tau=3, flow_backend="none", downsample_factor=1,
+        )
+        rgb = torch.zeros(1, 5, 3, 32, 32)
+        out = det.score(rgb)
+        assert out.shape == (1, 5, 1, 32, 32)
+
+    def test_first_tau_frames_are_zero(self):
+        det = MultiFrameFlowDetector(
+            tau=3, flow_backend="none",
+        )
+        rgb = torch.rand(1, 6, 3, 64, 64)
+        out = det.score(rgb)
+        assert torch.all(out[:, :3] == 0)
+        # Frames tau+ should be non-zero (from centeredness * residual=0)
+        # With flow_backend="none", residual=0, so ALL frames are zero
+        assert torch.all(out[:, 3:] == 0)
+
+    def test_single_frame_output(self):
+        det = MultiFrameFlowDetector(
+            tau=3, flow_backend="none",
+        )
+        rgb = torch.ones(2, 1, 3, 32, 32)
+        out = det.score(rgb)
+        assert out.shape == (2, 1, 1, 8, 8)
+        assert torch.all(out == 0)
+
+    def test_t_shorter_than_tau_all_zero(self):
+        det = MultiFrameFlowDetector(
+            tau=5, flow_backend="none",
+        )
+        rgb = torch.ones(1, 3, 3, 64, 64)
+        out = det.score(rgb)
+        assert out.shape == (1, 3, 1, 16, 16)
+        assert torch.all(out == 0)
+
+
+class TestMultiFrameDifferentiability:
+    def test_gradient_flows_through_detector(self):
+        """Backward should not crash. With flow_backend='none', gradient
+        magnitude may be zero (residual=0 always), which is correct."""
+        det = MultiFrameFlowDetector(
+            tau=2, flow_backend="none", downsample_factor=4,
+        )
+        rgb = torch.rand(1, 4, 3, 64, 64, requires_grad=True)
+        score_map = det.score(rgb)
+        loss = score_map.sum()
+        loss.backward()
+        assert rgb.grad is not None
+        # Gradient exists but may be zero since residual=0 when
+        # flow_backend="none" — this is semantically correct.
+
+    def test_no_inplace_op_breaks_grad(self):
+        det = MultiFrameFlowDetector(
+            tau=2, flow_backend="none", downsample_factor=4,
+        )
+        rgb = torch.rand(1, 4, 3, 64, 64, requires_grad=True)
+        det.score(rgb).sum().backward()
+
+
+class TestMultiFrameConfig:
+    def test_is_available_no_flow(self):
+        det = MultiFrameFlowDetector(flow_backend="none")
+        assert det.is_available() is True
+
+    def test_invalid_shape_raises(self):
+        det = MultiFrameFlowDetector(flow_backend="none")
+        with pytest.raises(ValueError, match="Expected rgb shape"):
+            det.score(torch.zeros(1, 3, 64, 64))
+        with pytest.raises(ValueError, match="Expected 3 channels"):
+            det.score(torch.zeros(1, 3, 1, 64, 64))
+
+    def test_invalid_mode_raises(self):
+        with pytest.raises(ValueError, match="mode must be"):
+            MultiFrameFlowDetector(mode="invalid")
+
+    def test_invalid_tau_raises(self):
+        with pytest.raises(ValueError, match="tau must be"):
+            MultiFrameFlowDetector(tau=0)
+        with pytest.raises(ValueError, match="tau must be"):
+            MultiFrameFlowDetector(tau=-1)
+
+    def test_centeredness_cache_reuse(self):
+        det = MultiFrameFlowDetector(
+            tau=2, flow_backend="none", downsample_factor=1,
+        )
+        rgb = torch.zeros(1, 4, 3, 32, 32)
+        det.score(rgb)
+        assert len(det._centeredness_cache) == 1
+        det.score(rgb)
+        assert len(det._centeredness_cache) == 1
+
+    def test_direct_mode_constructs(self):
+        det = MultiFrameFlowDetector(
+            tau=4, mode="direct", flow_backend="none",
+        )
+        assert det._mode == "direct"
+        assert det._tau == 4
+
+
+class TestFlowComposition:
+    def test_compose_two_uniform_flows(self):
+        """Two uniform [1, 0] flows should compose to [2, 0]."""
+        det = MultiFrameFlowDetector(flow_backend="none")
+        B, H, W = 1, 16, 16
+        flow_a = torch.zeros(B, 2, H, W)
+        flow_a[:, 0, :, :] = 1.0  # dx = 1
+        flow_b = torch.zeros(B, 2, H, W)
+        flow_b[:, 0, :, :] = 1.0  # dx = 1
+
+        composed = det._compose_flows([flow_a, flow_b])
+        assert composed.shape == (B, 2, H, W)
+        # Near center, composition should be ~[2, 0]
+        # At borders, grid_sample with border padding may differ
+        center_dx = composed[0, 0, H // 2, W // 2].item()
+        center_dy = composed[0, 1, H // 2, W // 2].item()
+        assert abs(center_dx - 2.0) < 0.2, f"got dx={center_dx}"
+        assert abs(center_dy) < 0.1, f"got dy={center_dy}"
+
+    def test_compose_three_uniform_flows(self):
+        """Three uniform [1, 0] flows should compose to ~[3, 0]."""
+        det = MultiFrameFlowDetector(flow_backend="none")
+        B, H, W = 1, 16, 16
+        flows = []
+        for _ in range(3):
+            f = torch.zeros(B, 2, H, W)
+            f[:, 0, :, :] = 1.0
+            flows.append(f)
+
+        composed = det._compose_flows(flows)
+        center_dx = composed[0, 0, H // 2, W // 2].item()
+        center_dy = composed[0, 1, H // 2, W // 2].item()
+        assert abs(center_dx - 3.0) < 0.3, f"got dx={center_dx}"
+        assert abs(center_dy) < 0.1, f"got dy={center_dy}"
+
+    def test_compose_vertical_flow(self):
+        """Two uniform [0, 1] flows should compose to ~[0, 2]."""
+        det = MultiFrameFlowDetector(flow_backend="none")
+        B, H, W = 1, 16, 16
+        flow_a = torch.zeros(B, 2, H, W)
+        flow_a[:, 1, :, :] = 1.0  # dy = 1
+        flow_b = torch.zeros(B, 2, H, W)
+        flow_b[:, 1, :, :] = 1.0  # dy = 1
+
+        composed = det._compose_flows([flow_a, flow_b])
+        center_dx = composed[0, 0, H // 2, W // 2].item()
+        center_dy = composed[0, 1, H // 2, W // 2].item()
+        assert abs(center_dx) < 0.1
+        assert abs(center_dy - 2.0) < 0.2
+
+    def test_warp_flow_identity(self):
+        """Warping by zero flow should return the original flow."""
+        det = MultiFrameFlowDetector(flow_backend="none")
+        B, H, W = 1, 16, 16
+        flow_src = torch.rand(B, 2, H, W)
+        flow_zero = torch.zeros(B, 2, H, W)
+
+        warped = det._warp_flow(flow_src, flow_zero)
+        assert torch.allclose(warped, flow_src, atol=1e-5)
+
+    def test_compose_single_flow_returns_itself(self):
+        """Composing a single flow should return it unchanged."""
+        det = MultiFrameFlowDetector(flow_backend="none")
+        B, H, W = 1, 16, 16
+        flow = torch.rand(B, 2, H, W)
+        composed = det._compose_flows([flow])
+        assert torch.allclose(composed, flow, atol=1e-5)
+
+    def test_multiplicative_centeredness_gate(self):
+        """With flow_backend='none', residual=0, so score should be all zeros
+        regardless of centeredness."""
+        det = MultiFrameFlowDetector(
+            tau=2, flow_backend="none", downsample_factor=4,
+        )
+        rgb = torch.rand(1, 5, 3, 64, 64)
+        out = det.score(rgb)
+        # residual=0 * centeredness = 0 everywhere
+        assert torch.all(out == 0)

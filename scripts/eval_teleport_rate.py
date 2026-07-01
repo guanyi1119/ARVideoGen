@@ -133,6 +133,9 @@ def evaluate_directory(
     min_event_area_ratio: float = 0.001,
     device: str = "auto",
     use_raft: bool = False,
+    flow_mode: str = "chained",
+    tau: int = 5,
+    flow_model_path: str | None = None,
 ) -> dict[str, Any]:
     """Evaluate all MP4 files in a directory and write a JSON report.
 
@@ -145,6 +148,11 @@ def evaluate_directory(
             *threshold* for a frame to count as a teleport event.
         device: ``"auto"``, ``"cpu"``, or ``"cuda"``.
         use_raft: If True, use RAFT optical flow backend (requires GPU).
+        flow_mode: ``"adjacent"``, ``"direct"``, or ``"chained"``
+            (default: ``"chained"``). Only used when ``use_raft`` is True.
+        tau: Multi-frame lookback distance (default: 5). Only used when
+            ``use_raft`` is True and ``flow_mode`` is not ``"adjacent"``.
+        flow_model_path: Optional path to offline RAFT weights.
 
     Returns:
         The report dict (also written to ``output_path``).
@@ -180,8 +188,27 @@ def evaluate_directory(
         device = "cuda"  # transfer_to_npu maps cuda -> npu
 
     # Build detector
-    detector_type = "optical_flow" if use_raft else "optical_flow_no_raft"
-    detector = build_teleport_detector({"type": detector_type, "downsample_factor": 4})
+    if use_raft:
+        if flow_mode == "adjacent":
+            detector = build_teleport_detector({
+                "type": "optical_flow",
+                "downsample_factor": 4,
+                "flow_model_path": flow_model_path,
+            })
+        else:
+            det_type = f"multi_frame_{flow_mode}"
+            detector = build_teleport_detector({
+                "type": det_type,
+                "tau": tau,
+                "downsample_factor": 4,
+                "flow_backend": "raft_small",
+                "flow_model_path": flow_model_path,
+            })
+    else:
+        detector = build_teleport_detector({
+            "type": "optical_flow_no_raft",
+            "downsample_factor": 4,
+        })
 
     per_video: dict[str, dict] = {}
     for mp4_path in mp4_files:
@@ -211,6 +238,8 @@ def evaluate_directory(
             "mean_teleport_rate": round(mean_rate, 6),
             "total_videos": total_videos,
             "total_frames": total_frames,
+            "flow_mode": flow_mode,
+            "tau": tau,
         },
     }
 
@@ -274,6 +303,28 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Use RAFT optical flow backend (requires GPU and torchvision RAFT weights).",
     )
+    parser.add_argument(
+        "--flow_mode",
+        default="chained",
+        choices=["adjacent", "direct", "chained"],
+        help=(
+            "Flow mode when --use_raft is set: 'adjacent' (original adjacent-frame), "
+            "'direct' (multi-frame single RAFT call), 'chained' (multi-frame composed flows). "
+            "Default: chained."
+        ),
+    )
+    parser.add_argument(
+        "--tau",
+        type=int,
+        default=5,
+        help="Multi-frame lookback distance (default: 5). Only used when --use_raft and flow_mode != adjacent.",
+    )
+    parser.add_argument(
+        "--flow_model_path",
+        type=str,
+        default=None,
+        help="Optional path to offline RAFT model weights (.pth).",
+    )
     return parser
 
 
@@ -294,6 +345,9 @@ def main(argv: list[str] | None = None) -> None:
         min_event_area_ratio=args.min_event_area_ratio,
         device=args.device,
         use_raft=args.use_raft,
+        flow_mode=args.flow_mode,
+        tau=args.tau,
+        flow_model_path=args.flow_model_path,
     )
 
     agg = report["aggregate"]

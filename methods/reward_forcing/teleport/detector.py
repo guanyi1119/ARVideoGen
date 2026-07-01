@@ -345,6 +345,318 @@ class OpticalFlowTeleportDetector(TeleportDetector):
         return centeredness
 
 
+class MultiFrameFlowDetector(TeleportDetector):
+    """Multi-frame optical-flow teleport detector.
+
+    Compares frame t with frame t-tau to detect content that appeared
+    without a continuous motion trajectory (teleport).
+
+    Two modes:
+        - "direct": single RAFT call between t-tau and t
+        - "chained": tau per-frame RAFT calls, composed into multi-step flow
+
+    Score = warp_residual * centeredness  (multiplicative gate)
+
+    First tau frames are always zero (no history).
+    """
+
+    def __init__(
+        self,
+        tau: int = 5,
+        mode: str = "chained",
+        downsample_factor: int = 4,
+        edge_sigma: float = 0.15,
+        flow_backend: str = "raft_small",
+        flow_model_path: Optional[str] = None,
+    ) -> None:
+        if mode not in ("direct", "chained"):
+            raise ValueError(
+                f"mode must be 'direct' or 'chained', got {mode!r}"
+            )
+        if tau < 1:
+            raise ValueError(f"tau must be >= 1, got {tau}")
+        super().__init__()
+        self._tau = tau
+        self._mode = mode
+        self._downsample_factor = downsample_factor
+        self._edge_sigma = edge_sigma
+        self._flow_backend = flow_backend
+        self._flow_model_path = flow_model_path
+        self._flow_model: Optional[torch.nn.Module] = None
+        self._centeredness_cache: dict = {}
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def is_available(self) -> bool:
+        if self._flow_backend == "none":
+            return True
+        return self._flow_model is not None
+
+    def score(self, rgb: torch.Tensor) -> torch.Tensor:
+        """Compute score map.
+
+        Args:
+            rgb: [B, T, 3, H, W], values in [0, 1].
+
+        Returns:
+            score_map: [B, T, 1, H', W'], non-negative.  First tau frames are zero.
+        """
+        if rgb.dim() != 5:
+            raise ValueError(
+                f"Expected rgb shape [B, T, 3, H, W], got {tuple(rgb.shape)}"
+            )
+        B, T, C, H, W = rgb.shape
+        if C != 3:
+            raise ValueError(f"Expected 3 channels, got {C}")
+
+        # --- Downsample ---
+        if self._downsample_factor > 1:
+            rgb_flat = rgb.reshape(B * T, C, H, W)
+            rgb_ds = F.interpolate(
+                rgb_flat,
+                scale_factor=1.0 / self._downsample_factor,
+                mode="bilinear",
+                align_corners=False,
+                antialias=False,
+            )
+            _, _, H_ds, W_ds = rgb_ds.shape
+            rgb = rgb_ds.reshape(B, T, C, H_ds, W_ds)
+        else:
+            H_ds, W_ds = H, W
+
+        # --- Multi-frame flow residual ---
+        residual = self._compute_multi_frame_residual(rgb)  # [B, T, H_ds, W_ds]
+
+        # --- Centeredness mask (multiplicative gate) ---
+        cent = self._compute_centeredness(
+            H_ds, W_ds, device=rgb.device, dtype=rgb.dtype
+        )  # [1, 1, H_ds, W_ds]
+
+        # --- Multiplicative score ---
+        score_map = residual * cent.squeeze(0)  # [B, T, H_ds, W_ds]
+
+        # Add channel dim -> [B, T, 1, H_ds, W_ds]
+        score_map = score_map.unsqueeze(2)
+
+        # Clamp to non-negative
+        score_map = score_map.clamp(min=0.0)
+
+        # First tau frames are zero (no history)
+        if T <= self._tau:
+            score_map[:, :] = 0.0
+        else:
+            score_map[:, : self._tau] = 0.0
+
+        return score_map
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _load_flow_model(self) -> None:
+        """Lazy-load the RAFT-small optical flow model."""
+        if self._flow_model is not None:
+            return
+        if self._flow_backend != "raft_small":
+            return
+
+        from torchvision.models.optical_flow import (
+            Raft_Small_Weights,
+            raft_small,
+        )
+
+        if self._flow_model_path is not None:
+            model = raft_small(weights=None)
+            state = torch.load(
+                self._flow_model_path, map_location="cpu", weights_only=True
+            )
+            model.load_state_dict(state)
+        else:
+            model = raft_small(weights=Raft_Small_Weights.DEFAULT)
+
+        self._flow_model = model.to(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
+
+    def _compute_multi_frame_residual(
+        self, rgb: torch.Tensor
+    ) -> torch.Tensor:
+        """Compute warp residual for multi-frame flow.
+
+        Args:
+            rgb: [B, T, 3, H, W], values in [0, 1].
+
+        Returns:
+            residual: [B, T, H, W], first tau frames are zero.
+        """
+        B, T, _C, H, W = rgb.shape
+        tau = self._tau
+        if T <= tau or self._flow_backend == "none":
+            zero = torch.zeros(B, T, H, W, device=rgb.device, dtype=rgb.dtype)
+            # Preserve gradient path: add rgb.sum() * 0 so backward() works
+            zero = zero + rgb.sum() * 0.0
+            return zero
+
+        self._load_flow_model()
+
+        # RAFT requires H,W >= 128 and divisible by 8
+        raft_min = 128
+        need_upsample = (
+            H < raft_min or W < raft_min or H % 8 != 0 or W % 8 != 0
+        )
+        if need_upsample:
+            new_h = max(H, raft_min)
+            new_w = max(W, raft_min)
+            new_h = ((new_h + 7) // 8) * 8
+            new_w = ((new_w + 7) // 8) * 8
+            rgb_raft = F.interpolate(
+                rgb.reshape(B * T, _C, H, W),
+                size=(new_h, new_w),
+                mode="bilinear",
+                align_corners=False,
+            ).reshape(B, T, _C, new_h, new_w)
+        else:
+            rgb_raft = rgb
+            new_h, new_w = H, W
+
+        results: list[torch.Tensor] = []
+        for t in range(T):
+            if t < tau:
+                results.append(
+                    torch.zeros(B, H, W, device=rgb.device, dtype=rgb.dtype)
+                )
+                continue
+
+            frame_src = rgb_raft[:, t - tau]  # [B, 3, new_h, new_w]
+            frame_dst = rgb_raft[:, t]         # [B, 3, new_h, new_w]
+
+            if self._mode == "direct":
+                flow = self._flow_model(frame_src, frame_dst)
+                if isinstance(flow, list):
+                    flow = flow[-1]
+            else:  # chained
+                per_frame_flows: list[torch.Tensor] = []
+                for i in range(tau):
+                    f_prev = rgb_raft[:, t - i - 1]
+                    f_curr = rgb_raft[:, t - i]
+                    flow_i = self._flow_model(f_prev, f_curr)
+                    if isinstance(flow_i, list):
+                        flow_i = flow_i[-1]
+                    per_frame_flows.append(flow_i)
+                # per_frame_flows[0] = RAFT(t-1, t), ..., [tau-1] = RAFT(t-tau, t-tau+1)
+                flow = self._compose_flows(per_frame_flows)
+
+            warped = OpticalFlowTeleportDetector._warp_frame(frame_src, flow)
+            residual = (frame_dst - warped).abs().mean(dim=1)  # [B, new_h, new_w]
+
+            if need_upsample:
+                residual = F.interpolate(
+                    residual.unsqueeze(1),
+                    size=(H, W),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(1)
+
+            results.append(residual)
+
+        return torch.stack(results, dim=1)  # [B, T, H, W]
+
+    def _compose_flows(
+        self, flows: list[torch.Tensor]
+    ) -> torch.Tensor:
+        """Compose tau per-frame flows into a single multi-step flow.
+
+        flows[0] is RAFT(t-1, t), flows[tau-1] is RAFT(t-tau, t-tau+1).
+        The composed flow maps frame (t-tau) to frame t.
+
+        Composition: composed = flows[0]; then for each subsequent flow,
+        warp the composed flow by it and add.
+        """
+        composed = flows[0]  # flow from t-1 to t
+        for i in range(1, len(flows)):
+            warped_composed = self._warp_flow(composed, flows[i])
+            composed = warped_composed + flows[i]
+        return composed
+
+    def _warp_flow(
+        self, flow_to_warp: torch.Tensor, base_flow: torch.Tensor
+    ) -> torch.Tensor:
+        """Warp a flow field by another flow field via grid_sample.
+
+        Args:
+            flow_to_warp: [B, 2, H, W], flow to resample.
+            base_flow: [B, 2, H, W], flow defining the resampling positions.
+
+        Returns:
+            warped: [B, 2, H, W], flow_to_warp resampled at positions
+                shifted by base_flow.
+        """
+        B, _C, H, W = flow_to_warp.shape
+
+        grid_y, grid_x = torch.meshgrid(
+            torch.linspace(-1, 1, H, device=flow_to_warp.device,
+                           dtype=flow_to_warp.dtype),
+            torch.linspace(-1, 1, W, device=flow_to_warp.device,
+                           dtype=flow_to_warp.dtype),
+            indexing="ij",
+        )
+        grid = torch.stack([grid_x, grid_y], dim=-1)  # [H, W, 2]
+        grid = grid.unsqueeze(0).expand(B, -1, -1, -1)  # [B, H, W, 2]
+
+        flow_perm = base_flow.permute(0, 2, 3, 1)  # [B, H, W, 2]
+        flow_norm = flow_perm.clone()
+        flow_norm[..., 0] = flow_norm[..., 0] / (W - 1) * 2.0
+        flow_norm[..., 1] = flow_norm[..., 1] / (H - 1) * 2.0
+
+        warped = F.grid_sample(
+            flow_to_warp,
+            grid + flow_norm,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=True,
+        )
+        return warped
+
+    def _compute_centeredness(
+        self, H: int, W: int, device: torch.device, dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Compute centeredness mask [1, 1, H, W] with Gaussian falloff.
+
+        Returns values in [0, 1] where 0 = edge, 1 = center.
+        Mask is cached by (H, W, device).
+        """
+        key = (H, W, device)
+        if key in self._centeredness_cache:
+            return self._centeredness_cache[key]
+
+        y_coords = torch.arange(H, device=device, dtype=dtype)
+        x_coords = torch.arange(W, device=device, dtype=dtype)
+        yy, xx = torch.meshgrid(y_coords, x_coords, indexing="ij")
+
+        dist_top = yy
+        dist_bottom = (H - 1) - yy
+        dist_left = xx
+        dist_right = (W - 1) - xx
+
+        dist_edge = torch.min(
+            torch.min(dist_top, dist_bottom),
+            torch.min(dist_left, dist_right),
+        )
+
+        half_min = min(H, W) / 2.0
+        edge_proximity = dist_edge / half_min
+
+        centeredness = 1.0 - torch.exp(
+            -(edge_proximity ** 2) / (2.0 * self._edge_sigma ** 2)
+        )
+
+        centeredness = centeredness.unsqueeze(0).unsqueeze(0)
+        self._centeredness_cache[key] = centeredness
+        return centeredness
+
+
 def build_teleport_detector(cfg: Optional[dict]) -> Optional[TeleportDetector]:
     """Factory: create a ``TeleportDetector`` instance from a config dict.
 
@@ -393,7 +705,28 @@ def build_teleport_detector(cfg: Optional[dict]) -> Optional[TeleportDetector]:
             flow_model_path=cfg.get("flow_model_path"),
         )
 
+    if det_type in ("multi_frame", "multi_frame_chained"):
+        return MultiFrameFlowDetector(
+            tau=cfg.get("tau", 5),
+            mode="chained",
+            downsample_factor=cfg.get("downsample_factor", 4),
+            edge_sigma=cfg.get("edge_sigma", 0.15),
+            flow_backend=cfg.get("flow_backend", "raft_small"),
+            flow_model_path=cfg.get("flow_model_path"),
+        )
+
+    if det_type == "multi_frame_direct":
+        return MultiFrameFlowDetector(
+            tau=cfg.get("tau", 5),
+            mode="direct",
+            downsample_factor=cfg.get("downsample_factor", 4),
+            edge_sigma=cfg.get("edge_sigma", 0.15),
+            flow_backend=cfg.get("flow_backend", "raft_small"),
+            flow_model_path=cfg.get("flow_model_path"),
+        )
+
     raise ValueError(
         f"Unknown teleport.detector.type: {det_type!r}. "
-        "Supported: ['optical_flow', 'optical_flow_no_raft', 'disabled']"
+        "Supported: ['optical_flow', 'optical_flow_no_raft', "
+        "'multi_frame', 'multi_frame_chained', 'multi_frame_direct', 'disabled']"
     )
