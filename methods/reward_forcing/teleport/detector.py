@@ -209,6 +209,27 @@ class OpticalFlowTeleportDetector(TeleportDetector):
 
         self._load_flow_model()
 
+        # RAFT internally downsamples by 8x and requires feature maps >= 16x16.
+        # If our input is too small (H/8 < 16 or W/8 < 16), upsample to the
+        # minimum size before feeding to RAFT, then downsample results back.
+        raft_min = 128  # 8 * 16
+        need_upsample = H < raft_min or W < raft_min
+        if need_upsample:
+            scale_h = max(raft_min / H, 1.0)
+            scale_w = max(raft_min / W, 1.0)
+            scale = max(scale_h, scale_w)
+            new_h = int(H * scale)
+            new_w = int(W * scale)
+            rgb_raft = F.interpolate(
+                rgb.reshape(B * T, _C, H, W),
+                size=(new_h, new_w),
+                mode="bilinear",
+                align_corners=False,
+            ).reshape(B, T, _C, new_h, new_w)
+        else:
+            rgb_raft = rgb
+            new_h, new_w = H, W
+
         results: list[torch.Tensor] = []
         for t in range(T):
             if t == 0:
@@ -217,8 +238,8 @@ class OpticalFlowTeleportDetector(TeleportDetector):
                 )
                 continue
 
-            frame_prev = rgb[:, t - 1]  # [B, 3, H, W]
-            frame_curr = rgb[:, t]       # [B, 3, H, W]
+            frame_prev = rgb_raft[:, t - 1]  # [B, 3, new_h, new_w]
+            frame_curr = rgb_raft[:, t]       # [B, 3, new_h, new_w]
 
             # RAFT expects values in [0, 1]
             flow = self._flow_model(frame_prev, frame_curr)
@@ -230,7 +251,15 @@ class OpticalFlowTeleportDetector(TeleportDetector):
             warped = self._warp_frame(frame_prev, flow)
 
             # Residual
-            residual = (frame_curr - warped).abs().mean(dim=1)  # [B, H, W]
+            residual = (frame_curr - warped).abs().mean(dim=1)  # [B, new_h, new_w]
+
+            # Downsample residual back to original H, W if we upsampled
+            if need_upsample:
+                residual = F.interpolate(
+                    residual.unsqueeze(1), size=(H, W), mode="bilinear",
+                    align_corners=False,
+                ).squeeze(1)
+
             results.append(residual)
 
         return torch.stack(results, dim=1)  # [B, T, H, W]
