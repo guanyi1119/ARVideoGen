@@ -89,13 +89,22 @@ def compute_teleport_rate(
     rgb: torch.Tensor,
     detector: Any,
     threshold: float,
+    min_event_area_ratio: float = 0.001,
 ) -> dict[str, float | int]:
     """Run detector on a video tensor and aggregate score map into a rate.
+
+    A frame is counted as a teleport event only when the *fraction* of
+    spatial positions whose score exceeds *threshold* is larger than
+    *min_event_area_ratio*.  This replaces the previous per-pixel-max
+    aggregation that caused every frame with any motion or noise to be
+    counted as an event when RAFT was not used.
 
     Args:
         rgb: [1, T, 3, H, W] float tensor in [0, 1].
         detector: A TeleportDetector instance.
-        threshold: Score threshold for counting a frame as a teleport event.
+        threshold: Score threshold for a single spatial position.
+        min_event_area_ratio: Minimum fraction of spatial positions above
+            *threshold* for the frame to count as a teleport event.
 
     Returns:
         Dict with keys ``teleport_rate``, ``frame_count``, ``event_count``.
@@ -103,9 +112,10 @@ def compute_teleport_rate(
     score_map = detector.score(rgb).detach()  # [1, T, 1, H', W']
     T = rgb.shape[1]
 
-    # Per-frame max score across all spatial positions
-    frame_max = score_map[0, :, 0, :, :].amax(dim=(1, 2))  # [T]
-    event_count = int((frame_max > threshold).sum().item())
+    # Per-frame fraction of spatial positions exceeding the threshold
+    score_2d = score_map[0, :, 0, :, :]  # [T, H', W']
+    frame_area_ratio = (score_2d > threshold).float().mean(dim=(1, 2))  # [T]
+    event_count = int((frame_area_ratio > min_event_area_ratio).sum().item())
     teleport_rate = event_count / T if T > 0 else 0.0
 
     return {
@@ -120,6 +130,7 @@ def evaluate_directory(
     output_path: str,
     max_videos: int | None = None,
     threshold: float = 0.3,
+    min_event_area_ratio: float = 0.001,
     device: str = "auto",
     use_raft: bool = False,
 ) -> dict[str, Any]:
@@ -129,7 +140,9 @@ def evaluate_directory(
         video_dir: Path to directory containing .mp4 files.
         output_path: Where to write the JSON report.
         max_videos: Limit to the first N videos (sorted alphabetically).
-        threshold: Score threshold for teleport event detection.
+        threshold: Score threshold for a single spatial position.
+        min_event_area_ratio: Minimum fraction of spatial positions above
+            *threshold* for a frame to count as a teleport event.
         device: ``"auto"``, ``"cpu"``, or ``"cuda"``.
         use_raft: If True, use RAFT optical flow backend (requires GPU).
 
@@ -179,7 +192,7 @@ def evaluate_directory(
             logger.warning("Failed to load %s, skipping", mp4_path.name, exc_info=True)
             continue
         rgb = rgb.to(device)
-        result = compute_teleport_rate(rgb, detector, threshold)
+        result = compute_teleport_rate(rgb, detector, threshold, min_event_area_ratio)
         per_video[mp4_path.name] = result
 
     if not per_video:
@@ -240,6 +253,16 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Score threshold for counting a frame as a teleport event (default: 0.3).",
     )
     parser.add_argument(
+        "--min_event_area_ratio",
+        type=float,
+        default=0.001,
+        help=(
+            "Minimum fraction of spatial positions above score_threshold for a "
+            "frame to count as a teleport event (default: 0.001). "
+            "Increase to reduce false positives from noise / normal motion."
+        ),
+    )
+    parser.add_argument(
         "--device",
         default="auto",
         choices=["auto", "cpu", "cuda", "npu"],
@@ -268,6 +291,7 @@ def main(argv: list[str] | None = None) -> None:
         output_path=args.output,
         max_videos=args.max_videos,
         threshold=args.score_threshold,
+        min_event_area_ratio=args.min_event_area_ratio,
         device=args.device,
         use_raft=args.use_raft,
     )

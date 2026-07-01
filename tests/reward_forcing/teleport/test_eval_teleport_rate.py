@@ -75,6 +75,58 @@ def _make_emergence_clip(
     return clip
 
 
+def _make_smooth_motion_clip(
+    T: int = 16, H: int = 64, W: int = 64
+) -> torch.Tensor:
+    """Synthetic clip: a bright Gaussian blob moves 1 px/frame right.
+
+    The Gaussian blur ensures frame-to-frame differences are moderate,
+    unlike hard-edged squares that produce artificially high frame diffs.
+    This simulates normal smooth motion that should NOT produce a high
+    teleport rate.
+
+    Returns:
+        Tensor [1, T, 3, H, W] in [0, 1].
+    """
+    clip = torch.zeros(1, T, 3, H, W)
+    cy, cx = H // 2, W // 4  # start left of center
+    radius = 6
+
+    for t in range(T):
+        # Gaussian-weighted circle
+        yy, xx = torch.meshgrid(
+            torch.arange(H, dtype=torch.float32),
+            torch.arange(W, dtype=torch.float32),
+            indexing="ij",
+        )
+        dist = ((yy - cy) ** 2 + (xx - (cx + t)) ** 2).sqrt()  # move right
+        gauss = torch.exp(-(dist**2) / (2.0 * radius**2))
+        # Clamp to [0, 1] and set all 3 channels
+        gauss = gauss.clamp(0.0, 1.0)
+        clip[0, t, 0] = gauss
+        clip[0, t, 1] = gauss
+        clip[0, t, 2] = gauss
+
+    return clip
+
+
+def _make_noisy_clip(
+    T: int = 16, H: int = 64, W: int = 64, noise_std: float = 0.01
+) -> torch.Tensor:
+    """Synthetic clip: constant gray with small Gaussian noise per frame.
+
+    Simulates camera sensor noise or mild compression artifacts.  With the
+    old max-pixel aggregation every frame would be an event; with the
+    area-aware aggregation this should produce zero events.
+
+    Returns:
+        Tensor [1, T, 3, H, W] in [0, 1].
+    """
+    clip = torch.full((1, T, 3, H, W), 0.5)
+    clip += torch.randn(1, T, 3, H, W) * noise_std
+    return clip.clamp(0.0, 1.0)
+
+
 def _make_detector() -> OpticalFlowTeleportDetector:
     """Create a CPU-safe no-RAFT detector."""
     return OpticalFlowTeleportDetector(flow_backend="none", downsample_factor=4)
@@ -110,6 +162,7 @@ class TestCLI:
         assert "--output" in stdout
         assert "--max_videos" in stdout
         assert "--score_threshold" in stdout
+        assert "--min_event_area_ratio" in stdout
         assert "--device" in stdout
 
 
@@ -171,6 +224,84 @@ class TestComputeTeleportRate:
         result = compute_teleport_rate(rgb, det, threshold=1.0)
         assert result["event_count"] == 0
         assert result["teleport_rate"] == 0.0
+
+    # ------------------------------------------------------------------
+    # Area-aware aggregation — the bugfix
+    # ------------------------------------------------------------------
+
+    def test_smooth_motion_produces_low_rate(self):
+        """Smooth Gaussian blob motion should NOT produce a high teleport rate.
+
+        With the old max-pixel aggregation this would be near 1.0 because
+        any moving edge pixel crosses the threshold.  Area-aware aggregation
+        (default min_event_area_ratio=0.001) should filter these out.
+        """
+        det = _make_detector()
+        rgb = _make_smooth_motion_clip(T=16)
+        result = compute_teleport_rate(rgb, det, threshold=0.3)
+        # With smooth Gaussian motion, frame_diff at edges is moderate,
+        # so the area above threshold should be very small.
+        assert result["teleport_rate"] <= 0.3, (
+            f"Smooth motion should have low teleport_rate, got {result['teleport_rate']}"
+        )
+
+    def test_noisy_clip_zero_events(self):
+        """Noisy gray clip (sensor noise) should yield zero events.
+
+        Small per-frame noise should not cause teleport detection when
+        using area-aware aggregation.
+        """
+        det = _make_detector()
+        torch.manual_seed(42)
+        rgb = _make_noisy_clip(T=16, noise_std=0.02)
+        result = compute_teleport_rate(rgb, det, threshold=0.3)
+        assert result["event_count"] == 0, (
+            f"Noise alone should not trigger events, got {result['event_count']}"
+        )
+        assert result["teleport_rate"] == 0.0
+
+    def test_min_event_area_ratio_controls_sensitivity(self):
+        """Higher min_event_area_ratio reduces event count."""
+        det = _make_detector()
+        rgb = _make_emergence_clip(position="center", T=8, onset_frame=5)
+
+        # With default ratio → should detect the emergence
+        r_default = compute_teleport_rate(rgb, det, threshold=0.3)
+        assert r_default["event_count"] >= 1
+
+        # With very high ratio → should detect nothing
+        r_strict = compute_teleport_rate(
+            rgb, det, threshold=0.3, min_event_area_ratio=1.0
+        )
+        assert r_strict["event_count"] == 0
+
+    def test_min_event_area_ratio_zero_matches_old_behavior(self):
+        """min_event_area_ratio=0.0 is equivalent to max-pixel aggregation."""
+        det = _make_detector()
+        # Use a hard-edged moving square that produces frame_max > 0.3
+        # at the leading/trailing edge (like real video motion)
+        T, H, W = 16, 64, 64
+        rgb = torch.zeros(1, T, 3, H, W)
+        for t in range(T):
+            x_start = t  # moves 1 px/frame right
+            rgb[0, t, :, 28:36, x_start : x_start + 8] = 1.0
+
+        # With ratio=0.0 → every frame where any pixel exceeds threshold is an event
+        r_old = compute_teleport_rate(
+            rgb, det, threshold=0.3, min_event_area_ratio=0.0
+        )
+        # Hard-edge moving square: some frames have frame_max > 0.3
+        assert r_old["teleport_rate"] >= 0.3, (
+            f"ratio=0.0 should match old max-pixel behavior, got {r_old}"
+        )
+
+        # With ratio=1.0 → nothing can possibly trigger
+        r_strict = compute_teleport_rate(
+            rgb, det, threshold=0.3, min_event_area_ratio=1.0
+        )
+        assert r_strict["event_count"] == 0, (
+            f"ratio=1.0 should block all events, got {r_strict}"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +398,7 @@ class TestEvaluateDirectory:
         call_count = [0]
         rates = [0.1, 0.2, 0.3]
 
-        def _fake_compute(rgb, detector, threshold):
+        def _fake_compute(rgb, detector, threshold, min_event_area_ratio=0.001):
             idx = call_count[0]
             call_count[0] += 1
             return {"teleport_rate": rates[idx], "frame_count": 10, "event_count": 1}
