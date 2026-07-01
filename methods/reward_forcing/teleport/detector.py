@@ -209,17 +209,18 @@ class OpticalFlowTeleportDetector(TeleportDetector):
 
         self._load_flow_model()
 
-        # RAFT internally downsamples by 8x and requires feature maps >= 16x16.
-        # If our input is too small (H/8 < 16 or W/8 < 16), upsample to the
-        # minimum size before feeding to RAFT, then downsample results back.
+        # RAFT internally downsamples by 8x and requires:
+        # 1. Feature maps >= 16x16 (so input >= 128x128)
+        # 2. Input dimensions divisible by 8
+        # If our input is too small, upsample to meet both constraints.
         raft_min = 128  # 8 * 16
-        need_upsample = H < raft_min or W < raft_min
+        need_upsample = H < raft_min or W < raft_min or H % 8 != 0 or W % 8 != 0
         if need_upsample:
-            scale_h = max(raft_min / H, 1.0)
-            scale_w = max(raft_min / W, 1.0)
-            scale = max(scale_h, scale_w)
-            new_h = int(H * scale)
-            new_w = int(W * scale)
+            new_h = max(H, raft_min)
+            new_w = max(W, raft_min)
+            # Round up to nearest multiple of 8
+            new_h = ((new_h + 7) // 8) * 8
+            new_w = ((new_w + 7) // 8) * 8
             rgb_raft = F.interpolate(
                 rgb.reshape(B * T, _C, H, W),
                 size=(new_h, new_w),
