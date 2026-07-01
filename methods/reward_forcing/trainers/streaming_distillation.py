@@ -756,6 +756,11 @@ class Trainer:
             if max_checkpoints > 0:
                 self.cleanup_old_checkpoints(self.output_path, max_checkpoints)
 
+        # Release large FSDP state dict tensors to avoid residual memory retention.
+        # state_dict holds full-rank copies; explicitly clearing it before gc helps
+        # the collector reclaim pages sooner.
+        del state_dict
+
         torch.cuda.empty_cache()
         import gc
         gc.collect()
@@ -804,8 +809,8 @@ class Trainer:
             if LOG_GPU_MEMORY:
                 log_gpu_memory("After train_generator backward pass", device=self.device, rank=dist.get_rank())
             # Return original loss for logging
-            generator_log_dict.update({"generator_loss": generator_loss,
-                                       "generator_grad_norm": torch.tensor(0.0, device=self.device)})  # Will be computed after accumulation
+            generator_log_dict.update({"generator_loss": generator_loss.detach(),
+                                        "generator_grad_norm": torch.tensor(0.0, device=self.device)})  # Will be computed after accumulation
 
             return generator_log_dict
         else:
@@ -825,7 +830,7 @@ class Trainer:
         if LOG_GPU_MEMORY:
             log_gpu_memory("After train_critic backward pass", device=self.device, rank=dist.get_rank())
         # Return original loss for logging
-        critic_log_dict.update({"critic_loss": critic_loss,
+        critic_log_dict.update({"critic_loss": critic_loss.detach(),
                                 "critic_grad_norm": torch.tensor(0.0, device=self.device)})  # Will be computed after accumulation
 
         return critic_log_dict
@@ -1069,7 +1074,7 @@ class Trainer:
                 raise
 
             generator_log_dict.update({
-                "generator_loss": generator_loss,
+                "generator_loss": generator_loss.detach(),
                 "generator_grad_norm": torch.tensor(0.0, device=self.device),
             })
             
@@ -1114,7 +1119,7 @@ class Trainer:
             scaled_critic_loss.backward()
             
             critic_log_dict.update({
-                "critic_loss": critic_loss,
+                "critic_loss": critic_loss.detach(),
                 "critic_grad_norm": torch.tensor(0.0, device=self.device),
             })
             
@@ -1499,6 +1504,17 @@ class Trainer:
             # After saving current length videos, release related tensors to reduce peak memory
             del videos, video_np, video_tensor  # type: ignore
             torch.cuda.empty_cache()
+
+        # Release visualization pipeline KV/cross-attention caches to reclaim
+        # memory (~9 GB for 240 frames with 30 transformer blocks) before
+        # continuing training.  Prefer release_kv_cache (sets refs to None so
+        # allocator reclaims pages); fall back to clear_kv_cache (zeroes in-place).
+        if hasattr(self.vis_pipeline, "release_kv_cache"):
+            self.vis_pipeline.release_kv_cache()
+        elif hasattr(self.vis_pipeline, "clear_kv_cache"):
+            self.vis_pipeline.clear_kv_cache()
+        if hasattr(self.vis_pipeline.vae, "model") and hasattr(self.vis_pipeline.vae.model, "clear_cache"):
+            self.vis_pipeline.vae.model.clear_cache()
 
         torch.cuda.empty_cache()
         import gc

@@ -222,21 +222,28 @@ class ReDMD(RewardForcingModel):
         teleport_weight_map = None
         teleport_aux_loss_val = None
         teleport_log = {}
-        if self._teleport_mode == "reweight" and self._teleport_detector is not None:
+        # Use getattr so mocks / partial instances (e.g. _FakeReDMD in tests)
+        # that skip ReDMD.__init__ default to "off" behaviour without AttributeError.
+        _tmode = getattr(self, "_teleport_mode", "off")
+        _tdet = getattr(self, "_teleport_detector", None)
+        _trw = getattr(self, "_teleport_reweighter", None)
+        _taux = getattr(self, "_teleport_aux_loss", None)
+        _tbeta = getattr(self, "_teleport_aux_beta", 1.0)
+        if _tmode == "reweight" and _tdet is not None:
             with torch.no_grad():
                 # detector input: pixels in [0,1], shape [B,T,3,H,W]
                 # `videos` is already (1+pixels)/2.0 in [0,1] shape [B,T,3,H,W]
-                student_score = self._teleport_detector.score(videos).detach()
-            teleport_weight_map = self._teleport_reweighter.compute_weight(
+                student_score = _tdet.score(videos).detach()
+            teleport_weight_map = _trw.compute_weight(
                 student_score,
                 teacher_score=None,  # teacher path is tel_det_regular+ optional extension
             )
             teleport_log["teleport_score_mean"] = student_score.mean().detach()
             teleport_log["teleport_weight_mean"] = teleport_weight_map.mean().detach()
-        elif self._teleport_mode == "aux_loss" and self._teleport_detector is not None:
+        elif _tmode == "aux_loss" and _tdet is not None:
             # grad-attached path for aux_loss
-            student_score_grad = self._teleport_detector.score(videos)
-            teleport_aux_loss_val = self._teleport_aux_loss(student_score_grad)
+            student_score_grad = _tdet.score(videos)
+            teleport_aux_loss_val = _taux(student_score_grad)
             teleport_log["teleport_score_mean"] = student_score_grad.mean().detach()
             teleport_log["teleport_aux_loss"] = teleport_aux_loss_val.detach()
 
@@ -315,7 +322,7 @@ class ReDMD(RewardForcingModel):
 
         # Aux loss adds AFTER the multiplicative reward structure
         if teleport_aux_loss_val is not None:
-            rl_dmd_loss = rl_dmd_loss + self._teleport_aux_beta * teleport_aux_loss_val
+            rl_dmd_loss = rl_dmd_loss + _tbeta * teleport_aux_loss_val
 
         rl_dmd_log_dict.update(teleport_log)
         return rl_dmd_loss, rl_dmd_log_dict

@@ -311,3 +311,34 @@ class CausalInferencePipeline(torch.nn.Module):
                 "is_init": False
             })
         self.crossattn_cache = crossattn_cache
+
+    def clear_kv_cache(self):
+        """
+        Zero out all tensors in KV cache and cross-attention cache.
+        Preserves memory allocation while clearing old information, avoiding reallocation overhead.
+        """
+        # Clear KV cache
+        if getattr(self, "kv_cache1", None) is not None:
+            for blk in self.kv_cache1:
+                blk["k"].zero_()
+                blk["v"].zero_()
+                if "global_end_index" in blk:
+                    blk["global_end_index"].zero_()
+                if "local_end_index" in blk:
+                    blk["local_end_index"].zero_()
+
+        # Clear cross-attention cache
+        if getattr(self, "crossattn_cache", None) is not None:
+            for blk in self.crossattn_cache:
+                blk["k"].zero_()
+                blk["v"].zero_()
+                blk["is_init"] = False
+
+    def release_kv_cache(self):
+        """
+        Release KV and cross-attention cache tensors so the allocator can reclaim memory.
+        Next ``inference()`` call will reinitialize caches from scratch (checked via
+        ``self.kv_cache1 is None`` at inference entry).
+        """
+        self.kv_cache1 = None
+        self.crossattn_cache = None
