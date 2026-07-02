@@ -39,6 +39,12 @@ class StreamingCausalInferencePipeline(CausalInferencePipeline):
         conditional_dict = self.text_encoder(
             text_prompts=text_prompts
         )
+        # Encode negative prompt for enlarged CFG (zeroed cache + neg prompt)
+        unconditional_dict = self.text_encoder(
+            text_prompts=[self.args.negative_prompt] * batch_size
+        )
+        # Hardcoded CFG scale for inference (0 = disabled, 1.0 = standard)
+        KV_CACHE_CFG_SCALE = 1.0
 
         if low_memory:
             gpu_memory_preservation = get_cuda_free_memory_gb(gpu) + 5
@@ -105,8 +111,15 @@ class StreamingCausalInferencePipeline(CausalInferencePipeline):
 
             for index, current_timestep in enumerate(self.denoising_step_list):
                 timestep = torch.ones([batch_size, current_num_frames], device=noise.device, dtype=torch.int64) * current_timestep
+
+                # --- Enlarged CFG: dual generation per denoising step ---
+                # Save pre-step KV cache and cross-attn cache
+                pre_step_cache = self._save_kv_cache()
+                pre_step_ca = self._save_crossattn_cache()
+
                 if index < len(self.denoising_step_list) - 1:
-                    _, denoised_pred = self.generator(
+                    # Full cache + positive prompt
+                    _, denoised_pred_full = self.generator(
                         noisy_image_or_video=noisy_input,
                         conditional_dict=conditional_dict,
                         timestep=timestep,
@@ -114,6 +127,36 @@ class StreamingCausalInferencePipeline(CausalInferencePipeline):
                         crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length,
                     )
+                    # Save post-full cache
+                    post_step_cache = self._save_kv_cache()
+                    post_step_ca = self._save_crossattn_cache()
+
+                    # Restore pre-step, zero KV cache, reset cross-attn for neg prompt
+                    self._restore_kv_cache(pre_step_cache)
+                    self._zero_kv_cache()
+                    for blk in self.crossattn_cache:
+                        blk["is_init"] = False
+
+                    # Zeroed cache + negative prompt (no grad)
+                    with torch.no_grad():
+                        _, denoised_pred_zeroed = self.generator(
+                            noisy_image_or_video=noisy_input,
+                            conditional_dict=unconditional_dict,
+                            timestep=timestep,
+                            kv_cache=self.kv_cache1,
+                            crossattn_cache=self.crossattn_cache,
+                            current_start=current_start_frame * self.frame_seq_length,
+                        )
+
+                    # CFG combine
+                    denoised_pred = denoised_pred_zeroed + KV_CACHE_CFG_SCALE * (
+                        denoised_pred_full - denoised_pred_zeroed
+                    )
+
+                    # Restore post-full cache for next step
+                    self._restore_kv_cache(post_step_cache)
+                    self._restore_crossattn_cache(post_step_ca)
+
                     next_timestep = self.denoising_step_list[index + 1]
                     noisy_input = self.scheduler.add_noise(
                         denoised_pred.flatten(0, 1),
@@ -121,7 +164,8 @@ class StreamingCausalInferencePipeline(CausalInferencePipeline):
                         next_timestep * torch.ones([batch_size * current_num_frames], device=noise.device, dtype=torch.long),
                     ).unflatten(0, denoised_pred.shape[:2])
                 else:
-                    _, denoised_pred = self.generator(
+                    # Full cache + positive prompt
+                    _, denoised_pred_full = self.generator(
                         noisy_image_or_video=noisy_input,
                         conditional_dict=conditional_dict,
                         timestep=timestep,
@@ -129,6 +173,35 @@ class StreamingCausalInferencePipeline(CausalInferencePipeline):
                         crossattn_cache=self.crossattn_cache,
                         current_start=current_start_frame * self.frame_seq_length,
                     )
+                    # Save post-full cache
+                    post_step_cache = self._save_kv_cache()
+                    post_step_ca = self._save_crossattn_cache()
+
+                    # Restore pre-step, zero KV cache, reset cross-attn for neg prompt
+                    self._restore_kv_cache(pre_step_cache)
+                    self._zero_kv_cache()
+                    for blk in self.crossattn_cache:
+                        blk["is_init"] = False
+
+                    # Zeroed cache + negative prompt (no grad)
+                    with torch.no_grad():
+                        _, denoised_pred_zeroed = self.generator(
+                            noisy_image_or_video=noisy_input,
+                            conditional_dict=unconditional_dict,
+                            timestep=timestep,
+                            kv_cache=self.kv_cache1,
+                            crossattn_cache=self.crossattn_cache,
+                            current_start=current_start_frame * self.frame_seq_length,
+                        )
+
+                    # CFG combine
+                    denoised_pred = denoised_pred_zeroed + KV_CACHE_CFG_SCALE * (
+                        denoised_pred_full - denoised_pred_zeroed
+                    )
+
+                    # Restore post-full cache for next step
+                    self._restore_kv_cache(post_step_cache)
+                    self._restore_crossattn_cache(post_step_ca)
 
             output[:, current_start_frame : current_start_frame + current_num_frames] = denoised_pred.to(output.device)
 

@@ -342,3 +342,71 @@ class CausalInferencePipeline(torch.nn.Module):
         """
         self.kv_cache1 = None
         self.crossattn_cache = None
+
+    # ------------------------------------------------------------------
+    # KV Cache helpers for enlarged CFG (dual generation per denoising step)
+    # ------------------------------------------------------------------
+
+    def _get_sink_size(self) -> int:
+        """Retrieve sink_size from the underlying causal model."""
+        try:
+            model = self.generator.model
+            blocks = getattr(model, 'blocks', None)
+            if blocks is not None and len(blocks) > 0:
+                attn = getattr(blocks[0], 'self_attn', None)
+                if attn is not None:
+                    return getattr(attn, 'sink_size', 0)
+        except Exception:
+            pass
+        return 0
+
+    def _save_kv_cache(self) -> list:
+        """Deep-copy the full KV cache state so it can be restored later."""
+        saved = []
+        for blk in self.kv_cache1:
+            saved.append({
+                "k": blk["k"].clone(),
+                "v": blk["v"].clone(),
+                "global_end_index": blk["global_end_index"].clone(),
+                "local_end_index": blk["local_end_index"].clone(),
+            })
+        return saved
+
+    def _restore_kv_cache(self, saved: list):
+        """Restore KV cache from a previously saved snapshot."""
+        for blk, sb in zip(self.kv_cache1, saved):
+            blk["k"].copy_(sb["k"])
+            blk["v"].copy_(sb["v"])
+            blk["global_end_index"].copy_(sb["global_end_index"])
+            blk["local_end_index"].copy_(sb["local_end_index"])
+
+    def _zero_kv_cache(self):
+        """Zero out both sink and window portions of the KV cache (always, for inference CFG)."""
+        sink_size = self._get_sink_size()
+        total_sink_tokens = sink_size * self.frame_seq_length
+        for kv_cache in self.kv_cache1:
+            local_end = kv_cache["local_end_index"].item()
+            if total_sink_tokens > 0:
+                kv_cache["k"][:, :total_sink_tokens].zero_()
+                kv_cache["v"][:, :total_sink_tokens].zero_()
+            if local_end > total_sink_tokens:
+                kv_cache["k"][:, total_sink_tokens:local_end].zero_()
+                kv_cache["v"][:, total_sink_tokens:local_end].zero_()
+
+    def _save_crossattn_cache(self) -> list:
+        """Deep-copy the cross-attention cache state."""
+        saved = []
+        for blk in self.crossattn_cache:
+            saved.append({
+                "k": blk["k"].clone(),
+                "v": blk["v"].clone(),
+                "is_init": blk["is_init"],
+            })
+        return saved
+
+    def _restore_crossattn_cache(self, saved: list):
+        """Restore cross-attention cache from a previously saved snapshot."""
+        for blk, sb in zip(self.crossattn_cache, saved):
+            blk["k"].copy_(sb["k"])
+            blk["v"].copy_(sb["v"])
+            blk["is_init"] = sb["is_init"]

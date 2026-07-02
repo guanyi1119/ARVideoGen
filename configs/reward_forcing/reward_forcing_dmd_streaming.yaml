@@ -99,6 +99,12 @@ train_first_chunk: true
 sink_kv_cache_zero_prob: 0.1
 window_kv_cache_zero_prob: 0.1
 
+# Enlarged CFG: probability of using the negative prompt (instead of the
+# positive prompt) when generating the zeroed-cache chunk.  Combined with
+# sink/window zeroing, this creates a stronger uncond signal.
+# Range: 0.0–1.0 (0.0 = disabled, use positive prompt for zeroed generation).
+neg_prompt_zero_prob: 0.0
+
 last_step_only: false
 
 # ---------------------------------------------------------------------------

@@ -76,6 +76,7 @@ class StreamingTrainingModel:
         # original implementation.
         self.sink_kv_cache_zero_prob = float(getattr(config, "sink_kv_cache_zero_prob", 0.0))
         self.window_kv_cache_zero_prob = float(getattr(config, "window_kv_cache_zero_prob", 0.0))
+        self.neg_prompt_zero_prob = float(getattr(config, "neg_prompt_zero_prob", 0.0))
         
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"[StreamingTrain-Model] streamingTrainingModel initialized:")
@@ -385,6 +386,28 @@ class StreamingTrainingModel:
                 # reference for the uncond CFG path, not the main output).
                 zeroed_kwargs = dict(kwargs)
                 zeroed_kwargs["requires_grad"] = False
+
+                # Randomly use negative prompt for zeroed-cache generation
+                # (enlarged CFG: degraded cache + negative prompt = stronger uncond signal)
+                use_neg_prompt = False
+                if self.neg_prompt_zero_prob > 0:
+                    decisions_neg = torch.zeros(1, device=self.device, dtype=torch.float32)
+                    if dist.is_initialized():
+                        if dist.get_rank() == 0:
+                            decisions_neg[0] = _random.random()
+                        dist.broadcast(decisions_neg, src=0)
+                    else:
+                        decisions_neg[0] = _random.random()
+                    use_neg_prompt = decisions_neg[0].item() < self.neg_prompt_zero_prob
+
+                if use_neg_prompt:
+                    zeroed_kwargs["conditional_dict"] = self.state["conditional_info"]["unconditional_dict"]
+                    if not dist.is_initialized() or dist.get_rank() == 0:
+                        print(
+                            f"[StreamingTrain-Model] Using NEGATIVE prompt for zeroed-cache generation "
+                            f"at chunk_start_frame={chunk_start_frame}"
+                        )
+
                 with torch.no_grad():
                     output_zeroed, _, _ = self.inference_pipeline.generate_chunk_with_cache(**zeroed_kwargs)
                 output_zeroed = output_zeroed.detach()
@@ -394,7 +417,8 @@ class StreamingTrainingModel:
                         f"[StreamingTrain-Model] Unified CFG fired at "
                         f"chunk_start_frame={chunk_start_frame}: "
                         f"sink_cache_zeroed={zero_info['zero_sink']}, "
-                        f"window_cache_zeroed={zero_info['zero_window']} → "
+                        f"window_cache_zeroed={zero_info['zero_window']}, "
+                        f"neg_prompt={use_neg_prompt} → "
                         f"second generation with degraded cache produced "
                         f"(shape={output_zeroed.shape}), used as uncond reference"
                     )

@@ -113,6 +113,10 @@ train_first_chunk: true
 sink_kv_cache_zero_prob: 0.1
 window_kv_cache_zero_prob: 0.1
 
+# Enlarged CFG: probability of using the negative prompt (instead of the
+# positive prompt) when generating the zeroed-cache chunk.
+neg_prompt_zero_prob: 0.0
+
 last_step_only: false
 
 # ---------------------------------------------------------------------------
