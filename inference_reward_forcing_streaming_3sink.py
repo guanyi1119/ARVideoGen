@@ -67,6 +67,10 @@ parser.add_argument("--use_ema", action="store_true", help="Use EMA weights")
 parser.add_argument("--seed", type=int, default=0)
 parser.add_argument("--num_samples", type=int, default=1)
 parser.add_argument("--save_with_index", action="store_true")
+parser.add_argument("--enlarged_cfg_scale", type=float, default=0.0,
+                    help="Enlarged CFG scale for inference (0.0=disabled, 1.0=standard). "
+                         "When >0, each denoising step runs twice: full cache + pos prompt vs "
+                         "zeroed cache + neg prompt, then CFG-combines the predictions.")
 args_cli = parser.parse_args()
 
 default_config_path = os.path.join(os.path.dirname(args_cli.config_path), "default_config.yaml")
@@ -89,6 +93,7 @@ config.use_ema = args_cli.use_ema
 config.seed = args_cli.seed
 config.num_samples = args_cli.num_samples
 config.save_with_index = args_cli.save_with_index
+config.enlarged_cfg_scale = args_cli.enlarged_cfg_scale
 config.switch_data_path = args_cli.switch_data_path
 config.multi_prompts = bool(args_cli.multi_prompts)
 use_multi = config.multi_prompts
