@@ -122,9 +122,9 @@ teleport:
 
   # === T10: tel_det_regular teleport mitigation (mutex-gated, default off) ===
   tel_det_regular:
-    mode: "off"                          # off | reweight | aux_loss (mutex)
+    mode: "aux_loss"                          # off | reweight | aux_loss (mutex)
     # Metric aggregation thresholds (also used by scripts/eval_teleport_rate.py)
-    score_threshold: 0.3                 # per-pixel score threshold for event detection
+    score_threshold: 0.8                # per-pixel score threshold for event detection
     min_event_area_ratio: 0.001          # fraction of pixels above threshold to count a frame as event
     detector:
       type: multi_frame_chained          # multi_frame_chained | multi_frame_direct | optical_flow | optical_flow_no_raft | disabled
@@ -132,7 +132,7 @@ teleport:
       downsample_factor: 4
       flow_backend: raft_small           # raft_small | none
       edge_sigma: 0.15
-      # flow_model_path: /cache/raft_small_C_T_V2.pth  # optional local weight; omit to auto-download
+      flow_model_path: /cache/raft_small_C_T_V2.pth  # optional local weight; omit to auto-download
     reweighter:
       type: absolute                     # teacher_relative | absolute | thresholded | disabled
       alpha: 5.0

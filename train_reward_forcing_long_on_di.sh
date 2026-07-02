@@ -19,6 +19,7 @@ python -c "import moxing as mox; mox.file.copy('obs://yw-pixelgeek-training-data
 # python -c "import moxing as mox; mox.file.copy('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/data/DMDPrompts/pretrain_30w_15s_20230211_5-10s.txt', '/cache/vidprom_filtered_extended_switch.txt')"
 python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/models/VideoReward', '/cache/VideoReward')"
 python -c "import moxing as mox; mox.file.copy_parallel('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/models/Qwen2-VL-2B-Instruct', '/cache/Qwen2-VL-2B-Instruct')"
+python -c "import moxing as mox; mox.file.copy('obs://yw-pixelgeek-training-data-gy1/01.USERS/z00546255/models/raft_small_C_T_V2-01064c6d.pth', '/cache/raft_small_C_T_V2.pth')"
 
 # pretrained dmd model should be put here: /cache/reward_forcing_dmd.pt
 
