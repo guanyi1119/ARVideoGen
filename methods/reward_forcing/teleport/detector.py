@@ -209,6 +209,12 @@ class OpticalFlowTeleportDetector(TeleportDetector):
 
         self._load_flow_model()
 
+        # RAFT weights are fp32; training pixels may be bf16/fp16 under mixed
+        # precision.  Cast to fp32 for the RAFT forward pass, then cast the
+        # residual back to the caller dtype at the end.
+        input_dtype = rgb.dtype
+        rgb_fp32 = rgb.to(torch.float32) if rgb.dtype != torch.float32 else rgb
+
         # RAFT internally downsamples by 8x and requires:
         # 1. Feature maps >= 16x16 (so input >= 128x128)
         # 2. Input dimensions divisible by 8
@@ -222,20 +228,20 @@ class OpticalFlowTeleportDetector(TeleportDetector):
             new_h = ((new_h + 7) // 8) * 8
             new_w = ((new_w + 7) // 8) * 8
             rgb_raft = F.interpolate(
-                rgb.reshape(B * T, _C, H, W),
+                rgb_fp32.reshape(B * T, _C, H, W),
                 size=(new_h, new_w),
                 mode="bilinear",
                 align_corners=False,
             ).reshape(B, T, _C, new_h, new_w)
         else:
-            rgb_raft = rgb
+            rgb_raft = rgb_fp32
             new_h, new_w = H, W
 
         results: list[torch.Tensor] = []
         for t in range(T):
             if t == 0:
                 results.append(
-                    torch.zeros(B, H, W, device=rgb.device, dtype=rgb.dtype)
+                    torch.zeros(B, H, W, device=rgb.device, dtype=torch.float32)
                 )
                 continue
 
@@ -263,7 +269,8 @@ class OpticalFlowTeleportDetector(TeleportDetector):
 
             results.append(residual)
 
-        return torch.stack(results, dim=1)  # [B, T, H, W]
+        stacked = torch.stack(results, dim=1)  # [B, T, H, W], fp32
+        return stacked.to(input_dtype)
 
     @staticmethod
     def _warp_frame(frame: torch.Tensor, flow: torch.Tensor) -> torch.Tensor:
@@ -501,6 +508,12 @@ class MultiFrameFlowDetector(TeleportDetector):
 
         self._load_flow_model()
 
+        # RAFT weights are fp32; training pixels may be bf16/fp16 under mixed
+        # precision.  Cast to fp32 for the RAFT forward pass, then cast the
+        # residual back to the caller dtype at the end.
+        input_dtype = rgb.dtype
+        rgb_fp32 = rgb.to(torch.float32) if rgb.dtype != torch.float32 else rgb
+
         # RAFT requires H,W >= 128 and divisible by 8
         raft_min = 128
         need_upsample = (
@@ -512,13 +525,13 @@ class MultiFrameFlowDetector(TeleportDetector):
             new_h = ((new_h + 7) // 8) * 8
             new_w = ((new_w + 7) // 8) * 8
             rgb_raft = F.interpolate(
-                rgb.reshape(B * T, _C, H, W),
+                rgb_fp32.reshape(B * T, _C, H, W),
                 size=(new_h, new_w),
                 mode="bilinear",
                 align_corners=False,
             ).reshape(B, T, _C, new_h, new_w)
         else:
-            rgb_raft = rgb
+            rgb_raft = rgb_fp32
             new_h, new_w = H, W
 
         # --- Pre-compute all adjacent-frame flows ONCE ---
@@ -536,7 +549,7 @@ class MultiFrameFlowDetector(TeleportDetector):
         for t in range(T):
             if t < tau:
                 results.append(
-                    torch.zeros(B, H, W, device=rgb.device, dtype=rgb.dtype)
+                    torch.zeros(B, H, W, device=rgb.device, dtype=torch.float32)
                 )
                 continue
 
@@ -582,7 +595,8 @@ class MultiFrameFlowDetector(TeleportDetector):
         # Free pre-computed flows to release memory before stacking
         del adj_flows
 
-        return torch.stack(results, dim=1)  # [B, T, H, W]
+        stacked = torch.stack(results, dim=1)  # [B, T, H, W], fp32
+        return stacked.to(input_dtype)
 
     def _compose_flows(
         self, flows: list[torch.Tensor]
