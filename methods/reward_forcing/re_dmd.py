@@ -81,6 +81,15 @@ class ReDMD(RewardForcingModel):
             elif self._teleport_mode != "off":
                 raise ValueError(f"Unknown teleport.tel_det_regular.mode: {self._teleport_mode!r}")
 
+        # Metric gate thresholds (shared by reweight & aux_loss branches).
+        # When either is missing, gating is skipped for that level.
+        self._teleport_score_threshold = getattr(
+            tel_det_regular_cfg, "score_threshold", None
+        ) if tel_det_regular_cfg is not None else None
+        self._teleport_min_event_area_ratio = getattr(
+            tel_det_regular_cfg, "min_event_area_ratio", None
+        ) if tel_det_regular_cfg is not None else None
+
         # Mutex assertion (defensive)
         assert (self._teleport_reweighter is None) or (self._teleport_aux_loss is None), (
             "Mutex violation: reweighter and aux_loss cannot both be active."
@@ -163,6 +172,39 @@ class ReDMD(RewardForcingModel):
             "timestep": timestep.detach()
         }
 
+    def _apply_teleport_metric_gates(
+        self, score_map: torch.Tensor
+    ) -> torch.Tensor:
+        """Apply pixel-level and frame-level gating to a detector score map.
+
+        The gating is **optional** — when ``score_threshold`` or
+        ``min_event_area_ratio`` is ``None`` that level is skipped, so
+        existing configs that omit these fields continue to work.
+
+        Args:
+            score_map: ``[B, T, 1, H, W]``, non-negative.
+
+        Returns:
+            Gated score map of the same shape.  Positions / frames that do
+            not satisfy the metric criteria are zeroed out.
+        """
+        gated = score_map
+        # Pixel-level gate: suppress low-confidence positions
+        if self._teleport_score_threshold is not None:
+            th = float(self._teleport_score_threshold)
+            gated = gated * (gated > th).to(gated.dtype)
+
+        # Frame-level gate: suppress frames with too few teleport pixels
+        if self._teleport_min_event_area_ratio is not None:
+            ratio = float(self._teleport_min_event_area_ratio)
+            B, T, C, H, W = gated.shape
+            # fraction of spatial positions above zero after pixel gate
+            frame_ratio = (gated > 0).float().sum(dim=(2, 3, 4)) / (C * H * W)  # [B, T]
+            frame_mask = (frame_ratio > ratio).float()  # [B, T]
+            gated = gated * frame_mask.view(B, T, 1, 1, 1)
+
+        return gated
+
     def compute_rewarded_distribution_matching_loss(
         self,
         image_or_video: torch.Tensor,
@@ -234,6 +276,7 @@ class ReDMD(RewardForcingModel):
                 # detector input: pixels in [0,1], shape [B,T,3,H,W]
                 # `videos` is already (1+pixels)/2.0 in [0,1] shape [B,T,3,H,W]
                 student_score = _tdet.score(videos).detach()
+                student_score = self._apply_teleport_metric_gates(student_score)
             teleport_weight_map = _trw.compute_weight(
                 student_score,
                 teacher_score=None,  # teacher path is tel_det_regular+ optional extension
@@ -243,6 +286,7 @@ class ReDMD(RewardForcingModel):
         elif _tmode == "aux_loss" and _tdet is not None:
             # grad-attached path for aux_loss
             student_score_grad = _tdet.score(videos)
+            student_score_grad = self._apply_teleport_metric_gates(student_score_grad)
             teleport_aux_loss_val = _taux(student_score_grad)
             teleport_log["teleport_score_mean"] = student_score_grad.mean().detach()
             teleport_log["teleport_aux_loss"] = teleport_aux_loss_val.detach()

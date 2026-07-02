@@ -80,7 +80,7 @@ def _make_teleport_tel_det_regular_cfg(mode: str = "off", **overrides):
     elif norm_mode == "aux_loss":
         base["aux_loss"] = {
             "type": "masked_mean",
-            "tau": 0.3,
+            "threshold": 0.3,
             "aggregation": "masked_mean",
         }
         base["aux_beta"] = 1.0
@@ -225,10 +225,10 @@ class TestInitHookConstruction:
         with pytest.raises(ValueError, match="requires 'tau'"):
             build_reweighter({"type": "thresholded", "alpha": 5.0, "latent_h": 40, "latent_w": 72})
 
-    def test_aux_loss_missing_tau_raises_at_init(self):
-        """mode=aux_loss with masked_mean without tau raises ValueError."""
+    def test_aux_loss_missing_threshold_raises_at_init(self):
+        """mode=aux_loss with masked_mean without threshold raises ValueError."""
         from methods.reward_forcing.teleport.aux_loss import build_aux_loss
-        with pytest.raises(ValueError, match="requires explicit tau"):
+        with pytest.raises(ValueError, match="requires explicit threshold"):
             build_aux_loss({"type": "masked_mean"})
 
 
@@ -517,8 +517,8 @@ class TestEndToEndTeleportScore:
         assert "teleport_score_mean" in tlog
         assert "teleport_aux_loss" in tlog
 
-    def test_aux_loss_mode_positive_score_above_tau_produces_nonzero_loss(self):
-        """Detector returning score > tau -> L_aux > 0."""
+    def test_aux_loss_mode_positive_score_above_threshold_produces_nonzero_loss(self):
+        """Detector returning score > threshold -> L_aux > 0."""
         cfg = _make_teleport_tel_det_regular_cfg("aux_loss")
         model = MockReDMD(tel_det_regular_cfg=cfg)
         high_score = torch.full((1, 4, 1, 64, 64), 0.7)

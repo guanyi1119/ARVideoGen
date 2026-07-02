@@ -38,25 +38,35 @@ class TeleportAuxLoss(ABC):
 class MaskedMeanAuxLoss(TeleportAuxLoss):
     """Masked-mean teleport penalty.
 
-    Computes the mean score over pixels whose score exceeds a threshold
-    ``tau``, so the loss penalises only "high teleport suspicion" regions::
+    Computes the mean score over pixels whose score exceeds a
+    ``threshold``, so the loss penalises only "high teleport suspicion"
+    regions::
 
-        mask = (score_map > tau).to(score_map.dtype)
+        mask = (score_map > threshold).to(score_map.dtype)
         L_aux = (score_map * mask).sum() / mask.sum().clamp_min(1.0)
 
     When ``aggregation="mean"`` the mask is skipped and the plain mean
     ``score_map.mean()`` is returned instead.
+
+    Note: this ``threshold`` is the aux-loss internal masking cut-off.
+    It is distinct from ``detector.tau`` (a temporal window in the
+    multi-frame flow detector) and from ``reweighter.thresholded.tau``
+    (the thresholded-reweighter cut-off).  All three used to be named
+    ``tau`` which caused confusion; the aux-loss one was renamed to
+    ``threshold``.
     """
 
-    def __init__(self, tau: float, aggregation: str = "masked_mean") -> None:
-        if tau is None:
-            raise ValueError("MaskedMeanAuxLoss requires explicit tau; got None")
+    def __init__(self, threshold: float, aggregation: str = "masked_mean") -> None:
+        if threshold is None:
+            raise ValueError(
+                "MaskedMeanAuxLoss requires explicit threshold; got None"
+            )
         if aggregation not in {"masked_mean", "mean"}:
             raise ValueError(
                 f"aggregation must be one of {{'masked_mean','mean'}}, "
                 f"got {aggregation!r}"
             )
-        self._tau = float(tau)
+        self._threshold = float(threshold)
         self._aggregation = aggregation
 
     def __call__(self, score_map: torch.Tensor) -> torch.Tensor:
@@ -64,7 +74,7 @@ class MaskedMeanAuxLoss(TeleportAuxLoss):
             return score_map.mean()
 
         # masked_mean path
-        mask = (score_map > self._tau).to(score_map.dtype)
+        mask = (score_map > self._threshold).to(score_map.dtype)
         denom = mask.sum().clamp_min(1.0)
         masked_sum = (score_map * mask).sum()
         # ``score_map.sum() * 0.0`` ensures the output is grad-attached
@@ -90,7 +100,7 @@ def build_aux_loss(cfg: Optional[dict]) -> Optional[TeleportAuxLoss]:
 
     Raises:
         ValueError: If ``cfg["type"]`` is not recognised, or required keys
-                    (e.g. ``tau`` for ``masked_mean``) are missing.
+                    (e.g. ``threshold`` for ``masked_mean``) are missing.
     """
     if cfg is None or cfg == {}:
         return None
@@ -100,11 +110,13 @@ def build_aux_loss(cfg: Optional[dict]) -> Optional[TeleportAuxLoss]:
         return None
 
     if loss_type == "masked_mean":
-        tau = cfg.get("tau")
-        if tau is None:
-            raise ValueError("masked_mean aux_loss requires explicit tau")
+        threshold = cfg.get("threshold")
+        if threshold is None:
+            raise ValueError(
+                "masked_mean aux_loss requires explicit threshold"
+            )
         return MaskedMeanAuxLoss(
-            tau=float(tau),
+            threshold=float(threshold),
             aggregation=cfg.get("aggregation", "masked_mean"),
         )
 
