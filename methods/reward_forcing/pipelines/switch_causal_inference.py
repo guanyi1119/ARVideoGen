@@ -262,14 +262,14 @@ class SwitchCausalInferencePipeline(StreamingCausalInferencePipeline):
             for index, current_timestep in enumerate(self.denoising_step_list):
                 timestep = torch.ones([batch_size, current_num_frames], device=noise.device, dtype=torch.int64) * current_timestep
 
-                # --- Enlarged CFG (conditionally enabled) ---
+                # --- Step-level enlarged CFG (clone + zero, no save/restore) ---
                 use_cfg = KV_CACHE_CFG_SCALE > 0
                 if use_cfg:
-                    pre_step_cache = self._save_kv_cache()
-                    pre_step_ca = self._save_crossattn_cache()
+                    uncond_kv = self._clone_kv_cache(zero_sink=True, zero_window=True)
+                    uncond_ca = self._clone_crossattn_cache()
 
                 if index < len(self.denoising_step_list) - 1:
-                    # Full cache + positive prompt (cond_in_use)
+                    # Cond: full cache + positive prompt (cond_in_use)
                     _, denoised_pred = self.generator(
                         noisy_image_or_video=noisy_input,
                         conditional_dict=cond_in_use,
@@ -280,26 +280,18 @@ class SwitchCausalInferencePipeline(StreamingCausalInferencePipeline):
                     )
 
                     if use_cfg:
-                        post_step_cache = self._save_kv_cache()
-                        post_step_ca = self._save_crossattn_cache()
-                        self._restore_kv_cache(pre_step_cache)
-                        self._zero_kv_cache()
-                        for blk in self.crossattn_cache:
-                            blk["is_init"] = False
                         with torch.no_grad():
-                            _, denoised_pred_zeroed = self.generator(
+                            _, pred_uncond = self.generator(
                                 noisy_image_or_video=noisy_input,
                                 conditional_dict=unconditional_dict,
                                 timestep=timestep,
-                                kv_cache=self.kv_cache1,
-                                crossattn_cache=self.crossattn_cache,
+                                kv_cache=uncond_kv,
+                                crossattn_cache=uncond_ca,
                                 current_start=current_start_frame * self.frame_seq_length,
                             )
-                        denoised_pred = denoised_pred_zeroed + KV_CACHE_CFG_SCALE * (
-                            denoised_pred - denoised_pred_zeroed
+                        denoised_pred = denoised_pred + KV_CACHE_CFG_SCALE * (
+                            denoised_pred - pred_uncond
                         )
-                        self._restore_kv_cache(post_step_cache)
-                        self._restore_crossattn_cache(post_step_ca)
 
                     next_timestep = self.denoising_step_list[index + 1]
                     noisy_input = self.scheduler.add_noise(
@@ -308,7 +300,7 @@ class SwitchCausalInferencePipeline(StreamingCausalInferencePipeline):
                         next_timestep * torch.ones([batch_size * current_num_frames], device=noise.device, dtype=torch.long),
                     ).unflatten(0, denoised_pred.shape[:2])
                 else:
-                    # Full cache + positive prompt (cond_in_use)
+                    # Cond: full cache + positive prompt (cond_in_use)
                     _, denoised_pred = self.generator(
                         noisy_image_or_video=noisy_input,
                         conditional_dict=cond_in_use,
@@ -319,26 +311,18 @@ class SwitchCausalInferencePipeline(StreamingCausalInferencePipeline):
                     )
 
                     if use_cfg:
-                        post_step_cache = self._save_kv_cache()
-                        post_step_ca = self._save_crossattn_cache()
-                        self._restore_kv_cache(pre_step_cache)
-                        self._zero_kv_cache()
-                        for blk in self.crossattn_cache:
-                            blk["is_init"] = False
                         with torch.no_grad():
-                            _, denoised_pred_zeroed = self.generator(
+                            _, pred_uncond = self.generator(
                                 noisy_image_or_video=noisy_input,
                                 conditional_dict=unconditional_dict,
                                 timestep=timestep,
-                                kv_cache=self.kv_cache1,
-                                crossattn_cache=self.crossattn_cache,
+                                kv_cache=uncond_kv,
+                                crossattn_cache=uncond_ca,
                                 current_start=current_start_frame * self.frame_seq_length,
                             )
-                        denoised_pred = denoised_pred_zeroed + KV_CACHE_CFG_SCALE * (
-                            denoised_pred - denoised_pred_zeroed
+                        denoised_pred = denoised_pred + KV_CACHE_CFG_SCALE * (
+                            denoised_pred - pred_uncond
                         )
-                        self._restore_kv_cache(post_step_cache)
-                        self._restore_crossattn_cache(post_step_ca)
 
             output[:, current_start_frame : current_start_frame + current_num_frames] = denoised_pred.to(output.device)
 

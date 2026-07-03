@@ -79,23 +79,20 @@ class StreamingTrainingPipeline:
         current_start_frame: int = 0,
         requires_grad: bool = True,
         return_sim_step: bool = False,
+        cfg_scale: float = 0.0,
+        cfg_uncond_dict: Optional[dict] = None,
+        cfg_zero_sink: bool = False,
+        cfg_zero_window: bool = False,
     ) -> Tuple[torch.Tensor, Optional[int], Optional[int]]:
         """
-        Chunk generation method tailored for sequential training
-        
-        Args:
-            noise: noise tensor for a single chunk [batch_size, chunk_frames, C, H, W]
-            conditional_dict: dictionary of conditional information
-            kv_cache: externally provided KV cache (defaults to self.kv_cache1 if None)
-            crossattn_cache: externally provided cross-attention cache (defaults to self.crossattn_cache if None)
-            current_start_frame: start frame index of the chunk in the full sequence
-            requires_grad: whether gradients are required
-            return_sim_step: whether to return simulation step info
-            
-        Returns:
-            output: generated chunk [batch_size, chunk_frames, C, H, W]
-            denoised_timestep_from: starting denoise timestep
-            denoised_timestep_to: ending denoise timestep
+        Chunk generation method tailored for sequential training.
+
+        When ``cfg_scale > 0`` and ``cfg_uncond_dict`` is provided, step-level
+        enlarged CFG is applied: each denoising step runs twice (cond with full
+        cache + pos prompt, uncond with fresh clone of cache — zeroed per flags —
+        + uncond prompt) and predictions are CFG-combined. The uncond pass is
+        always no-grad. A fresh clone is created each step so the uncond path
+        sees the cond path's latest cache updates.
         """
         batch_size, chunk_frames, num_channels, height, width = noise.shape
         assert chunk_frames % self.num_frame_per_block == 0
@@ -177,6 +174,20 @@ class StreamingTrainingPipeline:
                             crossattn_cache=self.crossattn_cache,
                             current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
                         )
+
+                        # Step-level CFG: fresh clone each step from updated self.kv_cache1
+                        if cfg_scale > 0 and cfg_uncond_dict is not None:
+                            uncond_kv = self._clone_kv_cache(zero_sink=cfg_zero_sink, zero_window=cfg_zero_window)
+                            uncond_ca = self._clone_crossattn_cache()
+                            _, pred_uncond = self.generator(
+                                noisy_image_or_video=noisy_input,
+                                conditional_dict=cfg_uncond_dict,
+                                timestep=timestep,
+                                kv_cache=uncond_kv,
+                                crossattn_cache=uncond_ca,
+                                current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
+                            )
+                            denoised_pred = denoised_pred + cfg_scale * (denoised_pred - pred_uncond)
                         
                         # Add noise for the next step
                         if step_idx < len(self.denoising_step_list) - 1:
@@ -205,6 +216,21 @@ class StreamingTrainingPipeline:
                             crossattn_cache=self.crossattn_cache,
                             current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
                         )
+
+                    # Step-level CFG: fresh clone each step (always no-grad)
+                    if cfg_scale > 0 and cfg_uncond_dict is not None:
+                        with torch.no_grad():
+                            uncond_kv = self._clone_kv_cache(zero_sink=cfg_zero_sink, zero_window=cfg_zero_window)
+                            uncond_ca = self._clone_crossattn_cache()
+                            _, pred_uncond = self.generator(
+                                noisy_image_or_video=noisy_input,
+                                conditional_dict=cfg_uncond_dict,
+                                timestep=timestep,
+                                kv_cache=uncond_kv,
+                                crossattn_cache=uncond_ca,
+                                current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
+                            )
+                        denoised_pred = denoised_pred + cfg_scale * (denoised_pred - pred_uncond)
                     break
             
             # Record output
@@ -256,6 +282,61 @@ class StreamingTrainingPipeline:
             return output, denoised_timestep_from, denoised_timestep_to, exit_flags[0] + 1
         
         return output, denoised_timestep_from, denoised_timestep_to
+
+    # ------------------------------------------------------------------
+    # KV Cache helpers for step-level enlarged CFG (clone + zero)
+    # ------------------------------------------------------------------
+
+    def _get_sink_size(self) -> int:
+        """Retrieve sink_size from the underlying causal model."""
+        try:
+            model = self.generator.model
+            blocks = getattr(model, 'blocks', None)
+            if blocks is not None and len(blocks) > 0:
+                attn = getattr(blocks[0], 'self_attn', None)
+                if attn is not None:
+                    return getattr(attn, 'sink_size', 0)
+        except Exception:
+            pass
+        return 0
+
+    def _clone_kv_cache(self, zero_sink: bool = False, zero_window: bool = False) -> list:
+        """Clone the current KV cache and optionally zero sink/window regions.
+
+        The original cache is untouched; the returned clone is a deep copy with
+        selective zeroing applied. Used for the uncond pass in step-level CFG.
+        """
+        sink_size = self._get_sink_size()
+        total_sink_tokens = sink_size * self.frame_seq_length
+        cloned = []
+        for blk in self.kv_cache1:
+            k = blk["k"].clone()
+            v = blk["v"].clone()
+            local_end = blk["local_end_index"].item()
+            if zero_sink and total_sink_tokens > 0:
+                k[:, :total_sink_tokens].zero_()
+                v[:, :total_sink_tokens].zero_()
+            if zero_window and local_end > total_sink_tokens:
+                k[:, total_sink_tokens:local_end].zero_()
+                v[:, total_sink_tokens:local_end].zero_()
+            cloned.append({
+                "k": k,
+                "v": v,
+                "global_end_index": blk["global_end_index"].clone(),
+                "local_end_index": blk["local_end_index"].clone(),
+            })
+        return cloned
+
+    def _clone_crossattn_cache(self) -> list:
+        """Clone cross-attention cache (is_init=False to force recompute with uncond prompt)."""
+        cloned = []
+        for blk in self.crossattn_cache:
+            cloned.append({
+                "k": blk["k"].clone(),
+                "v": blk["v"].clone(),
+                "is_init": False,
+            })
+        return cloned
 
     def _initialize_kv_cache(self, batch_size, dtype, device):
         """

@@ -33,6 +33,8 @@ class StreamingTrainingModel3Sink(StreamingTrainingModel):
 
     All training logic (_generate_chunk, generate_next_chunk, compute_*_loss,
     KV cache zeroing) is inherited unchanged from StreamingTrainingModel.
+    The 3-sink-specific _clone_kv_cache override lives on the pipeline side
+    (StreamingTrainingPipeline3Sink), not here.
     """
 
     def __init__(self, base_model, config):
@@ -49,31 +51,3 @@ class StreamingTrainingModel3Sink(StreamingTrainingModel):
             f"long={long_sink} mid={mid_sink} rolling={rolling} "
             f"total_attn={local_attn} chunk_size={self.chunk_size}"
         )
-
-    def _save_kv_cache(self) -> list:
-        saved = []
-        for blk in self.inference_pipeline.kv_cache1:
-            entry = {
-                "k": blk["k"].clone(),
-                "v": blk["v"].clone(),
-                "global_end_index": blk["global_end_index"].clone(),
-                "local_end_index": blk["local_end_index"].clone(),
-            }
-            for key in ("mid_ring_idx", "long_ring_idx", "mid_sink_filled"):
-                if key in blk:
-                    entry[key] = blk[key].clone()
-            saved.append(entry)
-        return saved
-
-    def _restore_kv_cache(self, saved: list):
-        for blk, sb in zip(self.inference_pipeline.kv_cache1, saved):
-            blk["k"].copy_(sb["k"])
-            blk["v"].copy_(sb["v"])
-            blk["global_end_index"].copy_(sb["global_end_index"])
-            blk["local_end_index"].copy_(sb["local_end_index"])
-            for key in ("mid_ring_idx", "long_ring_idx", "mid_sink_filled"):
-                if key in sb:
-                    if key not in blk:
-                        blk[key] = sb[key].clone()
-                    else:
-                        blk[key].copy_(sb[key])

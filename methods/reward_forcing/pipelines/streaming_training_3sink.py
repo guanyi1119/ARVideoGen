@@ -17,9 +17,10 @@ from methods.reward_forcing.pipelines.streaming_training import StreamingTrainin
 class StreamingTrainingPipeline3Sink(StreamingTrainingPipeline):
     """3-sink parallel variant of StreamingTrainingPipeline.
 
-    Behavior is identical to the parent.  The 3-sink layout is configured
-    through the model kwargs (local_attn_size=18, long_sink_size=3,
-    mid_sink_size=6) and does not require any code changes in the pipeline.
+    Behavior is identical to the parent except _clone_kv_cache also copies
+    the 3-sink-specific cache keys (mid_ring_idx, long_ring_idx, mid_sink_filled).
+    The 3-sink layout is configured through the model kwargs (local_attn_size=18,
+    long_sink_size=3, mid_sink_size=6) and does not require other code changes.
     """
 
     def __init__(self, *args, **kwargs):
@@ -35,3 +36,30 @@ class StreamingTrainingPipeline3Sink(StreamingTrainingPipeline):
             f"total_attn={self.local_attn_size} "
             f"kv_cache_size={self.kv_cache_size}"
         )
+
+    def _clone_kv_cache(self, zero_sink: bool = False, zero_window: bool = False) -> list:
+        """Clone KV cache with 3-sink extra keys, optionally zeroing sink/window."""
+        sink_size = self._get_sink_size()
+        total_sink_tokens = sink_size * self.frame_seq_length
+        cloned = []
+        for blk in self.kv_cache1:
+            k = blk["k"].clone()
+            v = blk["v"].clone()
+            local_end = blk["local_end_index"].item()
+            if zero_sink and total_sink_tokens > 0:
+                k[:, :total_sink_tokens].zero_()
+                v[:, :total_sink_tokens].zero_()
+            if zero_window and local_end > total_sink_tokens:
+                k[:, total_sink_tokens:local_end].zero_()
+                v[:, total_sink_tokens:local_end].zero_()
+            entry = {
+                "k": k,
+                "v": v,
+                "global_end_index": blk["global_end_index"].clone(),
+                "local_end_index": blk["local_end_index"].clone(),
+            }
+            for key in ("mid_ring_idx", "long_ring_idx", "mid_sink_filled"):
+                if key in blk:
+                    entry[key] = blk[key].clone()
+            cloned.append(entry)
+        return cloned

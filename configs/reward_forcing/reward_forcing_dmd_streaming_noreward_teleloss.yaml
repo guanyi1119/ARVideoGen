@@ -53,7 +53,7 @@ trainer: streaming_distillation
 gradient_checkpointing: true
 num_frame_per_block: 3
 load_raw_video: false
-beta: 3.5
+beta: 0.0  # 0.0 - no reward
 model_kwargs:
   timestep_shift: 5.0
   local_attn_size: 12
@@ -126,7 +126,7 @@ teleport:
 
   # === T10: tel_det_regular teleport mitigation (mutex-gated, default off) ===
   tel_det_regular:
-    mode: "off"                          # off | reweight | aux_loss (mutex)
+    mode: "aux_loss"                          # off | reweight | aux_loss (mutex)
     # Metric aggregation thresholds (also used by scripts/eval_teleport_rate.py)
     score_threshold: 0.8                # per-pixel score threshold for event detection
     min_event_area_ratio: 0.001          # fraction of pixels above threshold to count a frame as event

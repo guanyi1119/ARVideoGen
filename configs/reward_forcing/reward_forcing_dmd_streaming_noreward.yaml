@@ -53,7 +53,7 @@ trainer: streaming_distillation
 gradient_checkpointing: true
 num_frame_per_block: 3
 load_raw_video: false
-beta: 3.5
+beta: 0.0  # 0.0 - no reward
 model_kwargs:
   timestep_shift: 5.0
   local_attn_size: 12

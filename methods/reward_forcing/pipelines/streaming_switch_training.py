@@ -46,6 +46,10 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
         switch_conditional_dict: Optional[dict] = None,
         switch_recache_frames: Optional[torch.Tensor] = None,
         return_sim_step: bool = False,
+        cfg_scale: float = 0.0,
+        cfg_uncond_dict: Optional[dict] = None,
+        cfg_zero_sink: bool = False,
+        cfg_zero_window: bool = False,
     ) -> Tuple[torch.Tensor, Optional[int], Optional[int]]:
         """
         Chunk generation method tailored for sequential training with prompt switching.
@@ -85,6 +89,10 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                 current_start_frame=current_start_frame,
                 requires_grad=requires_grad,
                 return_sim_step=return_sim_step,
+                cfg_scale=cfg_scale,
+                cfg_uncond_dict=cfg_uncond_dict,
+                cfg_zero_sink=cfg_zero_sink,
+                cfg_zero_window=cfg_zero_window,
             )
         
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
@@ -170,6 +178,20 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                             crossattn_cache=self.crossattn_cache,
                             current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
                         )
+
+                        # Step-level CFG: fresh clone each step from updated self.kv_cache1
+                        if cfg_scale > 0 and cfg_uncond_dict is not None:
+                            uncond_kv = self._clone_kv_cache(zero_sink=cfg_zero_sink, zero_window=cfg_zero_window)
+                            uncond_ca = self._clone_crossattn_cache()
+                            _, pred_uncond = self.generator(
+                                noisy_image_or_video=noisy_input,
+                                conditional_dict=cfg_uncond_dict,
+                                timestep=timestep,
+                                kv_cache=uncond_kv,
+                                crossattn_cache=uncond_ca,
+                                current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
+                            )
+                            denoised_pred = denoised_pred + cfg_scale * (denoised_pred - pred_uncond)
                         
                         # Add noise for the next step
                         if step_idx < len(self.denoising_step_list) - 1:
@@ -198,6 +220,21 @@ class StreamingSwitchTrainingPipeline(StreamingTrainingPipeline):
                             crossattn_cache=self.crossattn_cache,
                             current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
                         )
+
+                    # Step-level CFG: fresh clone each step (always no-grad)
+                    if cfg_scale > 0 and cfg_uncond_dict is not None:
+                        with torch.no_grad():
+                            uncond_kv = self._clone_kv_cache(zero_sink=cfg_zero_sink, zero_window=cfg_zero_window)
+                            uncond_ca = self._clone_crossattn_cache()
+                            _, pred_uncond = self.generator(
+                                noisy_image_or_video=noisy_input,
+                                conditional_dict=cfg_uncond_dict,
+                                timestep=timestep,
+                                kv_cache=uncond_kv,
+                                crossattn_cache=uncond_ca,
+                                current_start=(current_start_frame + local_start_frame) * self.frame_seq_length,
+                            )
+                        denoised_pred = denoised_pred + cfg_scale * (denoised_pred - pred_uncond)
                     break
             
             # Record output
