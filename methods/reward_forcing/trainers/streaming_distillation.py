@@ -511,11 +511,13 @@ class Trainer:
         self.gradient_accumulation_steps = getattr(config, "gradient_accumulation_steps", 1)
         self.previous_time = None
 
-        # KV cache zeroing augmentation probabilities (applied during generator_loss
-        # which uses unconditional_dict for CFG).  When both are 0 the behaviour is
-        # identical to the original implementation.
+        # Generator-level enlarged CFG: three independent probability switches
+        # control which uncond degradations are applied (sink zero / window zero /
+        # neg prompt). kv_cache_cfg_scale controls the CFG strength.
+        self.kv_cache_cfg_scale = float(getattr(config, "kv_cache_cfg_scale", 0.0))
         self.sink_kv_cache_zero_prob = float(getattr(config, "sink_kv_cache_zero_prob", 0.0))
         self.window_kv_cache_zero_prob = float(getattr(config, "window_kv_cache_zero_prob", 0.0))
+        self.neg_prompt_zero_prob = float(getattr(config, "neg_prompt_zero_prob", 0.0))
         
         # streaming training configuration
         self.streaming_training = getattr(config, "streaming_training", False)
@@ -542,8 +544,13 @@ class Trainer:
                 print(f"Effective batch size: {config.batch_size * self.gradient_accumulation_steps * self.world_size}")
             if self.streaming_training:
                 print(f"streaming training enabled: chunk_size={self.streaming_chunk_size}, max_length={self.streaming_max_length}")
-            if self.sink_kv_cache_zero_prob > 0 or self.window_kv_cache_zero_prob > 0:
-                print(f"KV cache zeroing augmentation: sink_prob={self.sink_kv_cache_zero_prob}, window_prob={self.window_kv_cache_zero_prob}")
+            if self.kv_cache_cfg_scale > 0:
+                print(
+                    f"Generator enlarged CFG: cfg_scale={self.kv_cache_cfg_scale}, "
+                    f"sink_prob={self.sink_kv_cache_zero_prob}, "
+                    f"window_prob={self.window_kv_cache_zero_prob}, "
+                    f"neg_prompt_prob={self.neg_prompt_zero_prob}"
+                )
             if LOG_GPU_MEMORY:
                 log_gpu_memory("After initialization", device=self.device, rank=dist.get_rank())
 

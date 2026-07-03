@@ -100,30 +100,26 @@ class ReDMD(RewardForcingModel):
         estimated_clean_image_or_video: torch.Tensor,
         timestep: torch.Tensor,
         conditional_dict: dict, unconditional_dict: dict,
-        noisy_image_or_video_zeroed: Optional[torch.Tensor] = None,
         normalization: bool = True
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute the KL grad (eq 7 in https://arxiv.org/abs/2311.18828).
+
+        Score models (Real/Fake) only use negative-prompt CFG; the generator-level
+        enlarged CFG (zeroed cache) is applied on clean latents upstream and is
+        NOT duplicated here.
+
         Input:
-            - noisy_image_or_video: noisy version of the full-cache generation [B, F, C, H, W].
+            - noisy_image_or_video: noisy version of the (CFG-combined) generation [B, F, C, H, W].
             - estimated_clean_image_or_video: the estimated clean image or video.
             - timestep: timestep tensor [B, F].
             - conditional_dict: conditional information (positive prompt).
             - unconditional_dict: unconditional information (negative prompt).
-            - noisy_image_or_video_zeroed: optional noisy version of the zeroed-cache
-              generation.  When provided, the uncond path of CFG uses this *plus*
-              the negative prompt, creating a unified CFG that combines prompt and
-              cache-quality guidance.  When None, falls back to the original
-              prompt-only CFG behaviour.
             - normalization: whether to normalize the gradient.
         Output:
             - kl_grad: the KL gradient.
             - kl_log_dict: intermediate tensors for logging.
         """
-        # If no zeroed generation is provided, use the same noisy for uncond (original behaviour)
-        noisy_for_uncond = noisy_image_or_video_zeroed if noisy_image_or_video_zeroed is not None else noisy_image_or_video
-
         # Step 1: Compute the fake score
         _, pred_fake_image_cond = self.fake_score(
             noisy_image_or_video=noisy_image_or_video,
@@ -133,7 +129,7 @@ class ReDMD(RewardForcingModel):
 
         if self.fake_guidance_scale != 0.0:
             _, pred_fake_image_uncond = self.fake_score(
-                noisy_image_or_video=noisy_for_uncond,
+                noisy_image_or_video=noisy_image_or_video,
                 conditional_dict=unconditional_dict,
                 timestep=timestep
             )
@@ -150,7 +146,7 @@ class ReDMD(RewardForcingModel):
         )
 
         _, pred_real_image_uncond = self.real_score(
-            noisy_image_or_video=noisy_for_uncond,
+            noisy_image_or_video=noisy_image_or_video,
             conditional_dict=unconditional_dict,
             timestep=timestep
         )
@@ -217,24 +213,22 @@ class ReDMD(RewardForcingModel):
         denoised_timestep_to: int = 0,
         beta: float = 1.0,
         scores: Optional[torch.Tensor] = None,
-        image_or_video_zeroed: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, dict]:
         """
         Compute the DMD loss (eq 7 in https://arxiv.org/abs/2311.18828).
+
+        Score models (Real/Fake) only use negative-prompt CFG. The generator-level
+        enlarged CFG (zeroed cache + neg prompt) is applied on clean latents
+        upstream in ``_generate_chunk`` and is NOT duplicated here.
+
         Input:
-            - image_or_video: full-cache generation [B, F, C, H, W].
+            - image_or_video: generator output [B, F, C, H, W] (already CFG-combined if enabled).
             - pixels: decoded pixel representation for reward computation.
             - text_prompts: list of text prompts.
             - conditional_dict: conditional information (positive prompt).
             - unconditional_dict: unconditional information (negative prompt).
             - gradient_mask: boolean mask indicating which pixels to compute loss on.
             - scores: optional per-prompt dynamism score in [0, 1].
-            - image_or_video_zeroed: optional zeroed-cache generation [B, F, C, H, W].
-              When provided, the uncond path of the CFG in ``_compute_kl_grad`` uses
-              ``noisy(image_or_video_zeroed)`` + ``unconditional_dict`` instead of
-              ``noisy(image_or_video)`` + ``unconditional_dict``, creating a unified
-              CFG that combines prompt and cache-quality guidance.  When None, the
-              behaviour is identical to the original prompt-only CFG.
         Output:
             - dmd_loss: the DMD loss.
             - dmd_log_dict: intermediate tensors for logging.
@@ -316,24 +310,12 @@ class ReDMD(RewardForcingModel):
                 timestep.flatten(0, 1)
             ).detach().unflatten(0, (batch_size, num_frame))
 
-            # Create noisy version of the zeroed-cache generation using the SAME
-            # noise and timestep, so the CFG difference is purely due to cache
-            # quality rather than noise variance.
-            noisy_latent_zeroed = None
-            if image_or_video_zeroed is not None:
-                noisy_latent_zeroed = self.scheduler.add_noise(
-                    image_or_video_zeroed.flatten(0, 1),
-                    noise.flatten(0, 1),
-                    timestep.flatten(0, 1)
-                ).detach().unflatten(0, (batch_size, num_frame))
-
             grad, rl_dmd_log_dict = self._compute_kl_grad(
                 noisy_image_or_video=noisy_latent,
                 estimated_clean_image_or_video=original_latent,
                 timestep=timestep,
                 conditional_dict=conditional_dict,
                 unconditional_dict=unconditional_dict,
-                noisy_image_or_video_zeroed=noisy_latent_zeroed,
             )
 
         if gradient_mask is not None:

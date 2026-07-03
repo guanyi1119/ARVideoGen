@@ -91,19 +91,17 @@ streaming_max_length: 240
 streaming_min_new_frame: 18
 train_first_chunk: true
 
-# Unified CFG: probability of zeroing sink / window KV cache regions during
-# the generator rollout.  When zeroing fires, a second generation pass is
-# performed with the degraded cache and used as the uncond reference in the
-# CFG loss computation.  Range: 0.0–1.0 (e.g. 0.3 = 30% chance per chunk).
-# Both default to 0.0 (disabled, original behaviour).
+# Generator-level enlarged CFG: three independent probability switches control
+# which uncond degradations are applied when the dual generation fires.
+# kv_cache_cfg_scale controls the CFG strength (0 = no combination).
+#   - sink_kv_cache_zero_prob:   zero the sink region of KV cache
+#   - window_kv_cache_zero_prob:  zero the window region of KV cache
+#   - neg_prompt_zero_prob:       use negative prompt for the uncond pass
+# All default to 0.0 (disabled, original single-generation behaviour).
+kv_cache_cfg_scale: 0.0
 sink_kv_cache_zero_prob: 0.1
 window_kv_cache_zero_prob: 0.1
-
-# Enlarged CFG: probability of using the negative prompt (instead of the
-# positive prompt) when generating the zeroed-cache chunk.  Combined with
-# sink/window zeroing, this creates a stronger uncond signal.
-# Range: 0.0–1.0 (0.0 = disabled, use positive prompt for zeroed generation).
-neg_prompt_zero_prob: 0.0
+neg_prompt_zero_prob: 0.1
 
 last_step_only: false
 
