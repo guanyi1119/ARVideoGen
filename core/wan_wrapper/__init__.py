@@ -11,7 +11,8 @@ def get_wan_wrapper_classes(method='default'):
     """Return (WanTextEncoder, WanVAEWrapper, WanDiffusionWrapper) for the given method.
 
     Args:
-        method: One of 'default' (CF/SF), 'causvid', 'longlive', 'deepforcing', 'rolling_forcing', 'reward_forcing', 'reward_forcing_3sink'
+        method: One of 'default' (CF/SF), 'causvid', 'longlive', 'deepforcing', 'rolling_forcing',
+                'reward_forcing', 'reward_forcing_3sink', 'longlive_rag'
 
     Returns:
         Tuple of (WanTextEncoder, WanVAEWrapper, WanDiffusionWrapper) classes
@@ -37,5 +38,8 @@ def get_wan_wrapper_classes(method='default'):
     elif method == 'reward_forcing_3sink':
         from .wan_wrapper_reward_forcing_3sink import WanTextEncoder, WanVAEWrapper, WanDiffusionWrapper
         return WanTextEncoder, WanVAEWrapper, WanDiffusionWrapper
+    elif method == 'longlive_rag':
+        from .wan_wrapper_longlive_rag import WanTextEncoder, WanVAEWrapper, WanDiffusionWrapper
+        return WanTextEncoder, WanVAEWrapper, WanDiffusionWrapper
     else:
-        raise ValueError(f"Unknown wan_wrapper method '{method}'. Choose from: 'default', 'causvid', 'longlive', 'deepforcing', 'rolling_forcing', 'reward_forcing', 'reward_forcing_3sink'")
+        raise ValueError(f"Unknown wan_wrapper method '{method}'. Choose from: 'default', 'causvid', 'longlive', 'deepforcing', 'rolling_forcing', 'reward_forcing', 'reward_forcing_3sink', 'longlive_rag'")

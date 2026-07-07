@@ -1,0 +1,57 @@
+# LongLive-RAG latent corpus generator - RF base + LongLive LoRA
+#
+# Generates a flat directory of latent_{global_pos:06d}.pt files
+# using the Reward-Forcing base model with a LongLive LoRA adapter
+# loaded on top (StreamingCausalInferencePipeline).
+#
+# Launch:
+#     torchrun --nproc_per_node=8 scripts/generate_longlive_rag_latent.py \
+#         --config_path configs/longlive_rag/generate_latent_longlive.yaml
+#
+# Or via the top-level launcher:
+#     bash generate_longlive_rag_latent.sh
+
+# Inference / denoising schedule
+denoising_step_list: [1000, 750, 500, 250]
+warp_denoising_step: true
+num_frame_per_block: 3
+
+# Model
+model_name: Wan2.1-T2V-1.3B
+model_kwargs:
+  local_attn_size: 12
+  timestep_shift: 5.0
+  sink_size: 3
+
+# Data
+data_path: prompts/vidprom_filtered_extended.txt
+output_folder: datasets/longlive_rag/longlive_corpus
+num_output_frames: 120
+
+# Sampling
+use_ema: false
+seed: 0
+num_samples: 1
+sample_ratio: 0.1
+max_video_saves: 2
+
+# Generator checkpoint (TODO: replace with RF base checkpoint path)
+# This is the base Reward-Forcing checkpoint that the LongLive LoRA was
+# distilled on top of.
+generator_ckpt: "<TODO: replace with RF base checkpoint path - the base that LongLive LoRA was distilled on top of>"
+
+# LoRA adapter (LongLive)
+lora_ckpt: "<TODO: replace with LongLive LoRA checkpoint path>"
+adapter:
+  type: "lora"
+  rank: 256        # TODO: verify against actual lora_ckpt peft summary
+  alpha: 256
+  dropout: 0.0
+  dtype: "bfloat16"
+  verbose: false
+
+# Use streaming pipeline for LoRA-based long-video inference
+use_streaming_pipeline: true
+
+# Default config (merged with this file)
+default_config_path: configs/reward_forcing/default_config.yaml

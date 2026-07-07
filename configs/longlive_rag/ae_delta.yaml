@@ -1,0 +1,49 @@
+# ──────────────────────────────────────────────────────────────
+# LongLive-RAG retrieval autoencoder (TRAIN script: ae/train.py)
+# Repo-level config — launch with:
+#     python -m methods.longlive_rag.ae.train --config configs/longlive_rag/ae_delta.yaml
+# or via the launcher:
+#     bash train_longlive_rag_ae.sh
+# ──────────────────────────────────────────────────────────────
+
+# ── Data ──
+# Output of `bash generate_longlive_rag_latent.sh` (flat dir of latent_XXXXXX.pt)
+# Two corpora can be produced (see P2): RF base and RF-base + LongLive LoRA.
+# Mix or pick one by pointing this at the desired directory.
+data_dir: datasets/longlive_rag/reward_forcing_corpus
+num_workers: 8
+seq_len: 8                  # continuous latent blocks per training chunk
+
+# ── Model ──
+in_channels: 16
+spatial_h: 60
+spatial_w: 104
+latent_dim: 1024            # retrieval embedding dimension
+hidden_dims: [64, 128, 256] # encoder/decoder channel dimensions
+
+# ── Training ──
+batch_size: 128             # single-GPU batch
+lr: 3.0e-4                  # AdamW learning rate
+weight_decay: 1.0e-4
+epochs: 400
+grad_clip: 1.0
+use_amp: true               # mixed-precision
+
+# ── Loss weights ──
+delta_weight: 1.0           # λ_Δ — Window Temporal Delta Loss weight
+delta_margin: 0.85          # m — cosine-similarity margin
+delta_window: 3             # w — local window for temporal delta pairs
+smooth_weight: 1.0          # λ_smooth — trajectory-smoothing loss weight
+
+# ── Logging ──
+log_dir: ae_runs/longlive_rag
+wandb_project: latent-ae-longlive-rag
+wandb_run_name: ae_delta
+save_every: 50              # epochs between periodic checkpoints
+log_every: 20               # steps between console prints
+
+# ── GPU ──
+gpu: 0
+
+# ── Seed ──
+seed: 42

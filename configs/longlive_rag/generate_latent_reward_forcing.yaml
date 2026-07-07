@@ -1,0 +1,42 @@
+# LongLive-RAG latent corpus generator - pure Reward-Forcing backbone
+#
+# Generates a flat directory of latent_{global_pos:06d}.pt files
+# using the base Reward-Forcing (CausalInferencePipeline) without
+# any LoRA adapter.
+#
+# Launch:
+#     torchrun --nproc_per_node=8 scripts/generate_longlive_rag_latent.py \
+#         --config_path configs/longlive_rag/generate_latent_reward_forcing.yaml
+#
+# Or via the top-level launcher:
+#     bash generate_longlive_rag_latent.sh
+
+# Inference / denoising schedule
+denoising_step_list: [1000, 750, 500, 250]
+warp_denoising_step: true
+num_frame_per_block: 3
+
+# Model
+model_name: Wan2.1-T2V-1.3B
+model_kwargs:
+  local_attn_size: 12
+  timestep_shift: 5.0
+  sink_size: 3
+
+# Data
+data_path: prompts/vidprom_filtered_extended.txt
+output_folder: datasets/longlive_rag/reward_forcing_corpus
+num_output_frames: 120
+
+# Sampling
+use_ema: false
+seed: 0
+num_samples: 1
+sample_ratio: 0.1
+max_video_saves: 2
+
+# Generator checkpoint (TODO: replace with RF base checkpoint path)
+generator_ckpt: "<TODO: replace with RF base checkpoint path>"
+
+# Default config (merged with this file)
+default_config_path: configs/reward_forcing/default_config.yaml

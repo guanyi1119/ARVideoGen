@@ -1,0 +1,63 @@
+# LongLive-RAG inference - RF base + LongLive LoRA adapter
+#
+# Uses LatentMemCausalInferencePipeline with retrieval-augmented generation
+# enabled.  The backbone is the Reward-Forcing checkpoint; a LongLive LoRA
+# adapter is loaded on top.
+#
+# Launch:
+#     torchrun --nproc_per_node=8 inference_longlive_rag.py \
+#         --config_path configs/longlive_rag/longlive_latentmem.yaml
+
+# Inference / denoising schedule
+denoising_step_list: [1000, 750, 500, 250]
+warp_denoising_step: true
+num_frame_per_block: 3
+
+# Model
+model_name: Wan2.1-T2V-1.3B
+model_kwargs:
+  local_attn_size: 12
+  timestep_shift: 5.0
+  sink_size: 3
+  memory_size: 6           # K - retrieved blocks per inference block
+  recent_exclude: 5        # R - recent blocks excluded from retrieval
+  use_latentmem: true      # master RAG switch
+  compression_method: "ae"
+  ae_ckpt: "datasets/longlive_rag/ae_latent_mem.pt"  # P1 AE checkpoint
+
+# Data
+data_path: prompts/vidprom_filtered_extended.txt
+output_folder: videos/longlive_rag/longlive_latentmem
+num_output_frames: 120
+
+# Sampling
+use_ema: false
+seed: 0
+num_samples: 1
+save_with_index: true
+inference_iter: -1
+
+# Generator checkpoint (TODO: replace with RF base checkpoint path)
+# This is the base Reward-Forcing checkpoint that the LongLive LoRA was
+# distilled on top of.
+generator_ckpt: "<TODO: replace with RF base checkpoint path - the base that LongLive LoRA distillation started from>"
+
+# LongLive LoRA adapter
+lora_ckpt: "<TODO: replace with LongLive LoRA checkpoint path>"
+adapter:
+  type: "lora"
+  rank: 256                # TODO: verify against actual lora_ckpt peft summary
+  alpha: 256
+  dropout: 0.0
+  dtype: "bfloat16"
+  verbose: false
+
+# Use streaming pipeline for LoRA-based long-video inference
+use_streaming_pipeline: true
+
+# Noise / sink
+global_sink: true
+context_noise: 0
+
+# Default config (merged with this file)
+default_config_path: configs/longlive_rag/default_config.yaml

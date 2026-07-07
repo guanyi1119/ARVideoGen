@@ -1,0 +1,38 @@
+# LongLive-RAG default configuration
+# Forked from configs/reward_forcing/default_config.yaml
+# All existing Reward-Forcing fields are preserved; optional RAG fields are
+# commented out with safe defaults so that method-specific yamls that include
+# this file merge cleanly.
+
+independent_first_frame: false
+warp_denoising_step: false
+weight_decay: 0.01
+same_step_across_blocks: true
+discriminator_lr_multiplier: 1.0
+last_step_only: false
+i2v: false
+num_training_frames: 21
+gc_interval: 100
+context_noise: 0
+causal: true
+qwen2_vl_path: /cache/Qwen2-VL-2B-Instruct
+
+ckpt_step: 0
+prompt_name: MovieGenVideoBench
+prompt_path: prompts/MovieGenVideoBench.txt
+eval_first_n: 64
+num_samples: 1
+height: 480
+width: 832
+num_frames: 81
+
+# -- Optional LongLive-RAG retrieval fields ------------------------------------
+# Uncomment and set in method-specific yamls (reward_forcing_latentmem.yaml,
+# longlive_latentmem.yaml) to enable retrieval-augmented generation.
+#
+# model_kwargs:
+#   use_latentmem: false    # master switch - set to true to enable RAG
+#   memory_size: 0          # K - retrieved-block budget per inference block
+#   recent_exclude: 0       # R - most-recent blocks excluded from retrieval
+#   compression_method: avg_pool
+#   ae_ckpt: null           # path to LatentAE checkpoint (P1 output)
