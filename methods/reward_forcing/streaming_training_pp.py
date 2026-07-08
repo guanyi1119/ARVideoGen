@@ -103,3 +103,114 @@ class StreamingTrainingModelPP:
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"[SF++-Model] Sampled window: start={i}, K={K}, shape={window.shape}")
         return window
+
+    def setup_sequence(self, conditional_dict, unconditional_dict,
+                       initial_latent=None, text_prompts=None, scores=None):
+        """Initialize KV cache and crossattn cache, prepare for rollout.
+
+        Mirrors StreamingTrainingModel.setup_sequence but simplified:
+        no prompt switching, no temp_max_length, no previous_frames.
+        """
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        batch_size = self.image_or_video_shape[0]
+
+        # Initialize KV cache if needed
+        if self.inference_pipeline.kv_cache1 is None:
+            self.inference_pipeline._initialize_kv_cache(
+                batch_size=batch_size,
+                dtype=self.dtype,
+                device=self.device
+            )
+            if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+                print(f"[SF++-Model] Initialized kv_cache1")
+
+        if self.inference_pipeline.crossattn_cache is None:
+            self.inference_pipeline._initialize_crossattn_cache(
+                batch_size=batch_size,
+                dtype=self.dtype,
+                device=self.device
+            )
+            if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+                print(f"[SF++-Model] Initialized crossattn_cache")
+
+        # Clear existing cache state
+        self.inference_pipeline.clear_kv_cache()
+
+        # Prime cache with initial_latent if provided (e.g. for i2v)
+        if initial_latent is not None:
+            timestep = torch.zeros(
+                [batch_size, initial_latent.shape[1]],
+                device=self.device, dtype=torch.int64
+            )
+            with torch.no_grad():
+                self.inference_pipeline.generator(
+                    noisy_image_or_video=initial_latent,
+                    conditional_dict=conditional_dict,
+                    timestep=timestep,
+                    kv_cache=self.inference_pipeline.kv_cache1,
+                    crossattn_cache=self.inference_pipeline.crossattn_cache,
+                    current_start=0
+                )
+            if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+                print(f"[SF++-Model] Primed cache with initial_latent shape={initial_latent.shape}")
+
+    def rollout_long(self, conditional_dict, unconditional_dict,
+                     initial_latent=None, text_prompts=None) -> torch.Tensor:
+        """No-grad long rollout. Returns [B, N, C, H, W] detached.
+
+        Generates chunks sequentially using the rolling KV cache,
+        collecting all clean frames. No gradient is computed during rollout.
+        """
+        self.setup_sequence(conditional_dict, unconditional_dict, initial_latent,
+                            text_prompts)
+
+        batch_size = self.image_or_video_shape[0]
+        C, H, W = self.image_or_video_shape[2:]
+        V_chunks = []
+        current_length = 0
+
+        with torch.no_grad():
+            while current_length < self.rollout_length:
+                # Compute chunk_frames: min(chunk_size, remaining)
+                remaining = self.rollout_length - current_length
+                chunk_frames = min(self.chunk_size, remaining)
+                # Truncate to a multiple of num_frame_per_block
+                chunk_frames = (chunk_frames // self.num_frame_per_block) * self.num_frame_per_block
+                # If remaining frames are fewer than one block, stop —
+                # generating a partial block would exceed rollout_length and
+                # generate_chunk_with_cache requires block-aligned frames.
+                if chunk_frames == 0:
+                    break
+
+                noise_chunk = torch.randn(
+                    [batch_size, chunk_frames, C, H, W],
+                    device=self.device,
+                    dtype=self.dtype
+                )
+
+                if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
+                    log_gpu_memory(
+                        f"[SF++-Model] Rollout before chunk at frame {current_length}",
+                        device=self.device,
+                        rank=dist.get_rank() if dist.is_initialized() else 0
+                    )
+
+                chunk, _, _ = self.inference_pipeline.generate_chunk_with_cache(
+                    noise=noise_chunk,
+                    conditional_dict=conditional_dict,
+                    current_start_frame=current_length,
+                    requires_grad=False,
+                    return_sim_step=False,
+                )
+                V_chunks.append(chunk.detach())
+                current_length += chunk_frames
+
+                if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+                    print(f"[SF++-Model] Rollout progress: {current_length}/{self.rollout_length}")
+
+        V = torch.cat(V_chunks, dim=1)
+        if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+            print(f"[SF++-Model] Rollout complete: V shape={V.shape}")
+        return V

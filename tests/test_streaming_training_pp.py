@@ -92,3 +92,45 @@ class TestSampleWindow:
         V = torch.randn(1, 10, 16, 60, 104)
         with pytest.raises(AssertionError):
             pp.sample_window(V)
+
+
+class TestRolloutLengthTruncation:
+    """Test that rollout_long respects rollout_length even when it's not
+    a multiple of chunk_size. We test the truncation logic by mocking
+    generate_chunk_with_cache to return deterministic chunks."""
+
+    def test_rollout_respects_length_when_not_multiple_of_chunk(self):
+        pp = _make_pp_without_init(
+            sfpp_rollout_length=25,
+            streaming_chunk_size=21,
+        )
+        pp.num_frame_per_block = 3
+        pp.image_or_video_shape = [1, 25, 16, 60, 104]
+
+        # Mock inference_pipeline
+        pp.inference_pipeline = MagicMock()
+        pp.inference_pipeline.kv_cache1 = None
+        pp.inference_pipeline.crossattn_cache = None
+
+        def mock_generate(noise, **kwargs):
+            frames = noise.shape[1]
+            return torch.randn(1, frames, 16, 60, 104), None, None
+
+        def mock_init_kv(**kwargs):
+            pp.inference_pipeline.kv_cache1 = [MagicMock()]
+        def mock_init_cross(**kwargs):
+            pp.inference_pipeline.crossattn_cache = [MagicMock()]
+
+        pp.inference_pipeline._initialize_kv_cache = mock_init_kv
+        pp.inference_pipeline._initialize_crossattn_cache = mock_init_cross
+        pp.inference_pipeline.clear_kv_cache = MagicMock()
+        pp.inference_pipeline.generate_chunk_with_cache = mock_generate
+
+        V = pp.rollout_long(
+            conditional_dict={"context": MagicMock()},
+            unconditional_dict={"context": MagicMock()},
+        )
+        # 25 = 21 + 4 (4 is not multiple of 3, so truncated to 3)
+        # So V should be 21+3=24 frames (<= 25)
+        assert V.shape[1] <= pp.rollout_length
+        assert V.shape[1] > 0
