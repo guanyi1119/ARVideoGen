@@ -168,25 +168,31 @@ class PPTrainer(StreamingDistillationTrainer):
                     log_data = {**generator_log_dict, **critic_log_dict}
                     self.writer.log(log_data, step=self.step)
 
-                # Throughput logging
-                if (not dist.is_initialized() or dist.get_rank() == 0):
+                # Throughput + progress logging (tokens/s/npu, aligned with
+                # streaming_distillation.train and rewarded_distillation.train)
+                if not dist.is_initialized() or dist.get_rank() == 0:
+                    batch_size = getattr(self.config, "batch_size", 1)
                     end_time = time.time()
+                    end_step = self.step
+                    step_diff = max(end_step - self.start_step, 1)
+                    time_diff = end_time - self.start_time
+                    seconds_per_iter = time_diff / step_diff
+                    throughput = 1560 * 12 * batch_size / max(seconds_per_iter, 1e-6)
                     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                    if TRAIN_GENERATOR:
-                        print(
-                            f"{timestamp}: [SF++ step {self.step}] "
-                            f"gen={gen_loss.item():.4f} critic={critic_loss.item():.4f} "
-                            f"gen_grad={gen_grad_norm.item():.2f} "
-                            f"critic_grad={critic_grad_norm.item():.2f}"
-                        )
-                    else:
-                        print(
-                            f"{timestamp}: [SF++ step {self.step}] "
-                            f"gen=skip critic={critic_loss.item():.4f} "
-                            f"critic_grad={critic_grad_norm.item():.2f}"
-                        )
-                    self.start_time = end_time
-                    self.start_step = self.step
+                    gen_loss_val = (
+                        gen_loss.item()
+                        if TRAIN_GENERATOR else 0.0
+                    )
+                    print(
+                        f"{timestamp}: [SF++ step {self.step}] "
+                        f"generator_loss: {gen_loss_val:.4f} "
+                        f"critic_loss: {critic_loss.item():.4f} "
+                        f"DI_throughput: {throughput:.2f} tokens/s/npu"
+                    )
+                    if not self.disable_logging:
+                        self.writer.log({"DI_throughput": throughput}, step=self.step)
+                    self.start_time = time.time()
+                    self.start_step = end_step
 
                 # Checkpoint
                 if (not getattr(self.config, 'no_save', False)) and \
