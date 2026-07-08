@@ -1,4 +1,4 @@
-﻿# Self-Forcing++ post-training trainer.
+# Self-Forcing++ post-training trainer.
 #
 # Inherits from StreamingDistillationTrainer to reuse all initialization
 # (model setup, FSDP wrapping, LoRA, optimizer, dataloader, checkpoint
@@ -104,16 +104,22 @@ class PPTrainer(StreamingDistillationTrainer):
                 text_prompts, conditional_dict, unconditional_dict = \
                     self._get_batch_and_encode()
 
-                # Step 2: SF++ core — no-grad long rollout
+                # Step 2: SF++ core - long rollout + window sampling
+                # Only build the generator computation graph on TRAIN_GENERATOR
+                # steps. Critic-only steps use requires_grad=False to avoid
+                # building an unused graph (saved transformer activations) that
+                # would leak across iterations and cause OOM.
                 if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                     print(f"[SF++-Trainer] Step {self.step}: starting rollout "
-                          f"(N={self.streaming_model.rollout_length})")
+                          f"(N={self.streaming_model.rollout_length}, "
+                          f"requires_grad={TRAIN_GENERATOR})")
 
                 W = self.streaming_model.rollout_and_sample_window(
                     conditional_dict=conditional_dict,
                     unconditional_dict=unconditional_dict,
                     initial_latent=None,
                     text_prompts=text_prompts,
+                    requires_grad=TRAIN_GENERATOR,
                 )
 
                 if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
@@ -153,6 +159,13 @@ class PPTrainer(StreamingDistillationTrainer):
                 critic_log_dict = {
                     "critic_loss": critic_loss.detach(),
                 }
+
+                # Free window tensor + any residual graph before optimizer steps
+                # and next iteration. On critic-only steps W has no graph
+                # (requires_grad=False), but del is still good hygiene; on
+                # generator steps backward() already freed the graph, and del
+                # drops the last Python reference so CUDA memory is returned.
+                del W
 
                 # Step 6: Optimizer steps
                 if TRAIN_GENERATOR:

@@ -188,12 +188,15 @@ class StreamingTrainingModelPP:
                 print(f"[SF++-Model] Primed cache with initial_latent shape={initial_latent.shape}")
 
     def rollout_and_sample_window(self, conditional_dict, unconditional_dict,
-                                  initial_latent=None, text_prompts=None) -> torch.Tensor:
-        """Rollout context (no-grad) then window (WITH grad).
+                                  initial_latent=None, text_prompts=None,
+                                  requires_grad: bool = True) -> torch.Tensor:
+        """Rollout context (no-grad) then window (grad controlled by requires_grad).
 
-        Returns the window [B, K, C, H, W] which has gradient through the
-        actual rollout generation process (with KV cache context from
-        preceding chunks).
+        Returns the window [B, K, C, H, W]. When requires_grad=True, the window
+        has gradient through the actual rollout generation process (with KV cache
+        context from preceding chunks). When requires_grad=False, the entire
+        rollout runs under torch.no_grad() -- use this for critic-only steps to
+        avoid building an unused generator graph that would leak memory.
 
         This implements the paper's Algorithm 1 correctly: the gradient
         flows through ``dG_θ(z_i)/dθ`` -- the real rollout output -- not
@@ -204,8 +207,8 @@ class StreamingTrainingModelPP:
         Flow:
           1. Sample window chunk index (synced across ranks)
           2. Generate context chunks 0..i-1 (no-grad, build KV cache)
-          3. Generate window chunk i (WITH grad) -- the actual rollout output
-          4. Return window (has gradient through generator θ + KV cache context)
+          3. Generate window chunk i (grad per requires_grad) -- the actual rollout output
+          4. Return window (has gradient through generator θ + KV cache context if requires_grad)
         """
         self.setup_sequence(conditional_dict, unconditional_dict, initial_latent,
                             text_prompts)
@@ -256,7 +259,7 @@ class StreamingTrainingModelPP:
                 if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                     print(f"[SF++-Model] Context rollout: {current_length}/{window_start_frame}")
 
-        # --- Step 3: Generate window chunk (WITH grad) ---
+        # --- Step 3: Generate window chunk (grad controlled by requires_grad) ---
         noise_chunk = torch.randn(
             [batch_size, self.chunk_size, C, H, W],
             device=self.device,
@@ -274,7 +277,7 @@ class StreamingTrainingModelPP:
             noise=noise_chunk,
             conditional_dict=conditional_dict,
             current_start_frame=current_length,
-            requires_grad=True,
+            requires_grad=requires_grad,
             return_sim_step=False,
         )
 
