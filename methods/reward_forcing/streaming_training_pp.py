@@ -51,12 +51,35 @@ class StreamingTrainingModelPP:
         self.scheduler = base_model.scheduler
         self.denoising_loss_func = base_model.denoising_loss_func
 
-        # Initialize inference pipeline if not yet created
-        # (ReDMD.__init__ sets inference_pipeline = None; it's lazily created)
+        # Ensure we have a StreamingTrainingPipeline (has generate_chunk_with_cache,
+        # _initialize_kv_cache, etc.). ReDMD._initialize_inference_pipeline() creates
+        # a SelfForcingTrainingPipeline which lacks these streaming methods.
+        # If the existing pipeline is already a StreamingTrainingPipeline (e.g.
+        # created by ReDMDSwitch), keep it; otherwise create a new one.
+        from methods.reward_forcing.pipelines.streaming_training import StreamingTrainingPipeline
+
         self.inference_pipeline = base_model.inference_pipeline
-        if self.inference_pipeline is None:
-            base_model._initialize_inference_pipeline()
-            self.inference_pipeline = base_model.inference_pipeline
+        if self.inference_pipeline is None or not isinstance(
+            self.inference_pipeline, StreamingTrainingPipeline
+        ):
+            self.inference_pipeline = StreamingTrainingPipeline(
+                denoising_step_list=base_model.denoising_step_list,
+                scheduler=base_model.scheduler,
+                generator=base_model.generator,
+                num_frame_per_block=base_model.num_frame_per_block,
+                same_step_across_blocks=getattr(
+                    base_model.args, 'same_step_across_blocks', True
+                ),
+                last_step_only=getattr(base_model.args, 'last_step_only', False),
+                context_noise=getattr(base_model.args, 'context_noise', 0),
+                local_attn_size=getattr(config, 'model_kwargs', {}).get(
+                    'local_attn_size', -1
+                ),
+                slice_last_frames=getattr(config, 'slice_last_frames', 21),
+            )
+            # Update base_model so any code that reads base_model.inference_pipeline
+            # sees the streaming-capable pipeline.
+            base_model.inference_pipeline = self.inference_pipeline
 
         # Model config
         self.num_frame_per_block = base_model.num_frame_per_block
