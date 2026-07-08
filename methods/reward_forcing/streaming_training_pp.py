@@ -50,12 +50,18 @@ class StreamingTrainingModelPP:
         self.fake_score = base_model.fake_score
         self.scheduler = base_model.scheduler
         self.denoising_loss_func = base_model.denoising_loss_func
+
+        # Initialize inference pipeline if not yet created
+        # (ReDMD.__init__ sets inference_pipeline = None; it's lazily created)
         self.inference_pipeline = base_model.inference_pipeline
+        if self.inference_pipeline is None:
+            base_model._initialize_inference_pipeline()
+            self.inference_pipeline = base_model.inference_pipeline
 
         # Model config
         self.num_frame_per_block = base_model.num_frame_per_block
         self.frame_seq_length = getattr(
-            base_model.inference_pipeline, 'frame_seq_length', 1560
+            self.inference_pipeline, 'frame_seq_length', 1560
         )
 
         # Validate
@@ -116,6 +122,12 @@ class StreamingTrainingModelPP:
 
         batch_size = self.image_or_video_shape[0]
 
+        # Reset caches to force fresh initialization each rollout.
+        # SelfForcingTrainingPipeline doesn't have clear_kv_cache(), so we
+        # set to None and let the init checks below recreate them.
+        self.inference_pipeline.kv_cache1 = None
+        self.inference_pipeline.crossattn_cache = None
+
         # Initialize KV cache if needed
         if self.inference_pipeline.kv_cache1 is None:
             self.inference_pipeline._initialize_kv_cache(
@@ -134,9 +146,6 @@ class StreamingTrainingModelPP:
             )
             if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                 print(f"[SF++-Model] Initialized crossattn_cache")
-
-        # Clear existing cache state
-        self.inference_pipeline.clear_kv_cache()
 
         # Prime cache with initial_latent if provided (e.g. for i2v)
         if initial_latent is not None:
