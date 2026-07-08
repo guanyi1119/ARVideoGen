@@ -137,25 +137,56 @@ class TestRolloutLengthTruncation:
 
 
 class TestComputeGeneratorLossDelegation:
-    def test_calls_base_model_with_beta_zero(self):
+    def test_denoises_through_generator_then_dmd_with_beta_zero(self):
+        """Verify compute_generator_loss:
+        1. Adds noise to the detached window (backward noise init)
+        2. Runs the generator to denoise (creates gradient path)
+        3. Passes the generator's output (NOT the window) to DMD loss
+        4. Uses beta=0.0 (pure DMD)
+        """
         pp = _make_pp_without_init(sfpp_beta=0.0)
         pp.base_model = MagicMock()
+        pp.base_model.num_train_timestep = 1000
+        pp.base_model.min_score_timestep = 0
+        pp.base_model.min_step = 0
+        pp.base_model.max_step = 1000
+        pp.base_model.timestep_shift = 1.0
+        pp.base_model._get_timestep.return_value = torch.tensor([[500]], dtype=torch.int64)
+
+        # Mock scheduler.add_noise: receives flattened [21,16,60,104], returns same shape
+        pp.scheduler = MagicMock()
+        pp.scheduler.add_noise.side_effect = lambda x, n, t: x
+
+        # Mock generator: returns (hidden_states, denoised_pred)
+        student_output = torch.randn(1, 21, 16, 60, 104, requires_grad=True)
+        pp.generator = MagicMock(return_value=(MagicMock(), student_output))
+
+        # Mock vae + DMD loss
         pp.base_model.vae.decode_to_pixel.return_value = torch.randn(1, 21, 3, 480, 832)
         pp.base_model.compute_rewarded_distribution_matching_loss.return_value = (
             torch.tensor(0.5, requires_grad=True), {"test": True}
         )
 
-        window = torch.randn(1, 21, 16, 60, 104)
+        window = torch.randn(1, 21, 16, 60, 104)  # detached (no requires_grad)
         cond = {"context": MagicMock()}
         uncond = {"context": MagicMock()}
         loss, log_dict = pp.compute_generator_loss(window, cond, uncond,
                                                     text_prompts=["test"])
 
         assert loss.item() == 0.5
+        # Generator was called with the noised window
+        gen_call_args = pp.generator.call_args
+        assert gen_call_args.kwargs.get("conditional_dict") is cond
+
+        # DMD loss was called with the generator's output (student_output),
+        # NOT with the original window
+        dmd_call_args = pp.base_model.compute_rewarded_distribution_matching_loss.call_args
+        dmd_input = dmd_call_args.kwargs.get("image_or_video")
+        assert dmd_input is student_output, "DMD loss should receive generator output, not the window"
+
         # Verify beta=0.0 was passed (pure DMD)
-        call_kwargs = pp.base_model.compute_rewarded_distribution_matching_loss.call_args
-        assert call_kwargs.kwargs.get("beta", None) == 0.0
-        assert call_kwargs.kwargs.get("gradient_mask") is None
+        assert dmd_call_args.kwargs.get("beta", None) == 0.0
+        assert dmd_call_args.kwargs.get("gradient_mask") is None
 
 
 class TestClearCacheGradients:

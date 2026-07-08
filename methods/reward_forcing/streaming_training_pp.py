@@ -254,24 +254,63 @@ class StreamingTrainingModelPP:
         text_prompts: Optional[list] = None,
         beta: Optional[float] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        """DMD loss on window (backward noise init is inside the loss func).
+        """SF++ DMD loss: denoise window through generator, then DMD on output.
 
-        Delegates to base_model.compute_rewarded_distribution_matching_loss,
-        which internally does:
-          1. scheduler.add_noise(window, noise, timestep)  <- backward noise init
-          2. _compute_kl_grad(noised_window)               <- student vs teacher KL
-          3. 0.5 * exp(beta * reward) * mse                <- DMD loss
+        The window is detached from the no-grad rollout. The DMD loss
+        (compute_rewarded_distribution_matching_loss) requires gradient
+        through its ``image_or_video`` argument -- the gradient flows
+        ``MSE -> original_latent -> generator -> θ``. Passing the detached
+        window directly yields zero gradient.
 
-        With beta=0.0 (default), this is pure DMD: 0.5 * mse.
+        Following the paper's Algorithm 1 (``G_θ(x_t(W), t)``), we:
+          1. Backward noise init: add noise to the detached window
+          2. Generator denoises the noised window  (creates grad through θ)
+          3. DMD loss on the generator's denoised output (has gradient)
         """
         # NOTE: must use `is not None`, NOT `or`, because beta=0.0 is falsy
         beta = beta if beta is not None else self.beta
 
+        batch_size, num_frame = window.shape[:2]
+
+        # --- Step 1: Backward noise init on the detached window ---
+        timestep = self.base_model._get_timestep(
+            min_timestep=getattr(self.base_model, 'min_score_timestep', 0),
+            max_timestep=getattr(self.base_model, 'num_train_timestep', 1000),
+            batch_size=batch_size,
+            num_frame=num_frame,
+            num_frame_per_block=self.num_frame_per_block,
+            uniform_timestep=True,
+        ).to(self.device)
+
+        if getattr(self.base_model, 'timestep_shift', 1) > 1:
+            ts = self.base_model.timestep_shift
+            timestep = ts * (timestep / 1000) / \
+                (1 + (ts - 1) * (timestep / 1000)) * 1000
+        timestep = timestep.clamp(
+            getattr(self.base_model, 'min_step', 0),
+            getattr(self.base_model, 'max_step', 1000),
+        )
+
+        noise = torch.randn_like(window)
+        noised_window = self.scheduler.add_noise(
+            window.flatten(0, 1),
+            noise.flatten(0, 1),
+            timestep.flatten(0, 1),
+        ).unflatten(0, (batch_size, num_frame))
+
+        # --- Step 2: Generator denoises (gradient through θ) ---
+        _, student_output = self.generator(
+            noisy_image_or_video=noised_window,
+            conditional_dict=conditional_dict,
+            timestep=timestep,
+        )
+
+        # --- Step 3: DMD loss on the generator's denoised output ---
         with torch.no_grad():
-            pixels = self.base_model.vae.decode_to_pixel(window).to(self.dtype)
+            pixels = self.base_model.vae.decode_to_pixel(student_output).to(self.dtype)
 
         loss, log_dict = self.base_model.compute_rewarded_distribution_matching_loss(
-            image_or_video=window,
+            image_or_video=student_output,
             pixels=pixels,
             text_prompts=text_prompts,
             conditional_dict=conditional_dict,
