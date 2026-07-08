@@ -134,3 +134,48 @@ class TestRolloutLengthTruncation:
         # So V should be 21+3=24 frames (<= 25)
         assert V.shape[1] <= pp.rollout_length
         assert V.shape[1] > 0
+
+
+class TestComputeGeneratorLossDelegation:
+    def test_calls_base_model_with_beta_zero(self):
+        pp = _make_pp_without_init(sfpp_beta=0.0)
+        pp.base_model = MagicMock()
+        pp.base_model.vae.decode_to_pixel.return_value = torch.randn(1, 21, 3, 480, 832)
+        pp.base_model.compute_rewarded_distribution_matching_loss.return_value = (
+            torch.tensor(0.5, requires_grad=True), {"test": True}
+        )
+
+        window = torch.randn(1, 21, 16, 60, 104)
+        cond = {"context": MagicMock()}
+        uncond = {"context": MagicMock()}
+        loss, log_dict = pp.compute_generator_loss(window, cond, uncond,
+                                                    text_prompts=["test"])
+
+        assert loss.item() == 0.5
+        # Verify beta=0.0 was passed (pure DMD)
+        call_kwargs = pp.base_model.compute_rewarded_distribution_matching_loss.call_args
+        assert call_kwargs.kwargs.get("beta", None) == 0.0
+        assert call_kwargs.kwargs.get("gradient_mask") is None
+
+
+class TestClearCacheGradients:
+    def test_detaches_kv_cache_tensors(self):
+        pp = _make_pp_without_init()
+        grad_t = torch.randn(2, 2, requires_grad=True)
+        no_grad_t = torch.randn(2, 2)
+        pp.inference_pipeline = MagicMock()
+        pp.inference_pipeline.kv_cache1 = [{"k": grad_t.clone(), "v": no_grad_t.clone()}]
+        pp.inference_pipeline.crossattn_cache = None
+
+        pp._clear_cache_gradients()
+
+        assert not pp.inference_pipeline.kv_cache1[0]["k"].requires_grad
+        # v had no grad, stays as-is
+
+    def test_no_error_when_caches_none(self):
+        pp = _make_pp_without_init()
+        pp.inference_pipeline = MagicMock()
+        pp.inference_pipeline.kv_cache1 = None
+        pp.inference_pipeline.crossattn_cache = None
+        # Should not raise
+        pp._clear_cache_gradients()

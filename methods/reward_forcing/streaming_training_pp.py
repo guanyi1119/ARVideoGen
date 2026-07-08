@@ -214,3 +214,170 @@ class StreamingTrainingModelPP:
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"[SF++-Model] Rollout complete: V shape={V.shape}")
         return V
+
+    def compute_generator_loss(
+        self,
+        window: torch.Tensor,
+        conditional_dict: dict,
+        unconditional_dict: dict,
+        text_prompts: Optional[list] = None,
+        beta: Optional[float] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """DMD loss on window (backward noise init is inside the loss func).
+
+        Delegates to base_model.compute_rewarded_distribution_matching_loss,
+        which internally does:
+          1. scheduler.add_noise(window, noise, timestep)  <- backward noise init
+          2. _compute_kl_grad(noised_window)               <- student vs teacher KL
+          3. 0.5 * exp(beta * reward) * mse                <- DMD loss
+
+        With beta=0.0 (default), this is pure DMD: 0.5 * mse.
+        """
+        # NOTE: must use `is not None`, NOT `or`, because beta=0.0 is falsy
+        beta = beta if beta is not None else self.beta
+
+        with torch.no_grad():
+            pixels = self.base_model.vae.decode_to_pixel(window).to(self.dtype)
+
+        loss, log_dict = self.base_model.compute_rewarded_distribution_matching_loss(
+            image_or_video=window,
+            pixels=pixels,
+            text_prompts=text_prompts,
+            conditional_dict=conditional_dict,
+            unconditional_dict=unconditional_dict,
+            gradient_mask=None,
+            beta=beta,
+        )
+        return loss, log_dict
+
+    def _clear_cache_gradients(self):
+        """Detach gradient references in KV cache and cross-attention cache.
+
+        Same logic as StreamingTrainingModel._clear_cache_gradients.
+        Important for preventing memory leaks before critic training.
+        """
+        if hasattr(self.inference_pipeline, 'kv_cache1') and \
+           self.inference_pipeline.kv_cache1 is not None:
+            for cache_block in self.inference_pipeline.kv_cache1:
+                if 'k' in cache_block and cache_block['k'].requires_grad:
+                    cache_block['k'] = cache_block['k'].detach()
+                if 'v' in cache_block and cache_block['v'].requires_grad:
+                    cache_block['v'] = cache_block['v'].detach()
+
+        if hasattr(self.inference_pipeline, 'crossattn_cache') and \
+           self.inference_pipeline.crossattn_cache is not None:
+            for cache_block in self.inference_pipeline.crossattn_cache:
+                if 'k' in cache_block and cache_block['k'].requires_grad:
+                    cache_block['k'] = cache_block['k'].detach()
+                if 'v' in cache_block and cache_block['v'].requires_grad:
+                    cache_block['v'] = cache_block['v'].detach()
+
+    def compute_critic_loss(
+        self,
+        window: torch.Tensor,
+        conditional_dict: dict,
+        chunk_info: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, Dict[str, Any]]:
+        """Critic (fake_score) denoising loss on window.
+
+        Logic pattern copied from StreamingTrainingModel.compute_critic_loss
+        (NOT inherited — standalone implementation in this class).
+        """
+        _t_loss_start = time.time()
+
+        # Critical: ensure window has no gradient connections
+        if window.requires_grad:
+            window = window.detach()
+
+        # Clear gradient references in caches
+        self._clear_cache_gradients()
+
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        batch_size, num_frame = window.shape[:2]
+
+        # Sample timestep (same logic as StreamingTrainingModel.compute_critic_loss)
+        min_timestep = getattr(self.base_model, 'min_score_timestep', 0)
+        max_timestep = getattr(self.base_model, 'num_train_timestep', 1000)
+
+        critic_timestep = self.base_model._get_timestep(
+            min_timestep=min_timestep,
+            max_timestep=max_timestep,
+            batch_size=batch_size,
+            num_frame=num_frame,
+            num_frame_per_block=self.num_frame_per_block,
+            uniform_timestep=True,
+        ).to(self.device)
+
+        # Apply timestep shift
+        if getattr(self.base_model, 'timestep_shift', 1) > 1:
+            timestep_shift = self.base_model.timestep_shift
+            critic_timestep = timestep_shift * \
+                (critic_timestep / 1000) / \
+                (1 + (timestep_shift - 1) * (critic_timestep / 1000)) * 1000
+        critic_timestep = critic_timestep.clamp(
+            getattr(self.base_model, 'min_step', 0),
+            getattr(self.base_model, 'max_step', 1000),
+        )
+
+        # Add noise to window
+        critic_noise = torch.randn_like(window)
+        noisy_window = self.scheduler.add_noise(
+            window.flatten(0, 1),
+            critic_noise.flatten(0, 1),
+            critic_timestep.flatten(0, 1),
+        ).unflatten(0, (batch_size, num_frame))
+
+        # Fake score prediction
+        _, pred_fake = self.fake_score(
+            noisy_image_or_video=noisy_window,
+            conditional_dict=conditional_dict,
+            timestep=critic_timestep,
+        )
+
+        # Compute denoising loss (flow or mse)
+        denoising_loss_type = getattr(
+            self.base_model.args, 'denoising_loss_type', 'mse'
+        )
+        if denoising_loss_type == "flow":
+            from core.wan_wrapper import get_wan_wrapper_classes
+            _, _, WanDiffusionWrapper = get_wan_wrapper_classes('reward_forcing')
+            flow_pred = WanDiffusionWrapper._convert_x0_to_flow_pred(
+                scheduler=self.scheduler,
+                x0_pred=pred_fake.flatten(0, 1),
+                xt=noisy_window.flatten(0, 1),
+                timestep=critic_timestep.flatten(0, 1),
+            )
+            pred_fake_noise = None
+        else:
+            flow_pred = None
+            pred_fake_noise = self.scheduler.convert_x0_to_noise(
+                x=window.flatten(0, 1),
+                xt=noisy_window.flatten(0, 1),
+                timestep=critic_timestep.flatten(0, 1),
+            ).unflatten(0, (batch_size, num_frame))
+
+        denoising_loss = self.denoising_loss_func(
+            x=window.flatten(0, 1),
+            x_pred=pred_fake.flatten(0, 1),
+            noise=critic_noise.flatten(0, 1),
+            noise_pred=pred_fake_noise,
+            alphas_cumprod=self.scheduler.alphas_cumprod,
+            timestep=critic_timestep.flatten(0, 1),
+            flow_pred=flow_pred,
+            gradient_mask=None,
+        )
+
+        # Cleanup intermediate variables
+        del conditional_dict, critic_noise, noisy_window, pred_fake
+        if 'flow_pred' in locals():
+            del flow_pred
+        if 'pred_fake_noise' in locals():
+            del pred_fake_noise
+
+        log_dict = {
+            "loss_time": time.time() - _t_loss_start,
+            "critic_loss": denoising_loss.detach(),
+        }
+        return denoising_loss, log_dict
