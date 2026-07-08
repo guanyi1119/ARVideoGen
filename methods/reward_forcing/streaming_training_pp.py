@@ -145,12 +145,6 @@ class StreamingTrainingModelPP:
 
         batch_size = self.image_or_video_shape[0]
 
-        # Reset caches to force fresh initialization each rollout.
-        # SelfForcingTrainingPipeline doesn't have clear_kv_cache(), so we
-        # set to None and let the init checks below recreate them.
-        self.inference_pipeline.kv_cache1 = None
-        self.inference_pipeline.crossattn_cache = None
-
         # Initialize KV cache if needed
         if self.inference_pipeline.kv_cache1 is None:
             self.inference_pipeline._initialize_kv_cache(
@@ -169,6 +163,11 @@ class StreamingTrainingModelPP:
             )
             if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                 print(f"[SF++-Model] Initialized crossattn_cache")
+
+        # Clear existing cache contents (zeros out tensors, preserves allocation).
+        # StreamingTrainingPipeline.clear_kv_cache() is available now that we
+        # use StreamingTrainingPipeline instead of SelfForcingTrainingPipeline.
+        self.inference_pipeline.clear_kv_cache()
 
         # Prime cache with initial_latent if provided (e.g. for i2v)
         if initial_latent is not None:
