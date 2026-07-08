@@ -187,64 +187,102 @@ class StreamingTrainingModelPP:
             if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                 print(f"[SF++-Model] Primed cache with initial_latent shape={initial_latent.shape}")
 
-    def rollout_long(self, conditional_dict, unconditional_dict,
-                     initial_latent=None, text_prompts=None) -> torch.Tensor:
-        """No-grad long rollout. Returns [B, N, C, H, W] detached.
+    def rollout_and_sample_window(self, conditional_dict, unconditional_dict,
+                                  initial_latent=None, text_prompts=None) -> torch.Tensor:
+        """Rollout context (no-grad) then window (WITH grad).
 
-        Generates chunks sequentially using the rolling KV cache,
-        collecting all clean frames. No gradient is computed during rollout.
+        Returns the window [B, K, C, H, W] which has gradient through the
+        actual rollout generation process (with KV cache context from
+        preceding chunks).
+
+        This implements the paper's Algorithm 1 correctly: the gradient
+        flows through ``dG_θ(z_i)/dθ`` -- the real rollout output -- not
+        through a separate standalone denoising pass. The window IS the
+        rollout output at a random chunk position, generated with KV cache
+        context from previous (detached) chunks.
+
+        Flow:
+          1. Sample window chunk index (synced across ranks)
+          2. Generate context chunks 0..i-1 (no-grad, build KV cache)
+          3. Generate window chunk i (WITH grad) -- the actual rollout output
+          4. Return window (has gradient through generator θ + KV cache context)
         """
         self.setup_sequence(conditional_dict, unconditional_dict, initial_latent,
                             text_prompts)
 
         batch_size = self.image_or_video_shape[0]
         C, H, W = self.image_or_video_shape[2:]
-        V_chunks = []
+
+        # Number of complete chunks that fit in rollout_length
+        num_chunks = self.rollout_length // self.chunk_size
+        assert num_chunks >= 1, \
+            f"rollout_length ({self.rollout_length}) must be >= chunk_size ({self.chunk_size})"
+
+        # Sample window chunk index (synced across ranks)
+        window_chunk_idx = self._synced_random_int(0, num_chunks)
+        window_start_frame = window_chunk_idx * self.chunk_size
+
+        if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+            print(f"[SF++-Model] Window at chunk {window_chunk_idx}/{num_chunks}, "
+                  f"frames {window_start_frame}-{window_start_frame + self.chunk_size}")
+
         current_length = 0
 
+        # --- Step 2: Generate context chunks (no-grad, build KV cache) ---
         with torch.no_grad():
-            while current_length < self.rollout_length:
-                # Compute chunk_frames: min(chunk_size, remaining)
-                remaining = self.rollout_length - current_length
-                chunk_frames = min(self.chunk_size, remaining)
-                # Truncate to a multiple of num_frame_per_block
-                chunk_frames = (chunk_frames // self.num_frame_per_block) * self.num_frame_per_block
-                # If remaining frames are fewer than one block, stop —
-                # generating a partial block would exceed rollout_length and
-                # generate_chunk_with_cache requires block-aligned frames.
-                if chunk_frames == 0:
-                    break
-
+            while current_length < window_start_frame:
                 noise_chunk = torch.randn(
-                    [batch_size, chunk_frames, C, H, W],
+                    [batch_size, self.chunk_size, C, H, W],
                     device=self.device,
                     dtype=self.dtype
                 )
 
                 if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
                     log_gpu_memory(
-                        f"[SF++-Model] Rollout before chunk at frame {current_length}",
+                        f"[SF++-Model] Context chunk at frame {current_length}",
                         device=self.device,
                         rank=dist.get_rank() if dist.is_initialized() else 0
                     )
 
-                chunk, _, _ = self.inference_pipeline.generate_chunk_with_cache(
+                _, _, _ = self.inference_pipeline.generate_chunk_with_cache(
                     noise=noise_chunk,
                     conditional_dict=conditional_dict,
                     current_start_frame=current_length,
                     requires_grad=False,
                     return_sim_step=False,
                 )
-                V_chunks.append(chunk.detach())
-                current_length += chunk_frames
+                current_length += self.chunk_size
 
                 if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
-                    print(f"[SF++-Model] Rollout progress: {current_length}/{self.rollout_length}")
+                    print(f"[SF++-Model] Context rollout: {current_length}/{window_start_frame}")
 
-        V = torch.cat(V_chunks, dim=1)
+        # --- Step 3: Generate window chunk (WITH grad) ---
+        noise_chunk = torch.randn(
+            [batch_size, self.chunk_size, C, H, W],
+            device=self.device,
+            dtype=self.dtype
+        )
+
+        if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
+            log_gpu_memory(
+                f"[SF++-Model] Window chunk at frame {current_length}",
+                device=self.device,
+                rank=dist.get_rank() if dist.is_initialized() else 0
+            )
+
+        window, _, _ = self.inference_pipeline.generate_chunk_with_cache(
+            noise=noise_chunk,
+            conditional_dict=conditional_dict,
+            current_start_frame=current_length,
+            requires_grad=True,
+            return_sim_step=False,
+        )
+
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
-            print(f"[SF++-Model] Rollout complete: V shape={V.shape}")
-        return V
+            print(f"[SF++-Model] Window generated: shape={window.shape}, "
+                  f"requires_grad={window.requires_grad}")
+
+        return window
 
     def compute_generator_loss(
         self,
@@ -254,63 +292,27 @@ class StreamingTrainingModelPP:
         text_prompts: Optional[list] = None,
         beta: Optional[float] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
-        """SF++ DMD loss: denoise window through generator, then DMD on output.
+        """DMD loss on the window (which has gradient through rollout generation).
 
-        The window is detached from the no-grad rollout. The DMD loss
-        (compute_rewarded_distribution_matching_loss) requires gradient
-        through its ``image_or_video`` argument -- the gradient flows
-        ``MSE -> original_latent -> generator -> θ``. Passing the detached
-        window directly yields zero gradient.
+        The window comes from rollout_and_sample_window, which generates it
+        WITH gradient through the actual rollout process (KV cache context
+        from previous detached chunks). The DMD loss
+        (compute_rewarded_distribution_matching_loss) computes:
+          1. scheduler.add_noise(window, noise, timestep)  <- backward noise init
+          2. _compute_kl_grad(noised_window)               <- student vs teacher KL
+          3. 0.5 * exp(beta * reward) * mse                <- DMD loss
 
-        Following the paper's Algorithm 1 (``G_θ(x_t(W), t)``), we:
-          1. Backward noise init: add noise to the detached window
-          2. Generator denoises the noised window  (creates grad through θ)
-          3. DMD loss on the generator's denoised output (has gradient)
+        Gradient flows: MSE -> window -> generator (through rollout) -> θ.
+        With beta=0.0 (default), this is pure DMD: 0.5 * mse.
         """
         # NOTE: must use `is not None`, NOT `or`, because beta=0.0 is falsy
         beta = beta if beta is not None else self.beta
 
-        batch_size, num_frame = window.shape[:2]
-
-        # --- Step 1: Backward noise init on the detached window ---
-        timestep = self.base_model._get_timestep(
-            min_timestep=getattr(self.base_model, 'min_score_timestep', 0),
-            max_timestep=getattr(self.base_model, 'num_train_timestep', 1000),
-            batch_size=batch_size,
-            num_frame=num_frame,
-            num_frame_per_block=self.num_frame_per_block,
-            uniform_timestep=True,
-        ).to(self.device)
-
-        if getattr(self.base_model, 'timestep_shift', 1) > 1:
-            ts = self.base_model.timestep_shift
-            timestep = ts * (timestep / 1000) / \
-                (1 + (ts - 1) * (timestep / 1000)) * 1000
-        timestep = timestep.clamp(
-            getattr(self.base_model, 'min_step', 0),
-            getattr(self.base_model, 'max_step', 1000),
-        )
-
-        noise = torch.randn_like(window)
-        noised_window = self.scheduler.add_noise(
-            window.flatten(0, 1),
-            noise.flatten(0, 1),
-            timestep.flatten(0, 1),
-        ).unflatten(0, (batch_size, num_frame))
-
-        # --- Step 2: Generator denoises (gradient through θ) ---
-        _, student_output = self.generator(
-            noisy_image_or_video=noised_window,
-            conditional_dict=conditional_dict,
-            timestep=timestep,
-        )
-
-        # --- Step 3: DMD loss on the generator's denoised output ---
         with torch.no_grad():
-            pixels = self.base_model.vae.decode_to_pixel(student_output).to(self.dtype)
+            pixels = self.base_model.vae.decode_to_pixel(window).to(self.dtype)
 
         loss, log_dict = self.base_model.compute_rewarded_distribution_matching_loss(
-            image_or_video=student_output,
+            image_or_video=window,
             pixels=pixels,
             text_prompts=text_prompts,
             conditional_dict=conditional_dict,

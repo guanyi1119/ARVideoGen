@@ -1,4 +1,4 @@
-# Self-Forcing++ post-training trainer.
+﻿# Self-Forcing++ post-training trainer.
 #
 # Inherits from StreamingDistillationTrainer to reuse all initialization
 # (model setup, FSDP wrapping, LoRA, optimizer, dataloader, checkpoint
@@ -109,19 +109,16 @@ class PPTrainer(StreamingDistillationTrainer):
                     print(f"[SF++-Trainer] Step {self.step}: starting rollout "
                           f"(N={self.streaming_model.rollout_length})")
 
-                V = self.streaming_model.rollout_long(
+                W = self.streaming_model.rollout_and_sample_window(
                     conditional_dict=conditional_dict,
                     unconditional_dict=unconditional_dict,
                     initial_latent=None,
                     text_prompts=text_prompts,
                 )
 
-                # Step 3: Sample random window
-                W = self.streaming_model.sample_window(V)
-
                 if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
-                    print(f"[SF++-Trainer] Step {self.step}: sampled window "
-                          f"shape={W.shape}")
+                    print(f"[SF++-Trainer] Step {self.step}: window "
+                          f"shape={W.shape}, requires_grad={W.requires_grad}")
 
                 # Zero gradients
                 if TRAIN_GENERATOR:
