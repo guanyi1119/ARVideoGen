@@ -99,3 +99,4 @@ adapter:
 # Trainer selection (informational — entry point directly imports PPTrainer)
 trainer: streaming_distillation_pp
 distribution_loss: dmd
+gradient_checkpointing: true
