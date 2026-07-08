@@ -36,12 +36,24 @@ class PPTrainer(StreamingDistillationTrainer):
     """
 
     def __init__(self, config):
+        # Temporarily disable streaming_training in config so the parent
+        # __init__ skips creating a StreamingTrainingModel (which calls
+        # reset_state() -> clear_kv_cache() on a pipeline that lacks that
+        # method). We create our own StreamingTrainingModelPP after super
+        # returns. The parent only uses this flag in __init__ to decide
+        # whether to build the streaming model; our train() override never
+        # reads self.streaming_training, so restoring it is safe.
+        _original_streaming_training = getattr(config, "streaming_training", False)
+        config.streaming_training = False
+
         # Call parent __init__ — sets up everything:
         # model, FSDP, LoRA, optimizers, dataloader, EMA, checkpoint loading
         super().__init__(config)
 
-        # Replace streaming model with SF++ version
-        # The parent __init__ created a StreamingTrainingModel; we replace it
+        # Restore the original value for any downstream code that reads it
+        config.streaming_training = _original_streaming_training
+
+        # Create SF++ streaming model (replaces the None the parent left)
         self.streaming_model = StreamingTrainingModelPP(self.model, config)
 
         # SF++ does not use the streaming_active / sequence state machine
