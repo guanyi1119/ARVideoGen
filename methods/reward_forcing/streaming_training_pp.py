@@ -355,6 +355,7 @@ class StreamingTrainingModelPP:
         unconditional_dict: dict,
         text_prompts: Optional[list] = None,
         beta: Optional[float] = None,
+        scores: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict[str, Any]]:
         """DMD loss on the window (which has gradient through rollout generation).
 
@@ -368,6 +369,10 @@ class StreamingTrainingModelPP:
 
         Gradient flows: MSE -> window -> generator (through rollout) -> θ.
         With beta=0.0 (default), this is pure DMD: 0.5 * mse.
+
+        When ``scores`` is provided and ``beta > 0``, the reward term blends
+        MQ (motion quality) and VQ (visual quality) per the score value.
+        With beta=0.0, scores has no effect (exp(0)=1).
         """
         # NOTE: must use `is not None`, NOT `or`, because beta=0.0 is falsy
         beta = beta if beta is not None else self.beta
@@ -383,6 +388,7 @@ class StreamingTrainingModelPP:
             unconditional_dict=unconditional_dict,
             gradient_mask=None,
             beta=beta,
+            scores=scores,
         )
         return loss, log_dict
 

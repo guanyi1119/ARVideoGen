@@ -10,6 +10,7 @@
 # arXiv: 2510.02283
 #
 # SPDX-License-Identifier: Apache-2.0
+import gc
 import time
 from datetime import datetime
 
@@ -116,10 +117,19 @@ class PPTrainer(StreamingDistillationTrainer):
         (TwoText dataset), also encodes the switch conditional dict and
         computes a synced switch_frame_index via the parent's
         _get_switch_frame_index.
+
+        Returns a 7-tuple:
+          (text_prompts, conditional_dict, unconditional_dict,
+           switch_prompts, switch_conditional_dict, switch_frame_index,
+           scores)
+        where switch_prompts/switch_conditional_dict/switch_frame_index
+        are None when no switch prompt is configured, and scores is None
+        when the dataset does not provide per-prompt dynamism scores.
         """
         batch = next(self.dataloader)
         text_prompts = batch["prompts"]
         switch_prompts = batch.get("switch_prompts", None)
+        scores = batch.get("scores", None)
 
         with torch.no_grad():
             conditional_dict = self.model.text_encoder(text_prompts=text_prompts)
@@ -147,7 +157,7 @@ class PPTrainer(StreamingDistillationTrainer):
                       f"(rollout_length={self.streaming_model.rollout_length})")
 
         return text_prompts, conditional_dict, self._cached_uncond, \
-            switch_prompts, switch_conditional_dict, switch_frame_index
+            switch_prompts, switch_conditional_dict, switch_frame_index, scores
 
     def train(self):
         """SF++ training loop: rollout -> sample -> DMD -> update."""
@@ -169,7 +179,7 @@ class PPTrainer(StreamingDistillationTrainer):
 
                 # Step 1: Get batch and encode text (+ switch prompts if any)
                 text_prompts, conditional_dict, unconditional_dict, \
-                    switch_prompts, switch_conditional_dict, switch_frame_index = \
+                    switch_prompts, switch_conditional_dict, switch_frame_index, scores = \
                     self._get_batch_and_encode()
 
                 # Step 2: SF++ core - long rollout + window sampling
@@ -219,6 +229,7 @@ class PPTrainer(StreamingDistillationTrainer):
                         conditional_dict=window_conditional_dict,
                         unconditional_dict=unconditional_dict,
                         text_prompts=window_text_prompts,
+                        scores=scores,
                     )
                     scaled_gen_loss = gen_loss / self.gradient_accumulation_steps
                     scaled_gen_loss.backward()
@@ -303,11 +314,39 @@ class PPTrainer(StreamingDistillationTrainer):
                     self.save()
                     torch.cuda.empty_cache()
 
+                # Periodic garbage collection (aligns with streaming_distillation)
+                gc_interval = getattr(self.config, 'gc_interval', 100)
+                if self.step % gc_interval == 0:
+                    gc.collect()
+                    torch.cuda.empty_cache()
+
                 if dist.is_initialized():
                     dist.barrier()
+
+                # Termination check
+                if self.step > self.config.max_iters:
+                    if self.is_main_process:
+                        print(f"[SF++-Trainer] Reached max_iters "
+                              f"({self.config.max_iters}), stopping training")
+                    break
 
         except KeyboardInterrupt:
             if self.is_main_process:
                 print("Training interrupted by user")
             if not getattr(self.config, 'no_save', False):
                 self.save()
+        except Exception as e:
+            if self.is_main_process:
+                print(f"[ERROR] Training crashed at step {self.step} "
+                      f"with exception: {e}")
+                import traceback
+                traceback.print_exc()
+            raise
+        finally:
+            if hasattr(self, 'writer') and self.writer is not None:
+                try:
+                    self.writer.close()
+                except Exception as cleanup_e:
+                    if self.is_main_process:
+                        print(f"[WARNING] Failed to close TensorBoard "
+                              f"writer: {cleanup_e}")

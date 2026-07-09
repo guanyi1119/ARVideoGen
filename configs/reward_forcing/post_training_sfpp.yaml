@@ -4,7 +4,7 @@
 default_config_path: configs/reward_forcing/default_config.yaml
 
 # Start from distilled checkpoint (user must provide)
-generator_ckpt: checkpoints/reward_forcing/distilled_model.pt
+generator_ckpt: /cache/reward_forcing_dmd.pt
 reward_model_path: /cache/VideoReward
 
 # Model

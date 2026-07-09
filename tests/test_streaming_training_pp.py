@@ -92,6 +92,42 @@ class TestComputeGeneratorLossDelegation:
         assert dmd_call_args.kwargs.get("beta", None) == 0.0
         assert dmd_call_args.kwargs.get("gradient_mask") is None
 
+    def test_scores_forwarded_to_dmd_when_provided(self):
+        """Verify compute_generator_loss forwards scores to DMD loss."""
+        pp = _make_pp_without_init(sfpp_beta=0.0)
+        pp.base_model = MagicMock()
+        pp.base_model.vae.decode_to_pixel.return_value = torch.randn(1, 21, 3, 480, 832)
+        pp.base_model.compute_rewarded_distribution_matching_loss.return_value = (
+            torch.tensor(0.5, requires_grad=True), {"test": True}
+        )
+
+        window = torch.randn(1, 21, 16, 60, 104, requires_grad=True)
+        cond = {"context": MagicMock()}
+        uncond = {"context": MagicMock()}
+        scores = torch.tensor([0.7])
+        pp.compute_generator_loss(window, cond, uncond,
+                                  text_prompts=["test"], scores=scores)
+
+        dmd_call_args = pp.base_model.compute_rewarded_distribution_matching_loss.call_args
+        assert dmd_call_args.kwargs.get("scores") is scores, "scores should be forwarded to DMD loss"
+
+    def test_scores_defaults_to_none_when_not_provided(self):
+        """Verify compute_generator_loss passes scores=None by default."""
+        pp = _make_pp_without_init(sfpp_beta=0.0)
+        pp.base_model = MagicMock()
+        pp.base_model.vae.decode_to_pixel.return_value = torch.randn(1, 21, 3, 480, 832)
+        pp.base_model.compute_rewarded_distribution_matching_loss.return_value = (
+            torch.tensor(0.5, requires_grad=True), {"test": True}
+        )
+
+        window = torch.randn(1, 21, 16, 60, 104, requires_grad=True)
+        cond = {"context": MagicMock()}
+        uncond = {"context": MagicMock()}
+        pp.compute_generator_loss(window, cond, uncond, text_prompts=["test"])
+
+        dmd_call_args = pp.base_model.compute_rewarded_distribution_matching_loss.call_args
+        assert dmd_call_args.kwargs.get("scores") is None, "scores should default to None"
+
 
 class TestClearCacheGradients:
     def test_detaches_kv_cache_tensors(self):
