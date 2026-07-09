@@ -56,6 +56,11 @@ sfpp_beta: 0.0                  # 0 = pure DMD; >0 = rewarded DMD
 sfpp_train_critic: true         # train critic alongside generator
 dfake_gen_update_ratio: 5       # 1 critic step per 5 generator steps
 
+# Prompt switch mode: random within [min, max) at block granularity
+switch_mode: random
+min_switch_frame_index: 21
+max_switch_frame_index: 129
+
 # Streaming (reused by inference_pipeline for KV cache init)
 streaming_training: true
 streaming_chunk_size: 21
