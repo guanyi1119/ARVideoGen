@@ -54,6 +54,13 @@ class StreamingTrainingModelPP:
         self.window_kv_cache_zero_prob = float(getattr(config, "window_kv_cache_zero_prob", 0.0))
         self.neg_prompt_zero_prob = float(getattr(config, "neg_prompt_zero_prob", 0.0))
 
+        # Biased window sampling: probability of forcing the window to cover
+        # the switch frame. When a switch is active, this fraction of rollouts
+        # will place the window so it straddles the switch boundary, giving
+        # the switch-prompt region denser training signal. The rest are
+        # uniform random. Default 0.3 = ~30% of rollouts cover the switch.
+        self.switch_window_prob = float(getattr(config, "sfpp_switch_window_prob", 0.3))
+
         # Get required components from the underlying model
         self.generator = base_model.generator
         self.fake_score = base_model.fake_score
@@ -287,13 +294,6 @@ class StreamingTrainingModelPP:
             f"rollout_length ({self.rollout_length}) too small for window_size " \
             f"({self.window_size}) at {bsz} frames/block"
 
-        # Sample window start block (synced across ranks).
-        # Window can start at any block boundary: 0, 1, 2, ..., num_blocks_total - window_num_blocks
-        window_start_block = self._synced_random_int(
-            0, num_blocks_total - window_num_blocks + 1
-        )
-        window_start_frame = window_start_block * bsz
-
         # Determine the switch block boundary (first block that uses switch dict)
         switch_block_idx = None
         if switch_conditional_dict is not None and switch_frame_index is not None:
@@ -301,6 +301,33 @@ class StreamingTrainingModelPP:
             if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                 print(f"[SF++-Model] Switch at frame {switch_frame_index} -> "
                       f"block {switch_block_idx}/{num_blocks_total}")
+
+        # --- Sample window start block (synced across ranks) ---
+        # Biased sampling: when a switch is active, with probability
+        # switch_window_prob we force the window to cover the switch block.
+        # The rest of the time (and always when no switch) we sample uniformly.
+        max_start_block = num_blocks_total - window_num_blocks  # e.g. 43
+
+        use_bias = False
+        if switch_block_idx is not None and self.switch_window_prob > 0:
+            # Bernoulli decision synced across ranks
+            roll = self._synced_random_int(0, 100)
+            use_bias = roll < int(self.switch_window_prob * 100)
+
+        if use_bias:
+            # Window must cover switch_block_idx: window_start in
+            # [max(0, switch_block - window_num_blocks + 1), min(switch_block, max_start_block)]
+            lo = max(0, switch_block_idx - window_num_blocks + 1)
+            hi = min(switch_block_idx, max_start_block)
+            window_start_block = self._synced_random_int(lo, hi + 1)
+            if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+                print(f"[SF++-Model] Biased window sampling: covering switch block "
+                      f"{switch_block_idx}, start_block={window_start_block}")
+        else:
+            # Uniform random across all valid start positions
+            window_start_block = self._synced_random_int(0, max_start_block + 1)
+
+        window_start_frame = window_start_block * bsz
 
         # Helper: pick the right conditional dict for a given block index
         def _dict_for_block(block_idx: int) -> dict:

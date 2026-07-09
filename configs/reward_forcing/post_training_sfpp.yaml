@@ -55,6 +55,7 @@ sfpp_window_size: 21            # K (window = teacher horizon)
 sfpp_beta: 0.0                  # 0 = pure DMD; >0 = rewarded DMD
 sfpp_train_critic: true         # train critic alongside generator
 dfake_gen_update_ratio: 5       # 1 critic step per 5 generator steps
+sfpp_switch_window_prob: 0.3    # P(window covers switch frame); 0.0 = uniform random
 
 # Generator-level enlarged CFG (step-level CFG inside window block generation).
 # cfg_scale: CFG strength (0.0 = disabled). When >0, each denoising step of
