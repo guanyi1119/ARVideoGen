@@ -16,6 +16,7 @@ from datetime import datetime
 import torch
 import torch.distributed as dist
 
+from core.data.dataset import TextDataset, TwoTextDataset, TextScoreDataset, TwoTextScoreDataset, cycle
 from core.misc import merge_dict_list
 from core.misc.debug_option import DEBUG, LOG_GPU_MEMORY
 from core.misc.memory import log_gpu_memory
@@ -59,6 +60,30 @@ class PPTrainer(StreamingDistillationTrainer):
         # SF++ does not use the streaming_active / sequence state machine
         self.streaming_active = False
 
+        # If switch_prompt_path is configured, rebuild the dataloader with a
+        # TwoText variant so each batch also carries "switch_prompts". The
+        # parent Trainer only selects TwoText datasets when
+        # distribution_loss == "dmd_switch", but SF++ uses "dmd" (ReDMD), so
+        # we rebuild here to support prompt switching in the long rollout.
+        switch_prompt_path = getattr(config, "switch_prompt_path", None)
+        if switch_prompt_path:
+            use_score = getattr(config, "use_score", False)
+            if use_score:
+                dataset = TwoTextScoreDataset(config.data_path, switch_prompt_path)
+            else:
+                dataset = TwoTextDataset(config.data_path, switch_prompt_path)
+            sampler = torch.utils.data.distributed.DistributedSampler(
+                dataset, shuffle=True, drop_last=True)
+            dataloader = torch.utils.data.DataLoader(
+                dataset,
+                batch_size=config.batch_size,
+                sampler=sampler,
+                num_workers=8)
+            if dist.get_rank() == 0:
+                print(f"[SF++-Trainer] Switch-prompt dataset loaded: "
+                      f"{len(dataset)} samples, switch_prompt_path={switch_prompt_path}")
+            self.dataloader = cycle(dataloader)
+
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"[SF++-Trainer] Initialized PPTrainer with "
                   f"rollout_length={self.streaming_model.rollout_length}, "
@@ -68,10 +93,14 @@ class PPTrainer(StreamingDistillationTrainer):
         """Get next batch and encode text prompts into conditional dicts.
 
         Caches the unconditional dict (negative prompt encoding) since it
-        is identical across steps — only the conditional dict changes.
+        is identical across steps. When the batch contains "switch_prompts"
+        (TwoText dataset), also encodes the switch conditional dict and
+        computes a synced switch_frame_index via the parent's
+        _get_switch_frame_index.
         """
         batch = next(self.dataloader)
         text_prompts = batch["prompts"]
+        switch_prompts = batch.get("switch_prompts", None)
 
         with torch.no_grad():
             conditional_dict = self.model.text_encoder(text_prompts=text_prompts)
@@ -80,7 +109,26 @@ class PPTrainer(StreamingDistillationTrainer):
                 unconditional_dict = self.model.text_encoder(text_prompts=uncond_prompts)
                 self._cached_uncond = {k: v.detach() for k, v in unconditional_dict.items()}
 
-        return text_prompts, conditional_dict, self._cached_uncond
+        # Encode switch prompts if present
+        switch_conditional_dict = None
+        switch_frame_index = None
+        if switch_prompts is not None:
+            with torch.no_grad():
+                switch_conditional_dict = self.model.text_encoder(
+                    text_prompts=switch_prompts
+                )
+            # Compute switch frame index (synced across ranks) for the
+            # rollout length. The parent's _get_switch_frame_index handles
+            # fixed/random/random_choice modes and broadcasts from rank 0.
+            switch_frame_index = self._get_switch_frame_index(
+                self.streaming_model.rollout_length
+            )
+            if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+                print(f"[SF++-Trainer] Switch at frame {switch_frame_index} "
+                      f"(rollout_length={self.streaming_model.rollout_length})")
+
+        return text_prompts, conditional_dict, self._cached_uncond, \
+            switch_prompts, switch_conditional_dict, switch_frame_index
 
     def train(self):
         """SF++ training loop: rollout -> sample -> DMD -> update."""
@@ -100,8 +148,9 @@ class PPTrainer(StreamingDistillationTrainer):
                                    device=self.device,
                                    rank=dist.get_rank() if dist.is_initialized() else 0)
 
-                # Step 1: Get batch and encode text
-                text_prompts, conditional_dict, unconditional_dict = \
+                # Step 1: Get batch and encode text (+ switch prompts if any)
+                text_prompts, conditional_dict, unconditional_dict, \
+                    switch_prompts, switch_conditional_dict, switch_frame_index = \
                     self._get_batch_and_encode()
 
                 # Step 2: SF++ core - long rollout + window sampling
@@ -114,17 +163,29 @@ class PPTrainer(StreamingDistillationTrainer):
                           f"(N={self.streaming_model.rollout_length}, "
                           f"requires_grad={TRAIN_GENERATOR})")
 
-                W = self.streaming_model.rollout_and_sample_window(
+                W, window_conditional_dict = self.streaming_model.rollout_and_sample_window(
                     conditional_dict=conditional_dict,
                     unconditional_dict=unconditional_dict,
                     initial_latent=None,
                     text_prompts=text_prompts,
                     requires_grad=TRAIN_GENERATOR,
+                    switch_conditional_dict=switch_conditional_dict,
+                    switch_frame_index=switch_frame_index,
+                )
+
+                # When the window falls after the switch frame, use the switch
+                # prompt for the loss computation so the score models and reward
+                # see the correct prompt for the window content.
+                window_text_prompts = (
+                    switch_prompts
+                    if window_conditional_dict is not conditional_dict
+                    else text_prompts
                 )
 
                 if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                     print(f"[SF++-Trainer] Step {self.step}: window "
-                          f"shape={W.shape}, requires_grad={W.requires_grad}")
+                          f"shape={W.shape}, requires_grad={W.requires_grad}, "
+                          f"using_switch={window_conditional_dict is not conditional_dict}")
 
                 # Zero gradients
                 if TRAIN_GENERATOR:
@@ -136,9 +197,9 @@ class PPTrainer(StreamingDistillationTrainer):
                 if TRAIN_GENERATOR:
                     gen_loss, gen_log = self.streaming_model.compute_generator_loss(
                         window=W,
-                        conditional_dict=conditional_dict,
+                        conditional_dict=window_conditional_dict,
                         unconditional_dict=unconditional_dict,
-                        text_prompts=text_prompts,
+                        text_prompts=window_text_prompts,
                     )
                     scaled_gen_loss = gen_loss / self.gradient_accumulation_steps
                     scaled_gen_loss.backward()
@@ -152,7 +213,7 @@ class PPTrainer(StreamingDistillationTrainer):
                 # Step 5: Critic loss + backward (every step)
                 critic_loss, critic_log = self.streaming_model.compute_critic_loss(
                     window=W.detach(),
-                    conditional_dict=conditional_dict,
+                    conditional_dict=window_conditional_dict,
                 )
                 scaled_critic_loss = critic_loss / self.gradient_accumulation_steps
                 scaled_critic_loss.backward()

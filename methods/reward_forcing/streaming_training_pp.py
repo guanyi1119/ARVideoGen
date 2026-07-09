@@ -189,26 +189,35 @@ class StreamingTrainingModelPP:
 
     def rollout_and_sample_window(self, conditional_dict, unconditional_dict,
                                   initial_latent=None, text_prompts=None,
-                                  requires_grad: bool = True) -> torch.Tensor:
+                                  requires_grad: bool = True,
+                                  switch_conditional_dict=None,
+                                  switch_frame_index=None) -> Tuple[torch.Tensor, dict]:
         """Rollout context (no-grad) then window (grad controlled by requires_grad).
 
-        Returns the window [B, K, C, H, W]. When requires_grad=True, the window
-        has gradient through the actual rollout generation process (with KV cache
-        context from preceding chunks). When requires_grad=False, the entire
-        rollout runs under torch.no_grad() -- use this for critic-only steps to
-        avoid building an unused generator graph that would leak memory.
+        Returns ``(window, window_conditional_dict)`` where window is
+        [B, K, C, H, W] and window_conditional_dict is the conditional dict
+        that applies to the window chunk (equals ``conditional_dict`` when no
+        switch, or ``switch_conditional_dict`` when the window falls after
+        the switch frame).
 
-        This implements the paper's Algorithm 1 correctly: the gradient
-        flows through ``dG_θ(z_i)/dθ`` -- the real rollout output -- not
-        through a separate standalone denoising pass. The window IS the
-        rollout output at a random chunk position, generated with KV cache
-        context from previous (detached) chunks.
+        When requires_grad=True, the window has gradient through the actual
+        rollout generation process (with KV cache context from preceding
+        chunks). When requires_grad=False, the entire rollout runs under
+        torch.no_grad() -- use this for critic-only steps to avoid building
+        an unused generator graph that would leak memory.
+
+        When ``switch_conditional_dict`` and ``switch_frame_index`` are
+        provided, context chunks at/after the switch frame use the switch
+        dict instead of the original dict. The switch frame is rounded down
+        to the nearest chunk boundary so the switch always happens between
+        chunks (never within a single chunk).
 
         Flow:
           1. Sample window chunk index (synced across ranks)
-          2. Generate context chunks 0..i-1 (no-grad, build KV cache)
+          2. Generate context chunks 0..i-1 (no-grad, build KV cache),
+             using switch_conditional_dict for chunks at/after switch
           3. Generate window chunk i (grad per requires_grad) -- the actual rollout output
-          4. Return window (has gradient through generator θ + KV cache context if requires_grad)
+          4. Return (window, window_conditional_dict)
         """
         self.setup_sequence(conditional_dict, unconditional_dict, initial_latent,
                             text_prompts)
@@ -225,11 +234,30 @@ class StreamingTrainingModelPP:
         window_chunk_idx = self._synced_random_int(0, num_chunks)
         window_start_frame = window_chunk_idx * self.chunk_size
 
+        # Determine the switch chunk boundary (first chunk that uses switch dict)
+        switch_chunk_idx = None
+        if switch_conditional_dict is not None and switch_frame_index is not None:
+            switch_chunk_idx = switch_frame_index // self.chunk_size
+            if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+                print(f"[SF++-Model] Switch at frame {switch_frame_index} -> "
+                      f"chunk {switch_chunk_idx}/{num_chunks}")
+
+        # Helper: pick the right conditional dict for a given chunk index
+        def _dict_for_chunk(chunk_idx: int) -> dict:
+            if switch_chunk_idx is not None and chunk_idx >= switch_chunk_idx:
+                return switch_conditional_dict
+            return conditional_dict
+
+        # The conditional dict that applies to the window chunk (for losses)
+        window_conditional_dict = _dict_for_chunk(window_chunk_idx)
+
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"[SF++-Model] Window at chunk {window_chunk_idx}/{num_chunks}, "
-                  f"frames {window_start_frame}-{window_start_frame + self.chunk_size}")
+                  f"frames {window_start_frame}-{window_start_frame + self.chunk_size}, "
+                  f"using_switch={window_conditional_dict is not conditional_dict}")
 
         current_length = 0
+        chunk_idx = 0
 
         # --- Step 2: Generate context chunks (no-grad, build KV cache) ---
         with torch.no_grad():
@@ -249,12 +277,13 @@ class StreamingTrainingModelPP:
 
                 _, _, _ = self.inference_pipeline.generate_chunk_with_cache(
                     noise=noise_chunk,
-                    conditional_dict=conditional_dict,
+                    conditional_dict=_dict_for_chunk(chunk_idx),
                     current_start_frame=current_length,
                     requires_grad=False,
                     return_sim_step=False,
                 )
                 current_length += self.chunk_size
+                chunk_idx += 1
 
                 if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                     print(f"[SF++-Model] Context rollout: {current_length}/{window_start_frame}")
@@ -275,7 +304,7 @@ class StreamingTrainingModelPP:
 
         window, _, _ = self.inference_pipeline.generate_chunk_with_cache(
             noise=noise_chunk,
-            conditional_dict=conditional_dict,
+            conditional_dict=window_conditional_dict,
             current_start_frame=current_length,
             requires_grad=requires_grad,
             return_sim_step=False,
@@ -285,7 +314,7 @@ class StreamingTrainingModelPP:
             print(f"[SF++-Model] Window generated: shape={window.shape}, "
                   f"requires_grad={window.requires_grad}")
 
-        return window
+        return window, window_conditional_dict
 
     def compute_generator_loss(
         self,
