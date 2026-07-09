@@ -192,7 +192,7 @@ class PPTrainer(StreamingDistillationTrainer):
                           f"(N={self.streaming_model.rollout_length}, "
                           f"requires_grad={TRAIN_GENERATOR})")
 
-                W, window_conditional_dict = self.streaming_model.rollout_and_sample_window(
+                W, window_conditional_dict, window_start_frame = self.streaming_model.rollout_and_sample_window(
                     conditional_dict=conditional_dict,
                     unconditional_dict=unconditional_dict,
                     initial_latent=None,
@@ -301,6 +301,7 @@ class PPTrainer(StreamingDistillationTrainer):
                         f"generator_loss: {gen_loss_val:.4f} "
                         f"critic_loss: {critic_loss.item():.4f} "
                         f"switch_idx: {switch_frame_index if switch_frame_index is not None else '-'} "
+                        f"window_idx: {window_start_frame}-{window_start_frame + self.streaming_model.window_size} "
                         f"DI_throughput: {throughput:.2f} tokens/s/npu"
                     )
                     if not self.disable_logging:

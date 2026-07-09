@@ -45,6 +45,15 @@ class StreamingTrainingModelPP:
         self.beta = getattr(config, "sfpp_beta", 0.0)
         self.chunk_size = getattr(config, "streaming_chunk_size", 21)
 
+        # Generator-level enlarged CFG (step-level CFG inside generate_chunk_with_cache).
+        # Three independent probability switches control which uncond degradations are
+        # applied (sink zero / window zero / neg prompt). kv_cache_cfg_scale controls
+        # the CFG strength. All default to 0.0 = disabled.
+        self.kv_cache_cfg_scale = float(getattr(config, "kv_cache_cfg_scale", 0.0))
+        self.sink_kv_cache_zero_prob = float(getattr(config, "sink_kv_cache_zero_prob", 0.0))
+        self.window_kv_cache_zero_prob = float(getattr(config, "window_kv_cache_zero_prob", 0.0))
+        self.neg_prompt_zero_prob = float(getattr(config, "neg_prompt_zero_prob", 0.0))
+
         # Get required components from the underlying model
         self.generator = base_model.generator
         self.fake_score = base_model.fake_score
@@ -116,6 +125,35 @@ class StreamingTrainingModelPP:
             return tensor_val.item()
         else:
             return _random.randint(low, high - 1)
+
+    def _decide_cfg_degradations(self) -> Tuple[bool, bool, bool]:
+        """Decide which CFG degradations fire this rollout (synced across ranks).
+
+        Returns (zero_sink, zero_window, use_neg_prompt).
+        Same logic as StreamingTrainingModel._decide_cfg_degradations.
+        """
+        decisions = torch.zeros(3, device=self.device, dtype=torch.float32)
+        if dist.is_initialized():
+            if dist.get_rank() == 0:
+                if self.sink_kv_cache_zero_prob > 0:
+                    decisions[0] = _random.random()
+                if self.window_kv_cache_zero_prob > 0:
+                    decisions[1] = _random.random()
+                if self.neg_prompt_zero_prob > 0:
+                    decisions[2] = _random.random()
+            dist.broadcast(decisions, src=0)
+        else:
+            if self.sink_kv_cache_zero_prob > 0:
+                decisions[0] = _random.random()
+            if self.window_kv_cache_zero_prob > 0:
+                decisions[1] = _random.random()
+            if self.neg_prompt_zero_prob > 0:
+                decisions[2] = _random.random()
+
+        zero_sink = decisions[0].item() < self.sink_kv_cache_zero_prob
+        zero_window = decisions[1].item() < self.window_kv_cache_zero_prob
+        use_neg = decisions[2].item() < self.neg_prompt_zero_prob
+        return zero_sink, zero_window, use_neg
 
     def sample_window(self, V: torch.Tensor, K: int = None) -> torch.Tensor:
         """Random contiguous window [B, K, C, H, W] detached.
@@ -191,7 +229,7 @@ class StreamingTrainingModelPP:
                                   initial_latent=None, text_prompts=None,
                                   requires_grad: bool = True,
                                   switch_conditional_dict=None,
-                                  switch_frame_index=None) -> Tuple[torch.Tensor, dict]:
+                                  switch_frame_index=None) -> Tuple[torch.Tensor, dict, int]:
         """Rollout context (no-grad) then window (grad controlled by requires_grad).
 
         Returns ``(window, window_conditional_dict)`` where window is
@@ -215,10 +253,16 @@ class StreamingTrainingModelPP:
         If the window spans the switch, the loss uses the first block's
         dict (an approximation noted here for completeness).
 
+        When ``kv_cache_cfg_scale > 0`` and this is a generator step with
+        window not at the very start, step-level enlarged CFG is applied
+        to window blocks: each denoising step runs twice (cond + uncond
+        clone with optional zeroed sink/window + neg prompt) and predictions
+        are CFG-combined. Context blocks (before the window) never get CFG.
+
         Flow:
           1. Compute block counts; sample window start block (synced across ranks)
           2. Generate context blocks 0..i-1 (no-grad, build KV cache)
-          3. Generate window blocks i..i+W-1 (grad per requires_grad)
+          3. Generate window blocks i..i+W-1 (grad per requires_grad, +CFG if enabled)
           4. Concatenate window block outputs -> window tensor
           5. Return (window, window_conditional_dict)
         """
@@ -313,6 +357,40 @@ class StreamingTrainingModelPP:
         # same exit_flag for all 7 blocks. Independent exit flags give
         # more training diversity and match inference behavior (where each
         # block goes through the full denoising_step_list independently).
+
+        # Determine whether step-level CFG should fire for window blocks.
+        # CFG only applies on generator steps (not critic), when the window
+        # is not at the very start (needs history in KV cache), and when
+        # at least one degradation probability is set.
+        apply_cfg = (
+            requires_grad
+            and window_start_block > 0
+            and self.kv_cache_cfg_scale > 0
+            and (
+                self.sink_kv_cache_zero_prob > 0
+                or self.window_kv_cache_zero_prob > 0
+                or self.neg_prompt_zero_prob > 0
+            )
+            and self.inference_pipeline.kv_cache1 is not None
+        )
+
+        cfg_kwargs = {}
+        if apply_cfg:
+            zero_sink, zero_window, use_neg = self._decide_cfg_degradations()
+            if zero_sink or zero_window or use_neg:
+                cfg_kwargs["cfg_uncond_dict"] = (
+                    unconditional_dict if use_neg else window_conditional_dict
+                )
+                cfg_kwargs["cfg_zero_sink"] = zero_sink
+                cfg_kwargs["cfg_zero_window"] = zero_window
+                cfg_kwargs["cfg_scale"] = self.kv_cache_cfg_scale
+                if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
+                    print(
+                        f"[SF++-Model] Step-level CFG on window: sink={zero_sink}, "
+                        f"window={zero_window}, neg_prompt={use_neg}, "
+                        f"cfg_scale={self.kv_cache_cfg_scale}"
+                    )
+
         window_outputs = []
         for _ in range(window_num_blocks):
             noise_block = torch.randn(
@@ -334,6 +412,7 @@ class StreamingTrainingModelPP:
                 current_start_frame=current_length,
                 requires_grad=requires_grad,
                 return_sim_step=False,
+                **cfg_kwargs,
             )
             window_outputs.append(block_output)
             current_length += bsz
@@ -346,7 +425,7 @@ class StreamingTrainingModelPP:
             print(f"[SF++-Model] Window generated: shape={window.shape}, "
                   f"requires_grad={window.requires_grad}")
 
-        return window, window_conditional_dict
+        return window, window_conditional_dict, window_start_frame
 
     def compute_generator_loss(
         self,
