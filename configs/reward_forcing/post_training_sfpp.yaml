@@ -39,7 +39,8 @@ beta1: 0.0
 beta2: 0.999
 beta1_critic: 0.0
 beta2_critic: 0.999
-data_path: /cache/vidprom_filtered_extended.txt
+data_path: /cache/vidprom_filtered_extended_llm_scored.jsonl
+use_score: true
 switch_prompt_path: /cache/vidprom_filtered_extended_switch.txt
 batch_size: 1
 gradient_accumulation_steps: 1
@@ -101,7 +102,7 @@ vis_ema: false
 vis_video_lengths:
   - 150
 val_batch_size: 1
-val_data_path: /cache/vidprom_filtered_extended.txt
+val_data_path: /cache/vidprom_filtered_extended_llm_scored.jsonl
 val_switch_prompt_path: /cache/vidprom_filtered_extended_switch.txt
 slice_last_frames: 21
 
