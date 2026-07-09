@@ -300,6 +300,7 @@ class PPTrainer(StreamingDistillationTrainer):
                         f"{timestamp}: [SF++ step {self.step}] "
                         f"generator_loss: {gen_loss_val:.4f} "
                         f"critic_loss: {critic_loss.item():.4f} "
+                        f"switch_idx: {switch_frame_index if switch_frame_index is not None else '-'} "
                         f"DI_throughput: {throughput:.2f} tokens/s/npu"
                     )
                     if not self.disable_logging:
