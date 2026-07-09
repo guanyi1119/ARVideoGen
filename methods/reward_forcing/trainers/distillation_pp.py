@@ -89,6 +89,25 @@ class PPTrainer(StreamingDistillationTrainer):
                   f"rollout_length={self.streaming_model.rollout_length}, "
                   f"window_size={self.streaming_model.window_size}")
 
+    def _get_switch_frame_index(self, max_length=None):
+        """Override parent to default to half the rollout length.
+
+        The parent defaults ``fixed_switch_index`` to 21, which was
+        appropriate for a 42-frame rollout but is far too early for SF++'s
+        150-frame rollout. When the config does not explicitly set
+        ``fixed_switch_index``, we default to ``max_length // 2``. For
+        ``random`` / ``random_choice`` modes the parent logic is unchanged.
+        """
+        if getattr(self.config, "switch_mode", "fixed") == "fixed":
+            switch_idx = getattr(self.config, "fixed_switch_index", None)
+            if switch_idx is None:
+                switch_idx = (max_length or 42) // 2
+            if max_length is not None:
+                assert max_length > switch_idx, \
+                    f"max_length {max_length} is not greater than switch_idx {switch_idx}"
+            return switch_idx
+        return super()._get_switch_frame_index(max_length)
+
     def _get_batch_and_encode(self):
         """Get next batch and encode text prompts into conditional dicts.
 
