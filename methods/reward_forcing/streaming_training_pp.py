@@ -195,120 +195,152 @@ class StreamingTrainingModelPP:
         """Rollout context (no-grad) then window (grad controlled by requires_grad).
 
         Returns ``(window, window_conditional_dict)`` where window is
-        [B, K, C, H, W] and window_conditional_dict is the conditional dict
-        that applies to the window chunk (equals ``conditional_dict`` when no
-        switch, or ``switch_conditional_dict`` when the window falls after
-        the switch frame).
+        [B, window_size, C, H, W] and window_conditional_dict is the
+        conditional dict that applies to the window's first block.
 
-        When requires_grad=True, the window has gradient through the actual
-        rollout generation process (with KV cache context from preceding
-        chunks). When requires_grad=False, the entire rollout runs under
-        torch.no_grad() -- use this for critic-only steps to avoid building
-        an unused generator graph that would leak memory.
+        The rollout loops at **block granularity** (``num_frame_per_block``
+        frames, typically 3) so the window can start at any block boundary,
+        not just at multiples of ``chunk_size``. For a rollout of 150 frames
+        with 3 frames/block and a 21-frame (7-block) window, there are
+        50 - 7 + 1 = 44 possible window positions instead of just 7.
+
+        When requires_grad=True, each window block has gradient through its
+        final denoising step. KV cache updates (context_noise rerun) are
+        always no-grad, so previous blocks' cache entries are detached --
+        gradient flows only through the current window blocks' generation.
 
         When ``switch_conditional_dict`` and ``switch_frame_index`` are
-        provided, context chunks at/after the switch frame use the switch
-        dict instead of the original dict. The switch frame is rounded down
-        to the nearest chunk boundary so the switch always happens between
-        chunks (never within a single chunk).
+        provided, blocks at/after the switch frame use the switch dict.
+        The switch frame is rounded down to the nearest block boundary.
+        If the window spans the switch, the loss uses the first block's
+        dict (an approximation noted here for completeness).
 
         Flow:
-          1. Sample window chunk index (synced across ranks)
-          2. Generate context chunks 0..i-1 (no-grad, build KV cache),
-             using switch_conditional_dict for chunks at/after switch
-          3. Generate window chunk i (grad per requires_grad) -- the actual rollout output
-          4. Return (window, window_conditional_dict)
+          1. Compute block counts; sample window start block (synced across ranks)
+          2. Generate context blocks 0..i-1 (no-grad, build KV cache)
+          3. Generate window blocks i..i+W-1 (grad per requires_grad)
+          4. Concatenate window block outputs -> window tensor
+          5. Return (window, window_conditional_dict)
         """
         self.setup_sequence(conditional_dict, unconditional_dict, initial_latent,
                             text_prompts)
 
         batch_size = self.image_or_video_shape[0]
         C, H, W = self.image_or_video_shape[2:]
+        bsz = self.num_frame_per_block  # frames per block (typically 3)
 
-        # Number of complete chunks that fit in rollout_length
-        num_chunks = self.rollout_length // self.chunk_size
-        assert num_chunks >= 1, \
-            f"rollout_length ({self.rollout_length}) must be >= chunk_size ({self.chunk_size})"
+        # Block-based configuration
+        assert self.rollout_length % bsz == 0, \
+            f"sfpp_rollout_length ({self.rollout_length}) must be divisible by " \
+            f"num_frame_per_block ({bsz})"
+        assert self.window_size % bsz == 0, \
+            f"sfpp_window_size ({self.window_size}) must be divisible by " \
+            f"num_frame_per_block ({bsz})"
 
-        # Sample window chunk index (synced across ranks)
-        window_chunk_idx = self._synced_random_int(0, num_chunks)
-        window_start_frame = window_chunk_idx * self.chunk_size
+        num_blocks_total = self.rollout_length // bsz       # e.g. 150 // 3 = 50
+        window_num_blocks = self.window_size // bsz         # e.g.  21 // 3 = 7
+        assert num_blocks_total >= window_num_blocks, \
+            f"rollout_length ({self.rollout_length}) too small for window_size " \
+            f"({self.window_size}) at {bsz} frames/block"
 
-        # Determine the switch chunk boundary (first chunk that uses switch dict)
-        switch_chunk_idx = None
+        # Sample window start block (synced across ranks).
+        # Window can start at any block boundary: 0, 1, 2, ..., num_blocks_total - window_num_blocks
+        window_start_block = self._synced_random_int(
+            0, num_blocks_total - window_num_blocks + 1
+        )
+        window_start_frame = window_start_block * bsz
+
+        # Determine the switch block boundary (first block that uses switch dict)
+        switch_block_idx = None
         if switch_conditional_dict is not None and switch_frame_index is not None:
-            switch_chunk_idx = switch_frame_index // self.chunk_size
+            switch_block_idx = switch_frame_index // bsz
             if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
                 print(f"[SF++-Model] Switch at frame {switch_frame_index} -> "
-                      f"chunk {switch_chunk_idx}/{num_chunks}")
+                      f"block {switch_block_idx}/{num_blocks_total}")
 
-        # Helper: pick the right conditional dict for a given chunk index
-        def _dict_for_chunk(chunk_idx: int) -> dict:
-            if switch_chunk_idx is not None and chunk_idx >= switch_chunk_idx:
+        # Helper: pick the right conditional dict for a given block index
+        def _dict_for_block(block_idx: int) -> dict:
+            if switch_block_idx is not None and block_idx >= switch_block_idx:
                 return switch_conditional_dict
             return conditional_dict
 
-        # The conditional dict that applies to the window chunk (for losses)
-        window_conditional_dict = _dict_for_chunk(window_chunk_idx)
+        # The conditional dict that applies to the window's first block (for losses)
+        window_conditional_dict = _dict_for_block(window_start_block)
 
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
-            print(f"[SF++-Model] Window at chunk {window_chunk_idx}/{num_chunks}, "
-                  f"frames {window_start_frame}-{window_start_frame + self.chunk_size}, "
+            print(f"[SF++-Model] Window at block {window_start_block}/{num_blocks_total}, "
+                  f"frames {window_start_frame}-{window_start_frame + self.window_size} "
+                  f"({window_num_blocks} blocks), "
                   f"using_switch={window_conditional_dict is not conditional_dict}")
 
         current_length = 0
-        chunk_idx = 0
+        block_idx = 0
 
-        # --- Step 2: Generate context chunks (no-grad, build KV cache) ---
+        # --- Step 2: Generate context blocks (no-grad, build KV cache) ---
         with torch.no_grad():
-            while current_length < window_start_frame:
-                noise_chunk = torch.randn(
-                    [batch_size, self.chunk_size, C, H, W],
+            while block_idx < window_start_block:
+                noise_block = torch.randn(
+                    [batch_size, bsz, C, H, W],
                     device=self.device,
                     dtype=self.dtype
                 )
 
                 if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
                     log_gpu_memory(
-                        f"[SF++-Model] Context chunk at frame {current_length}",
+                        f"[SF++-Model] Context block at frame {current_length}",
                         device=self.device,
                         rank=dist.get_rank() if dist.is_initialized() else 0
                     )
 
                 _, _, _ = self.inference_pipeline.generate_chunk_with_cache(
-                    noise=noise_chunk,
-                    conditional_dict=_dict_for_chunk(chunk_idx),
+                    noise=noise_block,
+                    conditional_dict=_dict_for_block(block_idx),
                     current_start_frame=current_length,
                     requires_grad=False,
                     return_sim_step=False,
                 )
-                current_length += self.chunk_size
-                chunk_idx += 1
+                current_length += bsz
+                block_idx += 1
 
                 if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
-                    print(f"[SF++-Model] Context rollout: {current_length}/{window_start_frame}")
+                    print(f"[SF++-Model] Context rollout: block {block_idx}/{window_start_block}")
 
-        # --- Step 3: Generate window chunk (grad controlled by requires_grad) ---
-        noise_chunk = torch.randn(
-            [batch_size, self.chunk_size, C, H, W],
-            device=self.device,
-            dtype=self.dtype
-        )
-
-        if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
-            log_gpu_memory(
-                f"[SF++-Model] Window chunk at frame {current_length}",
+        # --- Step 3: Generate window blocks (grad per requires_grad) ---
+        # NOTE: We call generate_chunk_with_cache once per block (3 frames)
+        # instead of once per chunk (21 frames). This means each block
+        # independently samples its denoising exit_flag, whereas a single
+        # 21-frame call with same_step_across_blocks=True would use the
+        # same exit_flag for all 7 blocks. Independent exit flags give
+        # more training diversity and match inference behavior (where each
+        # block goes through the full denoising_step_list independently).
+        window_outputs = []
+        for _ in range(window_num_blocks):
+            noise_block = torch.randn(
+                [batch_size, bsz, C, H, W],
                 device=self.device,
-                rank=dist.get_rank() if dist.is_initialized() else 0
+                dtype=self.dtype
             )
 
-        window, _, _ = self.inference_pipeline.generate_chunk_with_cache(
-            noise=noise_chunk,
-            conditional_dict=window_conditional_dict,
-            current_start_frame=current_length,
-            requires_grad=requires_grad,
-            return_sim_step=False,
-        )
+            if (not dist.is_initialized() or dist.get_rank() == 0) and LOG_GPU_MEMORY:
+                log_gpu_memory(
+                    f"[SF++-Model] Window block at frame {current_length}",
+                    device=self.device,
+                    rank=dist.get_rank() if dist.is_initialized() else 0
+                )
+
+            block_output, _, _ = self.inference_pipeline.generate_chunk_with_cache(
+                noise=noise_block,
+                conditional_dict=_dict_for_block(block_idx),
+                current_start_frame=current_length,
+                requires_grad=requires_grad,
+                return_sim_step=False,
+            )
+            window_outputs.append(block_output)
+            current_length += bsz
+            block_idx += 1
+
+        # Concatenate window blocks into a single [B, window_size, C, H, W] tensor
+        window = torch.cat(window_outputs, dim=1)
 
         if DEBUG and (not dist.is_initialized() or dist.get_rank() == 0):
             print(f"[SF++-Model] Window generated: shape={window.shape}, "
