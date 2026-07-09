@@ -98,10 +98,10 @@ train_first_chunk: true
 #   - window_kv_cache_zero_prob:  zero the window region of KV cache
 #   - neg_prompt_zero_prob:       use negative prompt for the uncond pass
 # All default to 0.0 (disabled, original single-generation behaviour).
-kv_cache_cfg_scale: 3.0
-sink_kv_cache_zero_prob: 0.1
-window_kv_cache_zero_prob: 0.1
-neg_prompt_zero_prob: 0.1
+kv_cache_cfg_scale: 1.0
+sink_kv_cache_zero_prob: 0.5
+window_kv_cache_zero_prob: 0.5
+neg_prompt_zero_prob: 0.5
 
 last_step_only: false
 
