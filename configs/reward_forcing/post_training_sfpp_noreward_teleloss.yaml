@@ -1,0 +1,164 @@
+# Self-Forcing++ post-training config
+# Usage: torchrun --nproc_per_node=8 train_reward_forcing_pp.py \
+#   --config_path configs/reward_forcing/post_training_sfpp.yaml
+default_config_path: configs/reward_forcing/default_config.yaml
+
+# Start from distilled checkpoint (user must provide)
+generator_ckpt: /cache/reward_forcing_dmd.pt
+reward_model_path: /cache/VideoReward
+
+# Model
+real_name: Wan2.1-T2V-14B
+fake_name: Wan2.1-T2V-1.3B
+generator_fsdp_wrap_strategy: size
+real_score_fsdp_wrap_strategy: size
+fake_score_fsdp_wrap_strategy: size
+text_encoder_fsdp_wrap_strategy: size
+text_encoder_cpu_offload: true
+
+# Diffusion
+denoising_step_list:
+  - 1000
+  - 750
+  - 500
+  - 250
+warp_denoising_step: true
+ts_schedule: false
+num_train_timestep: 1000
+timestep_shift: 5.0
+guidance_scale: 3.0
+denoising_loss_type: flow
+mixed_precision: true
+
+# Training
+seed: 0
+sharding_strategy: full
+lr: 2.0e-06
+lr_critic: 2.0e-06
+beta1: 0.0
+beta2: 0.999
+beta1_critic: 0.0
+beta2_critic: 0.999
+data_path: /cache/vidprom_filtered_extended_llm_scored.jsonl
+use_score: true
+switch_prompt_path: /cache/vidprom_filtered_extended_switch.txt
+batch_size: 1
+gradient_accumulation_steps: 1
+ema_weight: 0.99
+ema_start_step: 200
+log_iters: 500
+max_checkpoints: 3
+max_iters: 3000
+
+# SF++ specific
+sfpp_rollout_length: 150        # N (no-grad rollout frames)
+sfpp_window_size: 21            # K (window = teacher horizon)
+sfpp_beta: 0.0                  # 0 = pure DMD; >0 = rewarded DMD
+sfpp_train_critic: true         # train critic alongside generator
+dfake_gen_update_ratio: 5       # 1 critic step per 5 generator steps
+sfpp_switch_window_prob: 0.3    # P(window covers switch frame); 0.0 = uniform random
+
+# Generator-level enlarged CFG (step-level CFG inside window block generation).
+# cfg_scale: CFG strength (0.0 = disabled). When >0, each denoising step of
+#   window blocks runs twice (cond + uncond clone) and predictions are combined.
+# sink/window zero prob: zero out sink or window KV cache entries in the uncond
+#   pass (degradation for robustness).
+# neg_prompt zero prob: use negative prompt as the uncond dict (standard CFG).
+kv_cache_cfg_scale: 0.0
+sink_kv_cache_zero_prob: 0.0
+window_kv_cache_zero_prob: 0.0
+neg_prompt_zero_prob: 0.0
+
+# Prompt switch mode: random within [min, max) at block granularity
+switch_mode: random
+min_switch_frame_index: 21
+max_switch_frame_index: 129
+
+# Streaming (reused by inference_pipeline for KV cache init)
+streaming_training: true
+streaming_chunk_size: 21
+streaming_max_length: 150
+streaming_min_new_frame: 18
+num_frame_per_block: 3
+image_or_video_shape:
+  - 1
+  - 21
+  - 16
+  - 60
+  - 104
+
+# Model kwargs
+model_kwargs:
+  timestep_shift: 5.0
+  local_attn_size: 12
+  sink_size: 3
+
+# Negative prompt - copy verbatim from reward_forcing_dmd_streaming.yaml
+negative_prompt: '色调艳丽，过曝，静态，细节模糊不清，字幕，风格，作品，画作，画面，静止，整体发灰，最差质量，低质量，JPEG压缩残留，丑陋的，残缺的，多余的手指，画得不好的手部，画得不好的脸部，畸形的，毁容的，形态畸形的肢体，手指融合，静止不动的画面，杂乱的背景，三条腿，背景人很多，倒着走'
+
+# Visualization
+vis_interval: 500
+vis_ema: false
+vis_video_lengths:
+  - 150
+val_batch_size: 1
+val_data_path: /cache/vidprom_filtered_extended_llm_scored.jsonl
+val_switch_prompt_path: /cache/vidprom_filtered_extended_switch.txt
+slice_last_frames: 21
+
+# LoRA
+adapter:
+  type: "lora"
+  rank: 256
+  alpha: 256
+  dropout: 0.0
+  dtype: "bfloat16"
+  apply_to_critic: true
+  verbose: true
+
+# Trainer selection (informational - entry point directly imports PPTrainer)
+trainer: streaming_distillation_pp
+distribution_loss: dmd
+gradient_checkpointing: true
+
+# ---------------------------------------------------------------------------
+# Teleport mitigation hooks.
+#   prompt_rewrite: inference-time prompt rewriting at switch/chunk boundaries.
+#                   Default OFF (enabled: false) = no-op, pipeline unchanged.
+#   tel_det_regular: training-time teleport loss (reweight or aux_loss).
+#                    Default "aux_loss" mode with optical-flow detector.
+# ---------------------------------------------------------------------------
+teleport:
+  prompt_rewrite:
+    enabled: false                       # master switch; false = no-op
+    trigger: switch                      # switch (default) | chunk
+    registry_enabled: true               # cross-chunk entity state machine
+    vlm:
+      type: qwen_vl_3b                   # qwen_vl_3b | qwen_vl | disabled
+      model_path: Qwen/Qwen2.5-VL-3B-Instruct
+      device: cuda
+      max_new_tokens: 256
+    rewriter:
+      mode: conservative                 # off | conservative | aggressive
+
+  tel_det_regular:
+    mode: "aux_loss"                          # off | reweight | aux_loss (mutex)
+    score_threshold: 0.8                 # per-pixel score threshold for event detection
+    min_event_area_ratio: 0.001          # fraction of pixels above threshold to count a frame as event
+    detector:
+      type: multi_frame_chained          # multi_frame_chained | multi_frame_direct | optical_flow | optical_flow_no_raft | disabled
+      tau: 5                             # temporal window for multi-frame flow
+      downsample_factor: 4
+      flow_backend: raft_small           # raft_small | none
+      edge_sigma: 0.15
+      flow_model_path: /cache/raft_small_C_T_V2.pth
+    reweighter:
+      type: absolute                     # teacher_relative | absolute | thresholded | disabled
+      alpha: 5.0
+      latent_h: 40
+      latent_w: 72
+    aux_loss:
+      type: masked_mean                  # masked_mean | disabled
+      threshold: 0.3                     # aux-loss internal masking cut-off
+      aggregation: masked_mean
+    aux_beta: 1.0
