@@ -48,7 +48,7 @@ ema_weight: 0.99
 ema_start_step: 200
 log_iters: 500
 max_checkpoints: 3
-max_iters: 3000
+max_iters: 2000
 
 # SF++ specific
 sfpp_rollout_length: 150        # N (no-grad rollout frames)
